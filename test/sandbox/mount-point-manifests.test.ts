@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import {
   accessSync,
@@ -13,6 +13,7 @@ import {
   readdirSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   statfsSync,
@@ -21,12 +22,15 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import {
+  type ManifestDirectoryPlaces,
   collectMountPoints,
   liveMountPoints,
+  mountPointManifestDirectories,
   namedMountPoints,
   publishMountPointManifest,
+  setMountPointManifestPlacesForTesting,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux } from '../helpers/platform.js'
@@ -40,8 +44,9 @@ import { usePrivateManifestDirectory } from '../helpers/private-manifest-directo
  */
 describe.if(isLinux)('The mount point manifests', () => {
   const runtime = usePrivateManifestDirectory()
-  const MODULE = JSON.stringify(
-    join(import.meta.dir, '../../src/sandbox/bwrap-mount-manifests.ts'),
+  const MODULE = join(
+    import.meta.dir,
+    '../../src/sandbox/bwrap-mount-manifests.ts',
   )
   const LIBRARY = JSON.stringify(
     join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
@@ -55,6 +60,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   let LOCK: string // the directory's lock
   let X: string // a mount point an earlier sandbox left
   let TMP: string // the temp dir of every child process
+  let THEIRS: string // the directory under /tmp, which this process only reads
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'mount-point-manifests-')))
@@ -65,9 +71,19 @@ describe.if(isLinux)('The mount point manifests', () => {
     chmodSync(DIR, 0o700)
     LOCK = join(DIR, 'directory.lock')
     X = join(BASE, 'config.lock')
+    THEIRS = join(
+      runtime.places().tempDir,
+      `srt-mount-points-${process.getuid!()}`,
+    )
   })
 
   afterEach(() => {
+    try {
+      chmodSync(THEIRS, 0o700)
+    } catch {
+      // Not made by this test.
+    }
+    rmSync(THEIRS, { recursive: true, force: true })
     for (const name of readdirSync(DIR)) {
       const file = join(DIR, name)
       try {
@@ -102,9 +118,10 @@ describe.if(isLinux)('The mount point manifests', () => {
   function manifestOfADeadProcess(
     paths: string[],
     fields: Record<string, unknown> = {},
+    dir = DIR,
   ): string {
     const pid = deadPid()
-    const file = join(DIR, `${pid}-${Math.random().toString(16).slice(2)}.json`)
+    const file = join(dir, `${pid}-${Math.random().toString(16).slice(2)}.json`)
     const body: Record<string, unknown> = {
       version: 1,
       pid,
@@ -128,6 +145,12 @@ describe.if(isLinux)('The mount point manifests', () => {
    * the thread it happens on, so a test in this process could not time it out.
    * `first` runs before the module is loaded, and an `env` entry that is
    * undefined is one the child does not have.
+   *
+   * The child looks where this process does for the runtime directory, and
+   * has a temp dir of its own, which is also what stands in for `/tmp`: it is
+   * where the manifests go when the runtime directory will not do, and the
+   * real one is every other process's. `places` puts something else in the
+   * place of either. It has no `XDG_RUNTIME_DIR` unless `env` gives it one.
    */
   function inAChild(
     source: string,
@@ -135,32 +158,60 @@ describe.if(isLinux)('The mount point manifests', () => {
       launcher?: string[]
       env?: Record<string, string | undefined>
       first?: string
+      places?: Partial<ManifestDirectoryPlaces>
     } = {},
   ): { status: number | null; ms: number; stdout: string } {
-    const script = join(BASE, `child-${Math.random().toString(16).slice(2)}.ts`)
-    writeFileSync(
-      script,
-      `${options.first ?? ''}\nconst m = await import(${MODULE})\n${source}\n`,
+    const script = writeChild(
+      `child-${Math.random().toString(16).slice(2)}.ts`,
+      source,
+      options.places,
+      options.first,
     )
     const argv = [...(options.launcher ?? []), process.execPath, script]
-    // A temp dir of its own: it is where the manifests go when the runtime
-    // directory will not do, and the real one is every other process's.
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      TMPDIR: TMP,
-      ...options.env,
-    }
-    for (const [name, value] of Object.entries(env)) {
-      if (value === undefined) delete env[name]
-    }
     const began = Date.now()
     const run = spawnSync(argv[0]!, argv.slice(1), {
-      env: env as Record<string, string>,
+      env: childEnv(options.env),
       encoding: 'utf8',
       timeout: 6000,
       killSignal: 'SIGKILL',
     })
     return { status: run.status, ms: Date.now() - began, stdout: run.stdout }
+  }
+
+  /** The script {@link inAChild} runs, for a child that is started otherwise. */
+  function writeChild(
+    name: string,
+    source: string,
+    places: Partial<ManifestDirectoryPlaces> = {},
+    first = '',
+  ): string {
+    const script = join(BASE, name)
+    const module = runtime.isolated(MODULE, {
+      runtimeDir: runtime.places().runtimeDir,
+      tempDir: TMP,
+      ...places,
+    })
+    writeFileSync(
+      script,
+      `${first}\nconst m = await import(${JSON.stringify(module)})\n${source}\n`,
+    )
+    return script
+  }
+
+  /** The environment {@link inAChild} gives its child. */
+  function childEnv(
+    given: Record<string, string | undefined> = {},
+  ): Record<string, string> {
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      XDG_RUNTIME_DIR: undefined,
+      TMPDIR: TMP,
+      ...given,
+    }
+    for (const [name, value] of Object.entries(env)) {
+      if (value === undefined) delete env[name]
+    }
+    return env as Record<string, string>
   }
 
   const COLLECT = `m.collectMountPoints()`
@@ -865,9 +916,13 @@ describe.if(isLinux)('The mount point manifests', () => {
       const shm = mkdtempSync(join(SHM, 'mount-point-manifests-'))
       chmodSync(shm, 0o700)
       try {
+        // Whichever place is under /dev is passed over, the first as much as
+        // the last.
         const elsewhere = TMP
+        const underDev = { runtimeDir: shm, tempDir: shm }
         const fellBack = inAChild(PUBLISH, {
           env: { XDG_RUNTIME_DIR: shm, TMPDIR: elsewhere },
+          places: underDev,
         })
         expect(fellBack.status).toBe(0)
         const manifest = JSON.parse(fellBack.stdout) as { file: string }
@@ -876,14 +931,9 @@ describe.if(isLinux)('The mount point manifests', () => {
 
         // With nowhere else to go it records nothing, rather than somewhere
         // bubblewrap cannot reach.
-        const env: Record<string, string> = { ...process.env, TMPDIR: shm }
-        delete env.XDG_RUNTIME_DIR
-        const script = join(BASE, 'nowhere.ts')
-        writeFileSync(script, `const m = await import(${MODULE})\n${PUBLISH}\n`)
-        const nowhere = spawnSync(process.execPath, [script], {
-          env,
-          encoding: 'utf8',
-          timeout: 6000,
+        const nowhere = inAChild(PUBLISH, {
+          env: { XDG_RUNTIME_DIR: shm, TMPDIR: shm },
+          places: underDev,
         })
         expect(nowhere.status).toBe(0)
         expect(JSON.parse(nowhere.stdout)).toBe(null)
@@ -903,7 +953,9 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(target)
     chmodSync(target, 0o755)
     symlinkSync(target, join(TMP, `srt-mount-points-${process.getuid!()}`))
-    const published = inAChild(PUBLISH, { env: { XDG_RUNTIME_DIR: undefined } })
+    const published = inAChild(PUBLISH, {
+      places: { runtimeDir: join(BASE, 'no-runtime-directory') },
+    })
     expect(published.status).toBe(0)
     expect(statSync(target).mode & 0o777).toBe(0o755)
     expect(readdirSync(target)).toEqual([])
@@ -941,6 +993,618 @@ describe.if(isLinux)('The mount point manifests', () => {
     },
     15000,
   )
+
+  // ---- which directory is written to, and which are read -----------------
+  //
+  // Where the manifests went used to be the environment's to say: under
+  // $XDG_RUNTIME_DIR, else under $TMPDIR. Two processes of one user that
+  // differed in either kept their manifests apart, and neither knew of the
+  // sandboxes of the other. The user id and the file system say it first
+  // now, the same for every process, and what they name is read by every
+  // process.
+
+  /**
+   * Four places of their own under `base`, none of them with a manifest
+   * directory yet.
+   */
+  function fourPlaces(base = BASE): {
+    places: { runtimeDir: string; tempDir: string }
+    env: { XDG_RUNTIME_DIR: string; TMPDIR: string }
+    /** The four manifest directories, in the order they are tried. */
+    dirs: [string, string, string, string]
+  } {
+    const at = (name: string, mode: number): string => {
+      const dir = join(base, name)
+      mkdirSync(dir, { recursive: true })
+      chmodSync(dir, mode)
+      return dir
+    }
+    const places = {
+      runtimeDir: at('run-user', 0o700),
+      tempDir: at('tmp-root', 0o1777),
+    }
+    const env = {
+      XDG_RUNTIME_DIR: at('xdg', 0o700),
+      TMPDIR: at('tmpdir', 0o1777),
+    }
+    const perUser = `srt-mount-points-${process.getuid!()}`
+    return {
+      places,
+      env,
+      dirs: [
+        join(places.runtimeDir, 'srt-mount-points'),
+        join(places.tempDir, perUser),
+        join(env.XDG_RUNTIME_DIR, 'srt-mount-points'),
+        join(env.TMPDIR, perUser),
+      ],
+    }
+  }
+
+  /** A manifest directory as the library makes one. */
+  function manifestDirectory(dir: string): string {
+    mkdirSync(dir, { mode: 0o700 })
+    chmodSync(dir, 0o700)
+    return dir
+  }
+
+  /** What makes a manifest live for as long as this test runs: its writer. */
+  function ofThisProcess(): Record<string, unknown> {
+    return {
+      pid: process.pid,
+      start: readFileSync('/proc/self/stat', 'utf8')
+        .split(') ')
+        .pop()!
+        .split(' ')[19],
+    }
+  }
+
+  const LOOK = `console.log(JSON.stringify({ named: [...m.namedMountPoints().named].sort(), live: [...m.namedMountPoints().live].sort(), spared: [...m.liveMountPoints()].sort(), collected: m.collectMountPoints().sort() }))`
+  type Looked = {
+    named: string[]
+    live: string[]
+    spared: string[]
+    collected: string[]
+  }
+
+  it('are written to the first directory that can be used: under the runtime directory, under /tmp, and only then where the environment says', () => {
+    // Every combination of the four being usable or not. One that is not is
+    // somebody's file at the name.
+    for (let usable = 0; usable < 16; usable++) {
+      const four = fourPlaces(join(BASE, `order-${usable}`))
+      four.dirs.forEach((dir, index) => {
+        if ((usable & (1 << index)) === 0) writeFileSync(dir, '')
+      })
+      const published = inAChild(PUBLISH, {
+        env: four.env,
+        places: four.places,
+      })
+      expect(published.status).toBe(0)
+      const written = dirname(
+        (JSON.parse(published.stdout) as { file: string }).file,
+      )
+      const first = four.dirs.find((_, index) => (usable & (1 << index)) !== 0)
+      if (first !== undefined) {
+        expect({ usable, written }).toEqual({ usable, written: first })
+      } else {
+        // A directory of the process's own, under its temp dir.
+        expect(written).toMatch(
+          new RegExp(`^${four.env.TMPDIR}/srt-mount-points-[A-Za-z0-9]{6}$`),
+        )
+      }
+    }
+  }, 60000)
+
+  it('are one directory where two names lead to the same one', () => {
+    // What the environment says is usually the runtime directory and /tmp
+    // again, by those names or by others.
+    const four = fourPlaces()
+    const runtimeDir = join(BASE, 'runtime-by-another-name')
+    const tempDir = join(BASE, 'tmp-by-another-name')
+    symlinkSync(four.places.runtimeDir, runtimeDir)
+    symlinkSync(four.places.tempDir, tempDir)
+    const looked = inAChild(
+      `console.log(JSON.stringify(m.mountPointManifestDirectories()))`,
+      {
+        env: { XDG_RUNTIME_DIR: runtimeDir, TMPDIR: tempDir },
+        places: four.places,
+      },
+    )
+    expect(looked.status).toBe(0)
+    expect(JSON.parse(looked.stdout)).toEqual(four.dirs.slice(0, 2))
+  })
+
+  const notARuntimeDirectory: [string, (dir: string) => void][] = [
+    ['is not there', dir => rmSync(dir, { recursive: true })],
+    [
+      'is a link to one',
+      dir => {
+        renameSync(dir, join(BASE, 'linked-to'))
+        symlinkSync(join(BASE, 'linked-to'), dir)
+      },
+    ],
+    ['can be looked into by the group', dir => chmodSync(dir, 0o750)],
+    ['can be looked into by others', dir => chmodSync(dir, 0o705)],
+  ]
+  for (const [what, spoil] of notARuntimeDirectory) {
+    it(`are neither written nor read, nor is anything made, under a runtime directory that ${what}`, () => {
+      const four = fourPlaces()
+      // What is there for this user to find, with a manifest in it that would
+      // keep X.
+      const planted = join(four.places.runtimeDir, 'srt-mount-points')
+      manifestDirectory(planted)
+      leftover(X)
+      manifestOfADeadProcess([X], ofThisProcess(), planted)
+      spoil(four.places.runtimeDir)
+      const before = existsSync(planted) ? readdirSync(planted) : undefined
+
+      const published = inAChild(PUBLISH, {
+        env: { TMPDIR: four.env.TMPDIR },
+        places: four.places,
+      })
+      expect(published.status).toBe(0)
+      expect(
+        dirname((JSON.parse(published.stdout) as { file: string }).file),
+      ).toBe(four.dirs[1])
+      const looked = inAChild(
+        [
+          `const directories = m.mountPointManifestDirectories()`,
+          `const named = [...m.namedMountPoints().named]`,
+          `console.log(JSON.stringify({ directories, named: named.filter(p => p === ${JSON.stringify(X)}), spared: [...m.liveMountPoints()] }))`,
+        ].join('\n'),
+        { env: { TMPDIR: four.env.TMPDIR }, places: four.places },
+      )
+      expect(looked.status).toBe(0)
+      expect(JSON.parse(looked.stdout)).toEqual({
+        directories: [four.dirs[1], four.dirs[3]],
+        named: [],
+        spared: [],
+      })
+      expect(existsSync(planted) ? readdirSync(planted) : undefined).toEqual(
+        before,
+      )
+    }, 15000)
+  }
+
+  /**
+   * Has `dir` look like another user's to whoever asks: nothing here can make
+   * a directory that is.
+   */
+  function asSomebodyElses(dir: string): { restore(): void } {
+    const lstat = fs.lstatSync
+    const spy = spyOn(fs, 'lstatSync').mockImplementation(((
+      file: unknown,
+      options: unknown,
+    ) => {
+      const stat = (lstat as (f: unknown, o: unknown) => fs.Stats)(
+        file,
+        options,
+      )
+      if (file !== dir) return stat
+      const other = Object.create(
+        Object.getPrototypeOf(stat) as object,
+      ) as fs.Stats
+      return Object.assign(other, stat, { uid: stat.uid + 1 })
+    }) as never)
+    return { restore: () => spy.mockRestore() }
+  }
+
+  it("are neither written nor read under a runtime directory that is somebody else's", () => {
+    const four = fourPlaces()
+    const planted = manifestDirectory(
+      join(four.places.runtimeDir, 'srt-mount-points'),
+    )
+    leftover(X)
+    manifestOfADeadProcess([X], ofThisProcess(), planted)
+    const theirs = asSomebodyElses(four.places.runtimeDir)
+    setMountPointManifestPlacesForTesting({
+      ...four.places,
+      environmentRuntimeDir: undefined,
+      environmentTempDir: four.env.TMPDIR,
+    })
+    try {
+      expect(mountPointManifestDirectories()).toEqual([
+        four.dirs[1],
+        four.dirs[3],
+      ])
+      expect(
+        dirname(publishMountPointManifest([join(BASE, 'absent')], [])!.file),
+      ).toBe(four.dirs[1])
+      expect([...namedMountPoints().named]).toEqual([join(BASE, 'absent')])
+      expect([...liveMountPoints()]).toEqual([])
+      expect(readdirSync(planted).length).toBe(1)
+    } finally {
+      theirs.restore()
+      collectMountPoints()
+      setMountPointManifestPlacesForTesting(runtime.places())
+    }
+  })
+
+  for (const differing of ['XDG_RUNTIME_DIR', 'TMPDIR'] as const) {
+    it(`are read by a process whose ${differing} is not the writer's`, async () => {
+      // A login shell and what a service or an IDE starts, two shells with a
+      // temp dir each: the second has to find what the first wrote.
+      const four = fourPlaces()
+      const environment = (n: number): Record<string, string | undefined> => {
+        const own = join(BASE, `${differing.toLowerCase()}-${n}`)
+        mkdirSync(own, { recursive: true })
+        chmodSync(own, 0o700)
+        return differing === 'XDG_RUNTIME_DIR'
+          ? { XDG_RUNTIME_DIR: own, TMPDIR: four.env.TMPDIR }
+          : { XDG_RUNTIME_DIR: undefined, TMPDIR: own }
+      }
+      leftover(X)
+      const go = join(BASE, 'go')
+      const up = join(BASE, 'up')
+      // The first process wraps, and its sandbox runs for as long as it is
+      // not told to go: its manifest is live for being its own.
+      const writer = spawn(
+        process.execPath,
+        [
+          writeChild(
+            'writer.ts',
+            [
+              `import { existsSync, writeFileSync } from 'node:fs'`,
+              `m.publishMountPointManifest([${JSON.stringify(X)}], [])`,
+              `writeFileSync(${JSON.stringify(up)}, '')`,
+              `while (!existsSync(${JSON.stringify(go)})) await new Promise(resolve => setTimeout(resolve, 20))`,
+            ].join('\n'),
+            four.places,
+          ),
+        ],
+        { env: childEnv(environment(1)), stdio: 'ignore' },
+      )
+      const writerExited = new Promise(resolve => writer.on('exit', resolve))
+      try {
+        const deadline = Date.now() + 10000
+        while (!existsSync(up)) {
+          if (Date.now() > deadline) throw new Error('the writer never wrote')
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+        const second = inAChild(LOOK, {
+          env: environment(2),
+          places: four.places,
+        })
+        expect(second.status).toBe(0)
+        expect(JSON.parse(second.stdout) as Looked).toEqual({
+          named: [X],
+          live: [X],
+          spared: [X],
+          collected: [],
+        })
+        expect(existsSync(X)).toBe(true)
+      } finally {
+        writeFileSync(go, '')
+        await writerExited
+      }
+
+      // And once the first is gone, and past its grace, the second is the one
+      // that takes away what it left.
+      await new Promise(resolve => setTimeout(resolve, 600))
+      const after = inAChild(LOOK, {
+        env: environment(2),
+        places: four.places,
+      })
+      expect(JSON.parse(after.stdout) as Looked).toEqual({
+        named: [X],
+        live: [],
+        spared: [],
+        collected: [X],
+      })
+      expect(existsSync(X)).toBe(false)
+      for (const dir of four.dirs) {
+        if (existsSync(dir)) {
+          expect(readdirSync(dir).filter(n => n.endsWith('.json'))).toEqual([])
+        }
+      }
+    }, 30000)
+  }
+
+  it('are believed in a directory this process does not write to', () => {
+    // This process writes under the runtime directory. What a process
+    // without one wrote under /tmp counts all the same: for a wrap that finds
+    // something at a path, and for a clean-up that is about to remove it.
+    const theirs = manifestDirectory(THEIRS)
+    const Y = join(BASE, 'second.lock')
+    leftover(X)
+    leftover(Y)
+    const mine = manifestOfADeadProcess([X, Y])
+    const live = manifestOfADeadProcess([X], ofThisProcess(), theirs)
+    const finished = manifestOfADeadProcess([Y], {}, theirs)
+
+    const named = namedMountPoints()
+    expect([...named.named].sort()).toEqual([X, Y].sort())
+    expect([...named.live]).toEqual([X])
+    expect([...liveMountPoints()]).toEqual([X])
+
+    // What only finished manifests name goes, and they go with it, wherever
+    // they are; what a live one names stays, wherever that one is.
+    expect(collectMountPoints()).toEqual([Y])
+    expect(existsSync(X)).toBe(true)
+    expect(existsSync(live)).toBe(true)
+    expect(existsSync(finished)).toBe(false)
+    expect(existsSync(mine)).toBe(false)
+    expect(readdirSync(theirs)).toEqual([basename(live)])
+
+    rmSync(live)
+    manifestOfADeadProcess([X], {}, theirs)
+    expect(collectMountPoints()).toEqual([X])
+    expect(readdirSync(theirs)).toEqual([])
+    // And all the while this process wrote under the runtime directory.
+    expect(
+      dirname(publishMountPointManifest([join(BASE, 'absent')], [])!.file),
+    ).toBe(DIR)
+  })
+
+  it('keeps a mount point named by a manifest that is published in another directory while the pass is under way', () => {
+    const theirs = manifestDirectory(THEIRS)
+    leftover(X)
+    manifestOfADeadProcess([X])
+    let arrived: string | undefined
+    const pass = duringTheNextPass(() => {
+      arrived = manifestOfADeadProcess([X], { created: Date.now() }, theirs)
+    })
+    try {
+      expect(collectMountPoints()).toEqual([])
+    } finally {
+      pass.restore()
+    }
+    expect(arrived).toBeDefined()
+    expect(existsSync(X)).toBe(true)
+  })
+
+  it('keeps what a finished manifest names when the lock on a manifest in another directory shows on the look before the removals', () => {
+    const theirs = manifestDirectory(THEIRS)
+    leftover(X)
+    manifestOfADeadProcess([X])
+    const locked = manifestOfADeadProcess([X], {}, theirs)
+    const line = `1: POSIX  ADVISORY  READ 4242 ${deviceOf(locked)}:${statSync(locked).ino} 0 EOF\n`
+    const readFile = fs.readFileSync
+    let reads = 0
+    const spy = spyOn(fs, 'readFileSync').mockImplementation(((
+      file: unknown,
+      options: unknown,
+    ) => {
+      if (file === '/proc/locks') {
+        reads++
+        return reads === 1 ? '' : line
+      }
+      return (readFile as (f: unknown, o: unknown) => unknown)(file, options)
+    }) as never)
+    try {
+      expect(collectMountPoints()).toEqual([])
+    } finally {
+      spy.mockRestore()
+    }
+    expect(existsSync(X)).toBe(true)
+    expect(existsSync(locked)).toBe(true)
+  })
+
+  const notOurs: [string, (dir: string) => { restore(): void } | void][] = [
+    [
+      'is a link to a directory',
+      dir => {
+        const target = join(BASE, 'linked-to')
+        renameSync(dir, target)
+        symlinkSync(target, dir)
+      },
+    ],
+    ['can be written by others', dir => chmodSync(dir, 0o777)],
+    ['can be looked into by the group', dir => chmodSync(dir, 0o750)],
+    ["is somebody else's", asSomebodyElses],
+  ]
+  for (const [what, spoil] of notOurs) {
+    it(`are not believed in a directory that ${what}, which is left as it is`, () => {
+      const theirs = manifestDirectory(THEIRS)
+      const Y = join(BASE, 'second.lock')
+      const Z = join(BASE, 'third.lock')
+      leftover(X)
+      leftover(Y)
+      leftover(Z)
+      // One that would keep X, and one that would have Y removed.
+      manifestOfADeadProcess([X], ofThisProcess(), theirs)
+      manifestOfADeadProcess([Y], {}, theirs)
+      manifestOfADeadProcess([X, Z])
+      const spoilt = spoil(theirs)
+      try {
+        const before = readdirSync(theirs).sort()
+        const mode = statSync(theirs).mode & 0o777
+
+        const named = namedMountPoints()
+        expect([...named.named].sort()).toEqual([X, Z].sort())
+        expect([...named.live]).toEqual([])
+        expect([...liveMountPoints()]).toEqual([])
+        expect(collectMountPoints().sort()).toEqual([X, Z].sort())
+        expect(existsSync(Y)).toBe(true)
+
+        expect(readdirSync(theirs).sort()).toEqual(before)
+        expect(statSync(theirs).mode & 0o777).toBe(mode)
+      } finally {
+        spoilt?.restore()
+      }
+    })
+  }
+
+  it('are read in both directories that come from the user id, in none the environment names beside them, and none is made for it', () => {
+    const four = fourPlaces()
+    const paths = four.dirs.map((dir, index) => {
+      const held = join(BASE, `held-${index}.lock`)
+      leftover(held)
+      // The last is not there, and is not made.
+      if (index < 3) {
+        manifestOfADeadProcess([held], ofThisProcess(), manifestDirectory(dir))
+      }
+      return held
+    })
+    const looked = inAChild(
+      `console.log(JSON.stringify([...m.liveMountPoints()].sort()))`,
+      { env: four.env, places: four.places },
+    )
+    expect(looked.status).toBe(0)
+    expect(JSON.parse(looked.stdout)).toEqual(paths.slice(0, 2).sort())
+    expect(existsSync(four.dirs[3])).toBe(false)
+    for (const dir of four.dirs.slice(0, 3)) {
+      expect(readdirSync(dir).length).toBe(1)
+    }
+  })
+
+  // What the environment names is kept out of a sandboxed command's reach by
+  // the processes whose environment names it, and by no other: a process with
+  // another temp dir has its sandboxes write there, if its caller lets them.
+  // So a manifest found there is somebody's word only to a process that has
+  // nowhere else to keep its own.
+
+  /**
+   * In each directory the environment names: the manifest of a sandbox that
+   * is running, which would keep X, and one a dead process left, which would
+   * have Y removed.
+   */
+  function whereTheEnvironmentSays(
+    four: ReturnType<typeof fourPlaces>,
+    Y: string,
+  ): string[] {
+    return four.dirs.slice(2).flatMap(dir => {
+      manifestDirectory(dir)
+      return [
+        manifestOfADeadProcess([X], ofThisProcess(), dir),
+        manifestOfADeadProcess([Y], {}, dir),
+      ]
+    })
+  }
+
+  for (const usable of ['the runtime directory', '/tmp'] as const) {
+    it(`are not believed where the environment says, by a process that can use the directory under ${usable}`, () => {
+      const four = fourPlaces()
+      if (usable === '/tmp') rmSync(four.places.runtimeDir, { recursive: true })
+      const Y = join(BASE, 'second.lock')
+      leftover(X)
+      leftover(Y)
+      const planted = whereTheEnvironmentSays(four, Y)
+      // What a process of the user left, where every process looks.
+      const finished = manifestOfADeadProcess(
+        [X],
+        {},
+        manifestDirectory(four.dirs[1]),
+      )
+
+      const published = inAChild(PUBLISH, {
+        env: four.env,
+        places: four.places,
+      })
+      expect(
+        dirname((JSON.parse(published.stdout) as { file: string }).file),
+      ).toBe(usable === '/tmp' ? four.dirs[1] : four.dirs[0])
+      rmSync((JSON.parse(published.stdout) as { file: string }).file)
+
+      const looked = inAChild(LOOK, { env: four.env, places: four.places })
+      expect(looked.status).toBe(0)
+      // X is kept by nothing that is believed, and goes on the word of the
+      // one manifest that is; Y is named by nothing that is believed, and
+      // stays.
+      expect(JSON.parse(looked.stdout) as Looked).toEqual({
+        named: [X],
+        live: [],
+        spared: [],
+        collected: [X],
+      })
+      expect(existsSync(X)).toBe(false)
+      expect(existsSync(Y)).toBe(true)
+      expect(existsSync(finished)).toBe(false)
+      for (const manifest of planted) {
+        expect(existsSync(manifest)).toBe(true)
+      }
+    }, 15000)
+  }
+
+  it('are believed where the environment says, and collected there, by a process that can use no directory that comes from the user id', () => {
+    const four = fourPlaces()
+    rmSync(four.places.runtimeDir, { recursive: true })
+    writeFileSync(four.dirs[1], '')
+    const Y = join(BASE, 'second.lock')
+    leftover(X)
+    leftover(Y)
+    const planted = whereTheEnvironmentSays(four, Y)
+
+    const looked = inAChild(LOOK, { env: four.env, places: four.places })
+    expect(looked.status).toBe(0)
+    expect(JSON.parse(looked.stdout) as Looked).toEqual({
+      named: [X, Y].sort(),
+      live: [X],
+      spared: [X],
+      collected: [Y],
+    })
+    expect(existsSync(X)).toBe(true)
+    expect(existsSync(Y)).toBe(false)
+    // The ones that named X for a running sandbox stay, in both; the ones a
+    // dead process left are gone, from both.
+    expect(planted.map(manifest => existsSync(manifest))).toEqual([
+      true,
+      false,
+      true,
+      false,
+    ])
+
+    // And it is where this process writes: to the first of the two.
+    const published = inAChild(PUBLISH, {
+      env: four.env,
+      places: four.places,
+    })
+    expect(
+      dirname((JSON.parse(published.stdout) as { file: string }).file),
+    ).toBe(four.dirs[2])
+  }, 15000)
+
+  it('are believed and collected in the directory a process settled on where the environment says, after one that comes from the user id has become usable', () => {
+    // Nothing that comes from the user id will do when the process first
+    // records, so it settles where its environment says, and stays there:
+    // its manifests are there, and the sandboxes that hold their locks.
+    const four = fourPlaces()
+    rmSync(four.places.runtimeDir, { recursive: true })
+    writeFileSync(four.dirs[1], '')
+    const [settled, other] = [four.dirs[2], four.dirs[3]]
+    const Y = join(BASE, 'second.lock')
+    const Z = join(BASE, 'third.lock')
+    leftover(X)
+    leftover(Y)
+    leftover(Z)
+    manifestOfADeadProcess([Y], {}, manifestDirectory(settled))
+    const notBelieved = manifestOfADeadProcess(
+      [Z],
+      {},
+      manifestDirectory(other),
+    )
+
+    const ran = inAChild(
+      [
+        `import { rmSync } from 'node:fs'`,
+        `import { dirname } from 'node:path'`,
+        `const first = m.publishMountPointManifest([${JSON.stringify(X)}], [])`,
+        // Somebody's file at the name under /tmp goes, and the next wrap
+        // makes the directory.
+        `rmSync(${JSON.stringify(four.dirs[1])})`,
+        `const directories = m.mountPointManifestDirectories()`,
+        `const named = m.namedMountPoints()`,
+        `const second = m.publishMountPointManifest([${JSON.stringify(join(BASE, 'absent'))}], [])`,
+        `const collected = m.collectMountPoints().sort()`,
+        `console.log(JSON.stringify({ first: dirname(first.file), second: dirname(second.file), directories, named: [...named.named].sort(), live: [...named.live], collected }))`,
+      ].join('\n'),
+      { env: four.env, places: four.places },
+    )
+    expect(ran.status).toBe(0)
+    expect(JSON.parse(ran.stdout)).toEqual({
+      first: settled,
+      second: settled,
+      directories: [four.dirs[1], settled, other],
+      named: [X, Y].sort(),
+      live: [X],
+      collected: [X, Y].sort(),
+    })
+    expect(existsSync(X)).toBe(false)
+    expect(existsSync(Y)).toBe(false)
+    expect(readdirSync(settled).filter(n => n.endsWith('.json'))).toEqual([])
+    // What the environment names beside it is nobody's word any more.
+    expect(existsSync(Z)).toBe(true)
+    expect(existsSync(notBelieved)).toBe(true)
+  }, 15000)
 
   // ---- what is read as a manifest ----------------------------------------
   //
@@ -1266,20 +1930,34 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(readdirSync(DIR).sort()).toEqual(before)
   })
 
+  /** A runtime directory with nothing in it yet. */
+  function emptyRuntimeDirectory(name: string): string {
+    const dir = join(BASE, name)
+    mkdirSync(dir, { mode: 0o700 })
+    chmodSync(dir, 0o700)
+    return dir
+  }
+
   it('makes no manifest directory where there is none, and holds nothing then', () => {
-    const run = join(BASE, 'run')
-    mkdirSync(run, { mode: 0o700 })
+    const run = emptyRuntimeDirectory('run')
+    const xdg = emptyRuntimeDirectory('xdg')
+    const tmp = join(BASE, 'tmp-root')
+    mkdirSync(tmp)
     const looked = inAChild(
       `console.log(JSON.stringify([...m.liveMountPoints()]))`,
-      { env: { XDG_RUNTIME_DIR: run } },
+      {
+        env: { XDG_RUNTIME_DIR: xdg },
+        places: { runtimeDir: run, tempDir: tmp },
+      },
     )
     expect(looked.status).toBe(0)
     expect(JSON.parse(looked.stdout)).toEqual([])
-    expect(readdirSync(run)).toEqual([])
-    expect(readdirSync(TMP)).toEqual([])
+    for (const place of [run, xdg, tmp, TMP]) {
+      expect(readdirSync(place)).toEqual([])
+    }
   })
 
-  it('reads the directory a process without a runtime directory keeps, where that is the one there is', () => {
+  it('reads the directory under the temp dir, where that is the one there is', () => {
     const theirs = join(TMP, `srt-mount-points-${process.getuid!()}`)
     mkdirSync(theirs, { mode: 0o700 })
     chmodSync(theirs, 0o700)
@@ -1297,11 +1975,10 @@ describe.if(isLinux)('The mount point manifests', () => {
       { mode: 0o600 },
     )
     rmSync(manifest)
-    const run = join(BASE, 'run')
-    mkdirSync(run, { mode: 0o700 })
+    const run = emptyRuntimeDirectory('run')
     const looked = inAChild(
       `console.log(JSON.stringify([...m.liveMountPoints()]))`,
-      { env: { XDG_RUNTIME_DIR: run } },
+      { places: { runtimeDir: run } },
     )
     expect(looked.status).toBe(0)
     expect(JSON.parse(looked.stdout)).toEqual([X])

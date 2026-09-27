@@ -488,7 +488,9 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
         [
           `import { spawnSync } from 'node:child_process'`,
           `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(
-            join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            runtime.isolated(
+              join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            ),
           )}`,
           `const command = await wrapCommandWithSandboxLinux({`,
           `  command: 'true',`,
@@ -542,7 +544,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 describe.if(isLinux)(
   'Mount points for deny paths that do not exist yet',
   () => {
-    usePrivateManifestDirectory()
+    const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     let BASE: string
     let AREA: string // allowed write area
@@ -761,7 +763,9 @@ describe.if(isLinux)(
         script,
         [
           `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(
-            join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            runtime.isolated(
+              join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            ),
           )}`,
           `process.umask(0o200)`,
           `for (let i = 0; i < 2; i++) {`,

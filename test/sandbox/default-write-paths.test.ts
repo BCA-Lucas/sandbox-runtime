@@ -9,6 +9,7 @@ import {
   isAtOrUnder,
 } from '../../src/sandbox/sandbox-utils.js'
 import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
+import { isolatedModule } from '../helpers/private-manifest-directory.js'
 
 const REPO_ROOT = join(import.meta.dir, '../..')
 const NPM_LOGS = '.npm/_logs'
@@ -193,7 +194,11 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const { allowOnly, wrapped, reopened } = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        // The manager as a child is to load it: it wraps, and the directories
+        // the manifests are kept in are not this test's to reach.
+        `const { SandboxManager } = await import(${JSON.stringify(
+          isolatedModule(join(REPO_ROOT, 'src/sandbox/sandbox-manager.ts')),
+        )})
        const filesystem = { denyRead: ['~/.npm'], allowWrite: [], denyWrite: [] }
        await SandboxManager.initialize({
          network: { allowedDomains: [], deniedDomains: [] },

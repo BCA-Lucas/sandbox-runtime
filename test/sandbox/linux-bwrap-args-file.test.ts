@@ -52,7 +52,7 @@ describe('the bwrap profile error at the package root', () => {
  * command line.
  */
 describe.if(isLinux)('bwrap --args for over-long profiles', () => {
-  usePrivateManifestDirectory()
+  const runtime = usePrivateManifestDirectory()
   const MAX_ARG_STRLEN =
     32 * Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout)
   // The largest rendering kept on the command line: the kernel's limit less
@@ -170,8 +170,23 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     launcher: string[] = [],
   ): unknown {
     const files = overLongProfile()
+    // A tmpdir of its own, so what a scenario leaves there goes with BASE,
+    // and no runtime directory: the mount point manifests are then kept under
+    // that tmpdir, which is the arrangement several scenarios are about. The
+    // child's own tmpdir is what stands in for /tmp, and nothing for
+    // /run/user/UID.
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      TMPDIR: join(BASE, 'tmp'),
+      ...env,
+    }
+    delete childEnv.XDG_RUNTIME_DIR
+    const library = runtime.isolated(MODULE, {
+      runtimeDir: join(BASE, 'no-runtime-directory'),
+      tempDir: childEnv.TMPDIR,
+    })
     const script = `
-      import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints, LinuxSandboxProfileError } from ${JSON.stringify(MODULE)}
+      import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints, LinuxSandboxProfileError } from ${JSON.stringify(library)}
       import * as fs from 'node:fs'
       const overLong = ${JSON.stringify(files)}
       const small = overLong.slice(0, 1)
@@ -197,16 +212,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     // fit one argument itself.
     const scriptFile = join(BASE, 'isolated.ts')
     writeFileSync(scriptFile, script)
-    // A tmpdir of its own, so what a scenario leaves there goes with BASE,
-    // and no runtime directory: the mount point manifests are then kept under
-    // that tmpdir, which is the arrangement several scenarios are about.
     mkdirSync(join(BASE, 'tmp'), { recursive: true })
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
-      TMPDIR: join(BASE, 'tmp'),
-      ...env,
-    }
-    delete childEnv.XDG_RUNTIME_DIR
     const argv = [...launcher, process.execPath, 'run', scriptFile]
     const run = spawnSync(argv[0]!, argv.slice(1), {
       cwd: BASE,

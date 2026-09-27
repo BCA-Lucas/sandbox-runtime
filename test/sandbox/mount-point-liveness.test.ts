@@ -16,8 +16,12 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { liveMountPoints } from '../../src/index.js'
+import {
+  type ManifestDirectoryPlaces,
+  setMountPointManifestPlacesForTesting,
+} from '../../src/sandbox/bwrap-mount-manifests.js'
 import {
   cleanupBwrapMountPoints,
   wrapCommandWithSandboxLinux,
@@ -26,7 +30,10 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { countMounts, indexOfMount } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux } from '../helpers/platform.js'
-import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
+import {
+  inPrivateNamespace,
+  usePrivateManifestDirectory,
+} from '../helpers/private-manifest-directory.js'
 
 /**
  * A denyWrite path that does not exist is blocked by binding /dev/null over
@@ -47,9 +54,12 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   // assert on what is left: in a directory of their own.
   const runtime = usePrivateManifestDirectory()
   const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-  const LIBRARY = JSON.stringify(
-    join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+  const LIBRARY_PATH = join(
+    import.meta.dir,
+    '../../src/sandbox/linux-sandbox-utils.ts',
   )
+  // For a child process: the library with this describe's stand-ins in place.
+  const LIBRARY = JSON.stringify(runtime.isolated(LIBRARY_PATH))
   let BASE: string
   let AREA: string // the allowed write area
   let LOCK: string // the denyWrite path, absent to begin with
@@ -86,16 +96,20 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     return `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done; echo pwned > ${LOCK}; echo rc=$?`
   }
 
-  /** A child process that wraps `command`, runs it and writes what it said. */
+  /**
+   * A child process that wraps `command`, runs it and writes what it said,
+   * with the library as `library` names it.
+   */
   function wrapperScript(
     command: string,
     out: string,
     after: string[] = [],
+    library = LIBRARY,
   ): string {
     return [
       `import { spawnSync } from 'node:child_process'`,
       `import { writeFileSync } from 'node:fs'`,
-      `import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${LIBRARY}`,
+      `import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${library}`,
       `const out = ${JSON.stringify(out)}`,
       `const wrapped = await wrapCommandWithSandboxLinux({`,
       `  command: ${JSON.stringify(command)},`,
@@ -146,8 +160,11 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
    * `writer`: a process that is gone, which makes it a finished one, unless
    * told otherwise.
    */
-  function manifestNaming(paths: string[], writer?: number): string {
-    const dir = runtime.manifestDir()
+  function manifestNaming(
+    paths: string[],
+    writer?: number,
+    dir = runtime.manifestDir(),
+  ): string {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
     chmodSync(dir, 0o700)
     let pid = 4194000
@@ -361,6 +378,401 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     90000,
   )
 
+  for (const differing of ['XDG_RUNTIME_DIR', 'TMPDIR'] as const) {
+    it.if(BWRAP_CAN_NAMESPACE)(
+      `stays while the sandbox of a process with another ${differing} runs, after the one it was made for has ended and been cleaned up after`,
+      async () => {
+        // Two processes as they really are, each working the directories out
+        // for itself from the real names, in a mount namespace where this
+        // test's stand-ins are what is at those names. They differ in what
+        // the environment says, as a login shell and what a service or an IDE
+        // starts do, and each kept its manifests where its own environment
+        // said: the second wrap took the first's mount point for the user's
+        // own file, and it went from under the second sandbox when the first
+        // process cleaned up. The two that differ in their temp dir have no
+        // runtime directory, and meet under /tmp.
+        const noRuntimeDirectory = join(BASE, 'run-user')
+        mkdirSync(noRuntimeDirectory)
+        const launcher = inPrivateNamespace(
+          differing === 'TMPDIR'
+            ? {
+                runtimeDir: join(noRuntimeDirectory, 'nobody'),
+                tempDir: runtime.places().tempDir,
+              }
+            : runtime.places(),
+          [BASE],
+        )
+        const environment = (n: number): Record<string, string> => {
+          const own = join(BASE, `${differing.toLowerCase()}-${n}`)
+          mkdirSync(own, { recursive: true })
+          chmodSync(own, 0o700)
+          const env: Record<string, string | undefined> = {
+            ...process.env,
+            XDG_RUNTIME_DIR: undefined,
+            TMPDIR: join(BASE, 'tmp'),
+            [differing]: own,
+          }
+          mkdirSync(env.TMPDIR!, { recursive: true })
+          for (const [name, value] of Object.entries(env)) {
+            if (value === undefined) delete env[name]
+          }
+          return env as Record<string, string>
+        }
+        const asItIs = (
+          name: string,
+          command: string,
+          out: string,
+          after: string[],
+        ): string =>
+          writeScript(
+            name,
+            wrapperScript(command, out, after, JSON.stringify(LIBRARY_PATH)),
+          )
+        const started = (script: string, n: number): ChildProcess =>
+          spawn(
+            launcher[0]!,
+            [...launcher.slice(1), process.execPath, script],
+            {
+              env: environment(n),
+              stdio: 'ignore',
+            },
+          )
+
+        const upSecond = join(AREA, 'up-second')
+        const goSecond = join(AREA, 'go-second')
+        const outSecond = join(BASE, 'out-second.txt')
+        const first = started(
+          asItIs(
+            'first.ts',
+            `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done`,
+            OUT,
+            ['cleanupBwrapMountPoints()'],
+          ),
+          1,
+        )
+        const firstExited = new Promise(resolve => first.on('exit', resolve))
+        let second: ChildProcess | undefined
+        try {
+          await waitFor(SIGNAL)
+          expect(lstatSync(LOCK).size).toBe(0)
+
+          second = started(
+            asItIs(
+              'second.ts',
+              `echo up > ${upSecond}; n=0; while [ ! -e ${goSecond} ]; do if (echo pwned > ${LOCK}) 2>/dev/null; then n=$((n+1)); fi; sleep 0.05; done; echo writes=$n`,
+              outSecond,
+              [],
+            ),
+            2,
+          )
+          await waitFor(upSecond)
+
+          writeFileSync(GO, '')
+          await firstExited // and its own clean-up has run
+          // Past the grace, and with a third process cleaning up as well.
+          await sleep(700)
+          const third = spawnSync(
+            launcher[0]!,
+            [
+              ...launcher.slice(1),
+              process.execPath,
+              asItIs('third.ts', 'true', join(BASE, 'out-third.txt'), [
+                'cleanupBwrapMountPoints()',
+              ]),
+            ],
+            { env: environment(3), encoding: 'utf8', timeout: 60000 },
+          )
+          expect(third.status).toBe(0)
+          expect(lstatSync(LOCK).size).toBe(0)
+          // For the command to have tried for a while longer.
+          await sleep(300)
+        } finally {
+          writeFileSync(GO, '')
+          writeFileSync(goSecond, '')
+          await firstExited
+          if (second !== undefined) {
+            const running = second
+            await new Promise(resolve => running.on('exit', resolve))
+          }
+        }
+
+        expect(readFileSync(OUT, 'utf8')).not.toContain('bwrap:')
+        expect(readFileSync(outSecond, 'utf8')).toBe('writes=0\n')
+        expect(contentAt(LOCK)).toBe('')
+        // Both wrote where the user id says, which is where this process
+        // looks too, and neither where its own environment says.
+        for (const n of [1, 2]) {
+          const own = join(BASE, `${differing.toLowerCase()}-${n}`)
+          for (const name of readdirSync(own)) {
+            expect(readdirSync(join(own, name))).toEqual([])
+          }
+        }
+
+        // And goes once nothing runs under it.
+        await sleep(600)
+        cleanupBwrapMountPoints()
+        expect(existsSync(LOCK)).toBe(false)
+      },
+      90000,
+    )
+  }
+
+  it('is taken for one on the word of a manifest in a directory this process does not write to', async () => {
+    // What a killed process that had no runtime directory left, and the
+    // manifest it left under /tmp. This process writes under the runtime
+    // directory, and reads both.
+    const theirs = join(
+      runtime.places().tempDir,
+      `srt-mount-points-${process.getuid!()}`,
+    )
+    writeFileSync(LOCK, '')
+    chmodSync(LOCK, 0o444)
+    const left = manifestNaming([LOCK], undefined, theirs)
+
+    const command = await wrap('true')
+    expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
+    expect(command).not.toContain(`--ro-bind ${LOCK} ${LOCK}`)
+    expect(dirname(manifestOf(command))).toBe(runtime.manifestDir())
+    expect(readFileSync(manifestOf(command), 'utf8')).toContain(LOCK)
+
+    // It goes when this wrap is cleaned up after, and the manifest that named
+    // it first with it.
+    cleanupBwrapMountPoints()
+    expect(existsSync(LOCK)).toBe(false)
+    expect(existsSync(left)).toBe(false)
+  })
+
+  it('is not taken for one on the word of a manifest where the environment says, by a process that can use a directory that comes from the user id', async () => {
+    // What the environment names is out of reach of the sandboxes of the
+    // processes with that environment, and of no others. While this process
+    // has a directory every process of the user looks in, what is found
+    // there is nobody's word: the file is the user's own, empty and
+    // read-only as it is.
+    const xdg = join(BASE, 'xdg')
+    mkdirSync(xdg)
+    chmodSync(xdg, 0o700)
+    const theirs = join(xdg, 'srt-mount-points')
+    writeFileSync(LOCK, '')
+    chmodSync(LOCK, 0o444)
+    const planted = manifestNaming([LOCK], undefined, theirs)
+    setMountPointManifestPlacesForTesting({
+      ...runtime.places(),
+      environmentRuntimeDir: xdg,
+    })
+    try {
+      const command = await wrap('true')
+      expect(command).toContain(`--ro-bind ${LOCK} ${LOCK}`)
+      expect(command).not.toContain(`--ro-bind /dev/null ${LOCK}`)
+      expect(command).not.toContain('--lock-file')
+      // Out of the command's reach all the same: a process with this
+      // environment that can use nothing else writes there.
+      expect(command).toContain(`--ro-bind-try ${theirs} ${theirs} `)
+
+      cleanupBwrapMountPoints()
+      expect(lstatSync(LOCK).size).toBe(0)
+      expect(existsSync(planted)).toBe(true)
+    } finally {
+      cleanupBwrapMountPoints({ force: true })
+      setMountPointManifestPlacesForTesting(runtime.places())
+    }
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'is not removed on the word of a manifest that the sandbox of a process with another temp dir wrote under this one',
+    () => {
+      // Two processes as they really are, in a mount namespace where this
+      // test's stand-ins are at the real names. The first has a temp dir of
+      // its own, inside what the second lets its command write. The second
+      // does not know of that temp dir, so its sandbox has nothing bound
+      // there, and its command writes a manifest under it that names
+      // somebody's empty read-only file. The first has a directory under
+      // /tmp to keep its manifests in, and believes nothing under its temp
+      // dir.
+      const uid = process.getuid!()
+      const HOME = join(BASE, 'home')
+      const theirTmp = join(HOME, 'tmp')
+      const theirs = join(theirTmp, `srt-mount-points-${uid}`)
+      const BYSTANDER = join(BASE, 'outside', 'bystander.lock')
+      mkdirSync(theirTmp, { recursive: true })
+      mkdirSync(dirname(BYSTANDER))
+      writeFileSync(BYSTANDER, '')
+      chmodSync(BYSTANDER, 0o444)
+      const launcher = inPrivateNamespace(runtime.places(), [BASE])
+      const inTheNamespace = (
+        name: string,
+        lines: string[],
+        env: Record<string, string | undefined>,
+      ): { status: number | null; stdout: string } => {
+        const merged: Record<string, string | undefined> = {
+          ...process.env,
+          XDG_RUNTIME_DIR: undefined,
+          TMPDIR: undefined,
+          ...env,
+        }
+        for (const [key, value] of Object.entries(merged)) {
+          if (value === undefined) delete merged[key]
+        }
+        return spawnSync(
+          launcher[0]!,
+          [
+            ...launcher.slice(1),
+            process.execPath,
+            writeScript(name, lines.join('\n')),
+          ],
+          {
+            env: merged as Record<string, string>,
+            encoding: 'utf8',
+            timeout: 60000,
+          },
+        )
+      }
+      const wrapping = (
+        command: string,
+        allowOnly: string[],
+        deny: string[],
+      ): string[] => [
+        `import { spawnSync } from 'node:child_process'`,
+        `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(LIBRARY_PATH)}`,
+        `const wrapped = await wrapCommandWithSandboxLinux({`,
+        `  command: ${JSON.stringify(command)},`,
+        `  needsNetworkRestriction: false,`,
+        `  readConfig: { denyOnly: [] },`,
+        `  writeConfig: { allowOnly: ${JSON.stringify(allowOnly)}, denyWithinAllow: ${JSON.stringify(deny)} },`,
+        `})`,
+        `const r = spawnSync(wrapped, { shell: true, encoding: 'utf8', timeout: 60000 })`,
+        `console.log(JSON.stringify({ wrapped, said: String(r.stdout ?? '') + String(r.stderr ?? '') }))`,
+      ]
+      type Ran = { wrapped: string; said: string }
+
+      // The first process wraps a command: it makes the directory under its
+      // temp dir, and writes under /tmp or the runtime directory.
+      const first = inTheNamespace(
+        'first.ts',
+        wrapping('true', [AREA], [LOCK]),
+        { TMPDIR: theirTmp },
+      )
+      expect(first.status).toBe(0)
+      const firstRan = JSON.parse(first.stdout) as Ran
+      expect(firstRan.said).not.toContain('bwrap:')
+      expect(firstRan.wrapped).toContain(`--ro-bind-try ${theirs} ${theirs} `)
+      expect(firstRan.wrapped).not.toContain(`--lock-file ${theirs}/`)
+      expect(lstatSync(theirs).isDirectory()).toBe(true)
+
+      // The command of the second, which may write the first's temp dir.
+      const forged = JSON.stringify({
+        version: 1,
+        pid: 4194000,
+        start: '0',
+        created: 0,
+        paths: [BYSTANDER],
+        sources: [],
+      })
+      const second = inTheNamespace(
+        'second.ts',
+        wrapping(
+          `mkdir -p -m 700 ${theirs} 2>/dev/null; echo '${forged}' > ${theirs}/forged.json; echo plant=$?`,
+          [HOME],
+          [],
+        ),
+        {},
+      )
+      expect(second.status).toBe(0)
+      const secondRan = JSON.parse(second.stdout) as Ran
+      // Nothing of the second's sandbox is bound there.
+      expect(secondRan.wrapped).not.toContain(`-bind ${theirs} `)
+      expect(secondRan.wrapped).not.toContain(`-bind-try ${theirs} `)
+      expect(secondRan.said).toContain('plant=0')
+      expect(readFileSync(join(theirs, 'forged.json'), 'utf8')).toContain(
+        BYSTANDER,
+      )
+
+      // The next clean-up of a process with the first's environment.
+      const cleaner = inTheNamespace(
+        'cleaner.ts',
+        [
+          `import { cleanupBwrapMountPoints } from ${JSON.stringify(LIBRARY_PATH)}`,
+          `cleanupBwrapMountPoints()`,
+        ],
+        { TMPDIR: theirTmp },
+      )
+      expect(cleaner.status).toBe(0)
+      expect(lstatSync(BYSTANDER).size).toBe(0)
+      expect(existsSync(join(theirs, 'forged.json'))).toBe(true)
+    },
+    90000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && existsSync('/run/user'))(
+    'cannot be made, written or moved aside under /tmp by a command that may write /tmp, while its process writes under the runtime directory',
+    () => {
+      // The directory under /tmp is where a process without a runtime
+      // directory writes, and every process reads it. A command that may write
+      // /tmp runs as the same user: a directory it made there itself would
+      // pass every check of owner and mode, and what it put in it would be
+      // believed. So the wrap makes it first, and binds it read-only.
+      const uid = process.getuid!()
+      const theirs = `/tmp/srt-mount-points-${uid}`
+      const onTheHost = join(runtime.places().tempDir, basename(theirs))
+      // Not there, as on a host where every process so far had a runtime
+      // directory to write to.
+      rmSync(onTheHost, { recursive: true, force: true })
+      const attack = [
+        `mkdir -m 700 ${theirs} 2>/dev/null; echo mkdir=$?`,
+        `echo forged > ${theirs}/planted.json; echo plant=$?`,
+        `mv ${theirs} /tmp/aside 2>/dev/null; echo mv=$?`,
+        `rmdir ${theirs} 2>/dev/null; echo rmdir=$?`,
+      ].join('; ')
+      const script = writeScript(
+        'attacker.ts',
+        [
+          `import { spawnSync } from 'node:child_process'`,
+          `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(LIBRARY_PATH)}`,
+          `const wrapped = await wrapCommandWithSandboxLinux({`,
+          `  command: ${JSON.stringify(attack)},`,
+          `  needsNetworkRestriction: false,`,
+          `  readConfig: { denyOnly: [] },`,
+          `  writeConfig: { allowOnly: ['/tmp', ${JSON.stringify(AREA)}], denyWithinAllow: [${JSON.stringify(LOCK)}] },`,
+          `})`,
+          `const r = spawnSync(wrapped, { shell: true, encoding: 'utf8', timeout: 60000 })`,
+          `console.log(JSON.stringify({ wrapped, said: String(r.stdout ?? '') + String(r.stderr ?? '') }))`,
+        ].join('\n'),
+      )
+      const env: Record<string, string | undefined> = { ...process.env }
+      delete env.XDG_RUNTIME_DIR
+      delete env.TMPDIR
+      const launcher = inPrivateNamespace(runtime.places(), [BASE])
+      const child = spawnSync(
+        launcher[0]!,
+        [...launcher.slice(1), process.execPath, script],
+        {
+          env: env as Record<string, string>,
+          encoding: 'utf8',
+          timeout: 60000,
+        },
+      )
+      expect(child.status).toBe(0)
+      const { wrapped, said } = JSON.parse(child.stdout) as {
+        wrapped: string
+        said: string
+      }
+      expect(wrapped).toContain(
+        `--lock-file /run/user/${uid}/srt-mount-points/`,
+      )
+      expect(wrapped).toContain(`--ro-bind-try ${theirs} ${theirs} `)
+      expect(said).not.toContain('bwrap:')
+      expect(said).toMatch(/mkdir=[1-9]/)
+      expect(said).toMatch(/plant=[1-9]/)
+      expect(said).toMatch(/mv=[1-9]/)
+      expect(said).toMatch(/rmdir=[1-9]/)
+      // Made by the wrap, the user's alone, and with nothing in it.
+      expect(lstatSync(onTheHost).isDirectory()).toBe(true)
+      expect(lstatSync(onTheHost).mode & 0o777).toBe(0o700)
+      expect(readdirSync(onTheHost)).toEqual([])
+      expect(existsSync(join(runtime.places().tempDir, 'aside'))).toBe(false)
+    },
+    90000,
+  )
+
   it.if(BWRAP_CAN_NAMESPACE)(
     'is collected, manifest and all, when the process that made it never cleans up',
     async () => {
@@ -480,27 +892,36 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   )
 
   it.if(BWRAP_CAN_NAMESPACE)(
-    'are read-only, too, where a process that was started without a runtime directory keeps them',
+    'are read-only, too, in the directory under the temp dir, for a process that writes under the runtime directory',
     async () => {
-      // A process started with $XDG_RUNTIME_DIR keeps its manifests under it,
-      // and one started without (from cron, over a plain ssh) under the temp
-      // dir. A sandbox of the first kind that may write the temp dir could
-      // delete and forge the manifests of the second, which a collect on the
-      // host then believed. So every wrap binds both names read-only, and
-      // makes the one that is not there so that the command cannot make it
-      // first.
-      const RUN = join(BASE, 'run')
+      // A process with a runtime directory keeps its manifests under it, and
+      // one without (in a container, under another user's `su`) under the
+      // temp dir, and every process reads both. A sandbox of the first kind
+      // that may write the temp dir could delete and forge the manifests of
+      // the second, which a collect on the host then believed. So every wrap
+      // binds every name read-only, and makes the one that is not there so
+      // that the command cannot make it first.
       const TMP = join(BASE, 'tmp')
-      mkdirSync(RUN, { mode: 0o700 })
-      chmodSync(RUN, 0o700)
       mkdirSync(TMP)
       const theirs = join(TMP, `srt-mount-points-${process.getuid!()}`)
+      // The runtime directory this process has too, and TMP for /tmp.
+      const library = JSON.stringify(
+        runtime.isolated(LIBRARY_PATH, {
+          runtimeDir: runtime.places().runtimeDir,
+          tempDir: TMP,
+        }),
+      )
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        TMPDIR: TMP,
+      }
+      delete env.XDG_RUNTIME_DIR
       const attacker = (script: string, attack: string): string =>
         writeScript(
           script,
           [
             `import { spawnSync } from 'node:child_process'`,
-            `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+            `import { wrapCommandWithSandboxLinux } from ${library}`,
             `const wrapped = await wrapCommandWithSandboxLinux({`,
             `  command: ${JSON.stringify(attack)},`,
             `  needsNetworkRestriction: false,`,
@@ -513,7 +934,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
         )
       const withARuntimeDirectory = (script: string) =>
         spawnSync(process.execPath, [script], {
-          env: { ...process.env, XDG_RUNTIME_DIR: RUN, TMPDIR: TMP },
+          env: env as Record<string, string>,
           encoding: 'utf8',
           timeout: 60000,
         })
@@ -836,12 +1257,19 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   it.if(BWRAP_CAN_NAMESPACE)(
     "is recorded in a directory of the process's own only when there is one to record, and that directory goes with the process",
     async () => {
-      // Neither shared name will do: no runtime directory, and the name under
-      // the temp dir is somebody's file.
+      // None of the shared names will do: no runtime directory, and the name
+      // under the temp dir, which is what stands in for /tmp too, is
+      // somebody's file.
       const TMP = join(BASE, 'tmp')
       mkdirSync(TMP)
       const squatted = join(TMP, `srt-mount-points-${process.getuid!()}`)
       writeFileSync(squatted, '')
+      const library = JSON.stringify(
+        runtime.isolated(LIBRARY_PATH, {
+          runtimeDir: join(BASE, 'no-runtime-directory'),
+          tempDir: TMP,
+        }),
+      )
       const env: Record<string, string | undefined> = {
         ...process.env,
         TMPDIR: TMP,
@@ -856,7 +1284,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
               [
                 `import { spawnSync } from 'node:child_process'`,
                 `import { readdirSync } from 'node:fs'`,
-                `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+                `import { wrapCommandWithSandboxLinux } from ${library}`,
                 `const wrapped = await wrapCommandWithSandboxLinux({`,
                 `  command: 'true',`,
                 `  needsNetworkRestriction: false,`,
@@ -971,11 +1399,15 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 describe.if(isLinux)(
   'A mount point whose sandbox outlives the process that wrapped it',
   () => {
-    usePrivateManifestDirectory()
+    const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-    const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    const LIBRARY_PATH = join(
+      import.meta.dir,
+      '../../src/sandbox/linux-sandbox-utils.ts',
     )
+    // For a child process: the library with this describe's stand-ins in
+    // place.
+    const LIBRARY = JSON.stringify(runtime.isolated(LIBRARY_PATH))
     // Comfortably past the grace a new manifest is given (500 ms): after this
     // only the writer being alive, or the lock, can make the manifest live.
     const PAST_GRACE_MS = 1200
@@ -1374,9 +1806,13 @@ describe.if(isLinux)(
   () => {
     const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-    const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    const LIBRARY_PATH = join(
+      import.meta.dir,
+      '../../src/sandbox/linux-sandbox-utils.ts',
     )
+    // For a child process: the library with this describe's stand-ins in
+    // place.
+    const LIBRARY = JSON.stringify(runtime.isolated(LIBRARY_PATH))
     let BASE: string
     let AREA: string
     let DIRECTORY: string // the first missing component of LEAF
@@ -1756,16 +2192,32 @@ describe.if(isLinux)(
 describe.if(isLinux)(
   'The directories above the ones this library keeps on the host',
   () => {
-    usePrivateManifestDirectory()
+    const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-    const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    const LIBRARY_PATH = join(
+      import.meta.dir,
+      '../../src/sandbox/linux-sandbox-utils.ts',
     )
     const UID = isLinux ? process.getuid!() : 0
     let BASE: string
     let HOME: string // the allowed write root
-    let TMP: string // the temp dir, strictly inside it
+    let TMP: string // the temp dir, strictly inside it, and what is at /tmp
     let GUARD: string // a denyWrite path, absent to begin with
+    let LIBRARY: string // the library, for a child process
+
+    /**
+     * The library for a child process that has no runtime directory and TMP
+     * at `/tmp`, or `places` instead of either.
+     */
+    function libraryWith(places: Partial<ManifestDirectoryPlaces>): string {
+      return JSON.stringify(
+        runtime.isolated(LIBRARY_PATH, {
+          runtimeDir: join(BASE, 'no-runtime-directory'),
+          tempDir: TMP,
+          ...places,
+        }),
+      )
+    }
 
     beforeEach(() => {
       BASE = realpathSync(mkdtempSync(join(tmpdir(), 'mount-point-pins-')))
@@ -1773,6 +2225,7 @@ describe.if(isLinux)(
       TMP = join(HOME, 'tmp')
       mkdirSync(TMP, { recursive: true })
       GUARD = join(HOME, 'guard.lock')
+      LIBRARY = libraryWith({})
     })
 
     afterEach(() => {
@@ -1781,8 +2234,9 @@ describe.if(isLinux)(
     })
 
     /**
-     * Runs `lines` in a process of its own whose temp dir is TMP. An `env`
-     * entry that is undefined is one that process does not have.
+     * Runs `lines` in a process of its own whose temp dir is TMP, and which
+     * has no `XDG_RUNTIME_DIR`. An `env` entry that is undefined is one that
+     * process does not have.
      */
     function inAChild(
       name: string,
@@ -1793,6 +2247,7 @@ describe.if(isLinux)(
       writeFileSync(file, lines.join('\n'))
       const merged: Record<string, string | undefined> = {
         ...process.env,
+        XDG_RUNTIME_DIR: undefined,
         TMPDIR: TMP,
         ...env,
       }
@@ -1809,15 +2264,19 @@ describe.if(isLinux)(
       return { status: r.status, stdout: r.stdout }
     }
 
-    /** What a process with that environment wraps `true` as. */
+    /**
+     * What a process with that environment wraps `true` as, with `places` for
+     * where it looks.
+     */
     function wrapped(
       options: Record<string, unknown>,
       env: Record<string, string | undefined> = {},
+      places: Partial<ManifestDirectoryPlaces> = {},
     ): string {
       const child = inAChild(
         'wrap.ts',
         [
-          `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+          `import { wrapCommandWithSandboxLinux } from ${libraryWith(places)}`,
           `console.log(await wrapCommandWithSandboxLinux({`,
           `  command: 'true',`,
           `  needsNetworkRestriction: false,`,
@@ -1848,10 +2307,9 @@ describe.if(isLinux)(
     }
 
     it('are pinned above the manifest directory a process with no runtime directory keeps', () => {
-      const command = wrapped(
-        { writeConfig: { allowOnly: [HOME], denyWithinAllow: [] } },
-        { XDG_RUNTIME_DIR: undefined },
-      )
+      const command = wrapped({
+        writeConfig: { allowOnly: [HOME], denyWithinAllow: [] },
+      })
       expect(command).toContain(`--ro-bind-try ${TMP}/srt-mount-points-${UID}`)
       expectPinned(command, TMP)
       // The write root is a mount point already, and nothing above it is the
@@ -1866,21 +2324,79 @@ describe.if(isLinux)(
       chmodSync(RUN, 0o700)
       const command = wrapped(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
-        { XDG_RUNTIME_DIR: RUN },
+        {},
+        { runtimeDir: RUN },
       )
       expect(command).toContain(`--lock-file ${RUN}/srt-mount-points/`)
       expectPinned(command, RUN)
       expectPinned(command, join(HOME, 'run'))
     })
 
+    it('are pinned above every manifest directory, whichever of them the process writes to', () => {
+      // Four names for four directories, each strictly inside the write
+      // root: the runtime directory and /tmp, and what the environment has
+      // for the two. The process writes to the first, and a process of the
+      // user that writes to one of the others believes what it finds there,
+      // so the command is kept out of all of them: each is made, bound
+      // read-only where it is, and what lies above it pinned.
+      const at = (name: string): string => {
+        const dir = join(HOME, name, 'deeper')
+        mkdirSync(dir, { recursive: true, mode: 0o700 })
+        chmodSync(dir, 0o700)
+        return dir
+      }
+      const runtimeDir = at('run-user')
+      const tempDir = at('tmp-root')
+      const XDG_RUNTIME_DIR = at('xdg')
+      const TMPDIR = at('tmpdir')
+      const every = [
+        join(runtimeDir, 'srt-mount-points'),
+        join(tempDir, `srt-mount-points-${UID}`),
+        join(XDG_RUNTIME_DIR, 'srt-mount-points'),
+        join(TMPDIR, `srt-mount-points-${UID}`),
+      ]
+
+      const recording = wrapped(
+        { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
+        { XDG_RUNTIME_DIR, TMPDIR },
+        { runtimeDir, tempDir },
+      )
+      expect(recording).toContain(`--lock-file ${every[0]}/`)
+      expect(countMounts(recording, '--ro-bind', every[0]!, every[0]!)).toBe(1)
+      for (const dir of every.slice(1)) {
+        expect(recording).toContain(`--ro-bind-try ${dir} ${dir} `)
+      }
+      for (const dir of every) {
+        expect(lstatSync(dir).isDirectory()).toBe(true)
+        expect(lstatSync(dir).mode & 0o777).toBe(0o700)
+        expectPinned(recording, dirname(dir))
+        expectPinned(recording, dirname(dirname(dir)))
+      }
+      // Nothing was written to any but the first.
+      for (const dir of every.slice(1)) {
+        expect(readdirSync(dir)).toEqual([])
+      }
+
+      // A wrap with nothing to record writes nowhere, and binds all four.
+      const other = wrapped(
+        { writeConfig: { allowOnly: [HOME], denyWithinAllow: [] } },
+        { XDG_RUNTIME_DIR, TMPDIR },
+        { runtimeDir, tempDir },
+      )
+      expect(other).not.toContain('--lock-file')
+      for (const dir of every) {
+        expect(other).toContain(`--ro-bind-try ${dir} ${dir} `)
+        expectPinned(other, dirname(dir))
+      }
+    })
+
     it('are pinned above the directory of its own a process settles on as it records', () => {
       // Neither shared name will do, so the wrap makes a directory only this
       // process knows, and makes it as it publishes: after the pins.
       takeTheSharedName()
-      const command = wrapped(
-        { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
-        { XDG_RUNTIME_DIR: undefined },
-      )
+      const command = wrapped({
+        writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] },
+      })
       expect(command).toMatch(
         new RegExp(`--lock-file ${TMP}/srt-mount-points-[A-Za-z0-9]{6}/`),
       )
@@ -1891,12 +2407,17 @@ describe.if(isLinux)(
       // The manifests are out of the way, under a runtime directory outside
       // the write root: the temp dir is pinned for the source alone.
       takeTheSharedName()
-      const command = wrapped({
-        writeConfig: {
-          allowOnly: [HOME],
-          denyWithinAllow: [join(HOME, 'absent', 'leaf')],
+      const command = wrapped(
+        {
+          writeConfig: {
+            allowOnly: [HOME],
+            denyWithinAllow: [join(HOME, 'absent', 'leaf')],
+          },
         },
-      })
+        {},
+        { runtimeDir: runtime.places().runtimeDir },
+      )
+      expect(command).toContain(`--lock-file ${runtime.manifestDir()}/`)
       expect(command).toMatch(
         new RegExp(`--ro-bind ${TMP}/claude-empty-\\S+ ${HOME}/absent `),
       )
@@ -1937,26 +2458,25 @@ describe.if(isLinux)(
       symlinkSync('real-tmp', through)
       const command = wrapped(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [] } },
-        { XDG_RUNTIME_DIR: undefined, TMPDIR: through },
+        { TMPDIR: through },
+        { tempDir: through },
       )
       expectPinned(command, real)
       expect(countMounts(command, '--ro-bind', through, through)).toBe(0)
     })
 
     it('are not pinned where the temp dir is itself the write root, or outside every one', () => {
-      const inside = wrapped(
-        { writeConfig: { allowOnly: [TMP], denyWithinAllow: [] } },
-        { XDG_RUNTIME_DIR: undefined },
-      )
+      const inside = wrapped({
+        writeConfig: { allowOnly: [TMP], denyWithinAllow: [] },
+      })
       expect(countMounts(inside, '--bind', TMP, TMP)).toBe(1)
       expect(countMounts(inside, '--ro-bind', TMP, TMP)).toBe(0)
 
       const AREA = join(BASE, 'area')
       mkdirSync(AREA)
-      const outside = wrapped(
-        { writeConfig: { allowOnly: [AREA], denyWithinAllow: [] } },
-        { XDG_RUNTIME_DIR: undefined },
-      )
+      const outside = wrapped({
+        writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+      })
       expect(countMounts(outside, '--ro-bind', TMP, TMP)).toBe(0)
       expect(countMounts(outside, '--ro-bind', HOME, HOME)).toBe(0)
     })
@@ -2020,14 +2540,10 @@ describe.if(isLinux)(
           }
           expect(lstatSync(GUARD).size).toBe(0)
 
-          const collector = inAChild(
-            'collector.ts',
-            [
-              `import { cleanupBwrapMountPoints } from ${LIBRARY}`,
-              `cleanupBwrapMountPoints()`,
-            ],
-            { XDG_RUNTIME_DIR: undefined },
-          )
+          const collector = inAChild('collector.ts', [
+            `import { cleanupBwrapMountPoints } from ${LIBRARY}`,
+            `cleanupBwrapMountPoints()`,
+          ])
           expect(collector.status).toBe(0)
           expect(existsSync(GUARD)).toBe(true)
         } finally {
@@ -2060,10 +2576,11 @@ describe.if(isLinux)(
 describe.if(isLinux)(
   'The manifest directory under a temp dir whose name is a link',
   () => {
-    usePrivateManifestDirectory()
+    const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
-    const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    const LIBRARY_PATH = join(
+      import.meta.dir,
+      '../../src/sandbox/linux-sandbox-utils.ts',
     )
     const UID = isLinux ? process.getuid!() : 0
     let BASE: string
@@ -2083,9 +2600,9 @@ describe.if(isLinux)(
     })
 
     /**
-     * What a process whose temp dir is `through`, and which has no runtime
-     * directory, wraps `command` as with that deny list, and what the command
-     * said when run.
+     * What a process whose temp dir is `through`, as `/tmp` is, and which has
+     * no runtime directory, wraps `command` as with that deny list, and what
+     * the command said when run.
      */
     function wrappedAndRun(
       through: string,
@@ -2094,11 +2611,17 @@ describe.if(isLinux)(
       store?: string,
     ): { wrapped: string; status: number | null; said: string } {
       const file = join(BASE, 'wrap-and-run.ts')
+      const library = JSON.stringify(
+        runtime.isolated(LIBRARY_PATH, {
+          runtimeDir: join(BASE, 'no-runtime-directory'),
+          tempDir: through,
+        }),
+      )
       writeFileSync(
         file,
         [
           `import { spawnSync } from 'node:child_process'`,
-          `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+          `import { wrapCommandWithSandboxLinux } from ${library}`,
           `const wrapped = await wrapCommandWithSandboxLinux({`,
           `  command: ${JSON.stringify(command)},`,
           `  needsNetworkRestriction: false,`,
@@ -2265,7 +2788,7 @@ describe.if(isLinux)(
 describe.if(isLinux)(
   'A mount point a running sandbox relies on, seen from another PID namespace',
   () => {
-    usePrivateManifestDirectory()
+    const runtime = usePrivateManifestDirectory()
     // A second PID namespace with a /proc of its own, uid unchanged, no root.
     const IN_NEW_PID_NAMESPACE = [
       'unshare',
@@ -2281,9 +2804,13 @@ describe.if(isLinux)(
         ...IN_NEW_PID_NAMESPACE.slice(1),
         'true',
       ]).status === 0
-    const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    const LIBRARY_PATH = join(
+      import.meta.dir,
+      '../../src/sandbox/linux-sandbox-utils.ts',
     )
+    // For a child process: the library with this describe's stand-ins in
+    // place.
+    const LIBRARY = JSON.stringify(runtime.isolated(LIBRARY_PATH))
     let BASE: string
     let AREA: string
     let LOCK: string

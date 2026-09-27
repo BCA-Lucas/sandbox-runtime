@@ -10,9 +10,12 @@ import * as os from 'os'
 import * as path from 'path'
 import { type Writable } from 'stream'
 import { isLinux, isWindows } from './helpers/platform.js'
+import { isolatedProgram } from './helpers/private-manifest-directory.js'
 
-// Get the path to the built CLI
-const CLI_PATH = path.join(process.cwd(), 'dist', 'cli.js')
+// Get the path to the built CLI: the tool itself, started with directories of
+// the run's own in place of the ones it keeps its mount point manifests in,
+// which are every other srt process's of the user.
+const CLI_PATH = isolatedProgram(path.join(process.cwd(), 'dist', 'cli.js'))
 
 // srt is expected to exit on its own shortly after the wrapped command
 // (which runs for well under a second) finishes; a hang is a failure, not

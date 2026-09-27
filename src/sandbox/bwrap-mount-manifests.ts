@@ -25,19 +25,32 @@
  * The lock belongs to the sandbox's init process, not to the command: bwrap
  * opens the manifest with O_CLOEXEC, so the descriptor does not survive the
  * exec into the command, and a POSIX lock is only dropped by the process that
- * took it. The directory is bound read-only into every sandbox that
- * restricts writes at all, whether or not its own invocation names a manifest
- * in it, and so is the other name a process of the same user would keep its
- * manifests under (see {@link mountPointManifestDirectories}), so a sandboxed
- * command can neither delete nor rewrite one, its own or another sandbox's;
- * and the directories between each of them and the write root it lies in are
- * pinned there, so that the command cannot rename one aside and make the
- * directory again under the old name, with manifests of its own in it.
+ * took it.
+ *
+ * Two processes of one user keep each other's mount points only when each
+ * reads what the other writes, so where the manifests go is worked out from
+ * the user id and the file system before the environment, which differs
+ * between a login shell and what a service, an IDE or cron starts: see
+ * {@link manifestDirectoryCandidates}. A process writes to the first of those
+ * directories it can use, and believes what it finds in the ones that come
+ * from the user id, or, where it can use none of those, in the ones its
+ * environment names (see {@link believedManifestDirectories}).
+ *
+ * Every one of them is bound read-only into every sandbox that restricts
+ * writes at all, whether or not its own invocation names a manifest, and
+ * whichever of them the wrapping process writes to (see
+ * {@link mountPointManifestDirectories}), so a sandboxed command can neither
+ * delete nor rewrite a manifest, its own or another sandbox's; one that is
+ * not there is made first, so that the command cannot make it itself, with
+ * manifests of its own in it; and the directories between each of them and
+ * the write root it lies in are pinned there, so that the command cannot
+ * rename one aside and make the directory again under the old name.
  * What that leaves out is a sandbox this library did not start, or an older
- * release of it did, with the directory writable, a process that looks
- * for its runtime or temp directory somewhere this one does not, and a
- * runtime or temp directory whose name is a link inside a write root, or not
- * there yet below one: neither can be pinned.
+ * release of it did, with a directory writable, the sandbox of a process with
+ * another environment where a process has to keep its manifests under a name
+ * its own environment gives, and a directory whose name, or a name above it,
+ * is a link inside a write root, or whose parent is not there yet below one:
+ * neither can be pinned.
  *
  * Both of the kernel's answers are relative to a PID namespace: /proc/locks
  * lists a lock only when its holder has a pid in the namespace of the /proc
@@ -289,7 +302,7 @@ function deviceOf(dev: bigint): string {
  * device of their own - and there only the inode number can be compared.
  */
 const FILESYSTEMS_WITH_ONE_DEVICE = new Set([
-  0x01021994, // tmpfs, which is what $XDG_RUNTIME_DIR is
+  0x01021994, // tmpfs, which is what /run/user/UID is
   0xef53, // ext2, ext3, ext4
   0x58465342, // xfs
 ])
@@ -308,8 +321,8 @@ type Locks = {
   inodes: Set<string>
   /** The same locks as `major:minor:inode`, in decimal. */
   files: Set<string>
-  /** Whether a manifest's device can be held against `files`. */
-  comparesDevices: boolean
+  /** The directories whose manifests' device can be held against `files`. */
+  comparesDevices: Set<string>
 }
 
 /**
@@ -328,22 +341,22 @@ type Locks = {
  */
 function holdsLock(
   locks: Locks,
-  file: { inode: string; device: string },
+  file: { file: string; inode: string; device: string },
 ): boolean {
-  return locks.comparesDevices
+  return locks.comparesDevices.has(path.dirname(file.file))
     ? locks.files.has(`${file.device}:${file.inode}`)
     : locks.inodes.has(file.inode)
 }
 
 /**
- * What /proc/locks lists, for the manifests in `dir`. Only the locks whose
+ * What /proc/locks lists, for the manifests in `dirs`. Only the locks whose
  * holder has a pid in the PID namespace of the /proc being read are listed,
  * which is why a manifest from another namespace is never judged by this.
  *
  * `undefined` when the list could not be read, which every caller reads as
  * "every manifest is locked".
  */
-function readLocks(dir: string): Locks | undefined {
+function readLocks(dirs: readonly string[]): Locks | undefined {
   let text: string
   try {
     text = fs.readFileSync('/proc/locks', 'utf8')
@@ -371,7 +384,11 @@ function readLocks(dir: string): Locks | undefined {
       }
     }
   }
-  return { inodes, files, comparesDevices: reportsTheLockedDevice(dir) }
+  return {
+    inodes,
+    files,
+    comparesDevices: new Set(dirs.filter(reportsTheLockedDevice)),
+  }
 }
 
 /** Whether `dir` is a directory of ours that nobody else can write, and we can. */
@@ -446,29 +463,140 @@ function isBuriedBySandboxMounts(dir: string): boolean {
 }
 
 /**
- * The names under which the processes of this user keep their manifests where
- * several can find them, in the order they are tried: under $XDG_RUNTIME_DIR
- * when there is one, else under the system temp dir. One that a sandbox's own
- * mounts would bury is left out.
+ * The places the manifest directories are looked for in. The first two are
+ * the same for every process of a user, whatever started it; the last two are
+ * what this process's environment says.
  */
-function sharedManifestDirectoryNames(): string[] {
-  const runtimeDir = process.env['XDG_RUNTIME_DIR']
-  const shared =
-    runtimeDir !== undefined && path.isAbsolute(runtimeDir)
-      ? [path.join(runtimeDir, 'srt-mount-points')]
-      : []
-  shared.push(
-    path.join(tmpdir(), `srt-mount-points-${process.getuid?.() ?? 0}`),
-  )
-  return shared.filter(candidate => !isBuriedBySandboxMounts(candidate))
+export type ManifestDirectoryPlaces = {
+  /** The user's runtime directory where the system keeps one: /run/user/UID. */
+  runtimeDir: string
+  /** The temp dir every process can name: /tmp. */
+  tempDir: string
+  /** $XDG_RUNTIME_DIR, where it is set. */
+  environmentRuntimeDir: string | undefined
+  /** The system temp dir as this process sees it, which is $TMPDIR's. */
+  environmentTempDir: string
+}
+
+// What a test has put in the place of some of those, and nothing else has.
+let placesForTesting: Partial<ManifestDirectoryPlaces> | undefined
+
+function manifestDirectoryPlaces(): ManifestDirectoryPlaces {
+  return {
+    runtimeDir: `/run/user/${process.getuid?.() ?? 0}`,
+    tempDir: '/tmp',
+    environmentRuntimeDir: process.env['XDG_RUNTIME_DIR'],
+    environmentTempDir: tmpdir(),
+    ...placesForTesting,
+  }
 }
 
 /**
- * The directory manifests live in: under $XDG_RUNTIME_DIR when there is one,
- * else a per-user directory under the system temp dir, else - when neither can
- * be made ours alone and written, as in a sandbox that binds them read-only -
- * a private directory only this process knows, which keeps the guarantee
- * within this process and loses only what other processes would have read.
+ * Whether `dir` is a runtime directory of this user's as the system makes
+ * one: a real directory, not a link to one, the user's, and nobody else's to
+ * look into.
+ */
+function isTheUsersRuntimeDirectory(dir: string): boolean {
+  try {
+    const stat = fs.lstatSync(dir)
+    return (
+      stat.isDirectory() &&
+      stat.uid === process.getuid?.() &&
+      (stat.mode & 0o077) === 0
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Where the directory `name` names really is, as far as that can be told
+ * before it is made: under its parent as the links above it resolve, by its
+ * own last component.
+ */
+function whereItReallyIs(name: string): string {
+  try {
+    return path.join(fs.realpathSync(path.dirname(name)), path.basename(name))
+  } catch {
+    return path.resolve(name)
+  }
+}
+
+/**
+ * The names under which the processes of this user keep their manifests where
+ * several can find them, in the order they are tried for writing:
+ * - `/run/user/UID/srt-mount-points`, where `/run/user/UID` is a runtime
+ *   directory of the user's (see {@link isTheUsersRuntimeDirectory});
+ * - `/tmp/srt-mount-points-UID`;
+ * - `$XDG_RUNTIME_DIR/srt-mount-points`, where that is set;
+ * - `srt-mount-points-UID` under the system temp dir, which is `$TMPDIR`'s.
+ *
+ * The user id and the file system come first because they are the same for
+ * every process of the user. The environment is not: a login shell and what a
+ * service, an IDE, cron or `docker exec` starts differ in `XDG_RUNTIME_DIR`,
+ * two shells can differ in `TMPDIR`, and two processes that each wrote where
+ * their own environment said never read each other's manifests. The second
+ * wrap then took the first's mount point for the user's own file, and the
+ * first's clean-up removed it from under the second sandbox. The names from
+ * the environment stay, last, for a process that can use neither of the first
+ * two.
+ *
+ * Two names for one directory are one, the earlier, by where they really are.
+ * One that a sandbox's own mounts would bury is left out.
+ */
+function manifestDirectoryCandidates(): {
+  name: string
+  fromTheEnvironment: boolean
+}[] {
+  const places = manifestDirectoryPlaces()
+  const perUser = `srt-mount-points-${process.getuid?.() ?? 0}`
+  const names: { name: string; fromTheEnvironment: boolean }[] = []
+  if (isTheUsersRuntimeDirectory(places.runtimeDir)) {
+    names.push({
+      name: path.join(places.runtimeDir, 'srt-mount-points'),
+      fromTheEnvironment: false,
+    })
+  }
+  names.push({
+    name: path.join(places.tempDir, perUser),
+    fromTheEnvironment: false,
+  })
+  if (
+    places.environmentRuntimeDir !== undefined &&
+    path.isAbsolute(places.environmentRuntimeDir)
+  ) {
+    names.push({
+      name: path.join(places.environmentRuntimeDir, 'srt-mount-points'),
+      fromTheEnvironment: true,
+    })
+  }
+  names.push({
+    name: path.join(places.environmentTempDir, perUser),
+    fromTheEnvironment: true,
+  })
+  const found = new Set<string>()
+  return names.filter(candidate => {
+    const where = whereItReallyIs(candidate.name)
+    if (isBuriedBySandboxMounts(candidate.name) || found.has(where)) {
+      return false
+    }
+    found.add(where)
+    return true
+  })
+}
+
+/** The names of {@link manifestDirectoryCandidates}, in their order. */
+function sharedManifestDirectoryNames(): string[] {
+  return manifestDirectoryCandidates().map(candidate => candidate.name)
+}
+
+/**
+ * The directory this process writes its manifests to: the first of the shared
+ * names (see {@link sharedManifestDirectoryNames}) that is, or can be made, a
+ * directory of ours alone that we can write, else - when none can, as in a
+ * sandbox that binds them read-only - a private directory only this process
+ * knows, which keeps the guarantee within this process and loses only what
+ * other processes would have read.
  *
  * Revalidated on every use: the temp dir is somewhere sandboxed commands
  * commonly write, and a directory swapped for a symlink between two wraps
@@ -489,11 +617,14 @@ function ensureManifestDirectory(): string | undefined {
     }
   }
   manifestDirectory = undefined
-  if (manifestDirectoryUnavailable || isBuriedBySandboxMounts(tmpdir())) {
+  const systemTempDir = manifestDirectoryPlaces().environmentTempDir
+  if (manifestDirectoryUnavailable || isBuriedBySandboxMounts(systemTempDir)) {
     return undefined
   }
   try {
-    const private_ = fs.mkdtempSync(path.join(tmpdir(), 'srt-mount-points-'))
+    const private_ = fs.mkdtempSync(
+      path.join(systemTempDir, 'srt-mount-points-'),
+    )
     if (!makeOurPrivateDirectory(private_)) {
       // A temp dir that keeps no modes or ownership: nothing made in it can be
       // told from somebody else's, now or on the next call.
@@ -535,24 +666,71 @@ function isOurDirectory(dir: string): boolean {
 }
 
 /**
+ * Every directory whose manifests this process believes, for a wrap, a
+ * clean-up and {@link liveMountPoints} to read:
+ * - each of the names that come from the user id that is there and is a
+ *   directory of ours alone that we can write, whichever of them this process
+ *   writes to;
+ * - the names the environment gives, held to the same, only where none of
+ *   the first kind will do, which is where this process writes to one of
+ *   them;
+ * - the one this process has settled on, whatever it is.
+ *
+ * What the environment names is kept out of a sandboxed command's reach by
+ * the processes whose environment names it, and by no other: a process with
+ * another temp dir does not know of it, and its command may write there. A
+ * manifest planted that way would keep a path, or have one removed, on the
+ * word of a process that never relied on the directory, so it is believed
+ * only by a process that has nowhere else to keep its own. Nothing is lost by
+ * that: every process that can use a name from the user id meets every other
+ * one there.
+ *
+ * One that is a link, somebody else's, open to others or not to be written is
+ * passed over: what is in it is not believed, and nothing fails for it.
+ * Nothing is made.
+ */
+function believedManifestDirectories(): string[] {
+  const usable = manifestDirectoryCandidates().filter(candidate =>
+    isOurPrivateDirectory(candidate.name),
+  )
+  const fromTheUserId = usable.filter(
+    candidate => !candidate.fromTheEnvironment,
+  )
+  const dirs = (fromTheUserId.length > 0 ? fromTheUserId : usable).map(
+    candidate => candidate.name,
+  )
+  if (
+    manifestDirectory !== undefined &&
+    !dirs.includes(manifestDirectory) &&
+    isOurPrivateDirectory(manifestDirectory)
+  ) {
+    dirs.push(manifestDirectory)
+  }
+  return dirs
+}
+
+/**
  * Every directory a sandbox must not be able to write, because some process
  * of this user keeps manifests in it and a collect on the host believes what
- * it finds there: both shared names, as this process sees them, and the one
- * this process has settled on where that is neither. For a wrap to bind
+ * it finds there: every shared name, as this process sees them, and the one
+ * this process has settled on where that is none of them. For a wrap to bind
  * read-only, whether or not it has a manifest of its own.
  *
- * Both names, and not only the one this process uses: a process started with
- * $XDG_RUNTIME_DIR uses the first and one started without it (from cron, over
- * a plain ssh, as a service) the second, and a sandbox of the first kind with
- * the temp dir writable could otherwise delete and forge the manifests of the
- * second. Each is made if it can be, so that a sandboxed command cannot make
- * it first and fill it before the process that will believe it comes along;
- * one that is there and the user's is listed even when it cannot be written
- * from here. The last resort is not made for this: there is nothing to keep
- * out of reach in a directory nobody has made. A wrap that is about to record
- * says so with `recording`, and the directory its manifest will go to is then
- * settled first, the last resort included: the wrap has to know every one of
- * these before it publishes, to pin what lies above them.
+ * Every name, and not only the one this process writes to: every process of
+ * the user believes what is under the ones that come from the user id, and
+ * one with this environment that can use none of those what is under the
+ * ones the environment gives, so a sandbox with the temp dir writable could
+ * otherwise delete and forge manifests in the one under it while its own
+ * process writes under the runtime directory. Each is made if it can be, so
+ * that a sandboxed command cannot make it first and fill it before a process
+ * that will believe it comes along: the command runs as the user, so what it
+ * makes passes every check of owner and mode, which keep other users out and
+ * not the command. One that is there and the user's is listed even when it
+ * cannot be written from here. The last resort is not made for this: there is
+ * nothing to keep out of reach in a directory nobody has made. A wrap that is
+ * about to record says so with `recording`, and the directory its manifest
+ * will go to is then settled first, the last resort included: the wrap has to
+ * know every one of these before it publishes, to pin what lies above them.
  */
 export function mountPointManifestDirectories(recording = false): string[] {
   if (!onLinux()) {
@@ -1094,34 +1272,44 @@ export function discardMountPointManifest(file: string): void {
 }
 
 /**
- * The mount points the manifests name, on one reading of the directory:
- * `live`, by a manifest whose sandbox may still be running, and `named`, by
- * any manifest at all. What only a finished manifest names is what a sandbox
- * that has ended left behind and no pass has collected yet, and the next pass
- * in any process removes it on that manifest's word.
+ * The path of every file in `dirs`, for a reading on which nothing is
+ * removed: a directory that cannot be listed adds nothing.
+ */
+function filesIn(dirs: readonly string[]): string[] {
+  return dirs.flatMap(dir => {
+    try {
+      return fs.readdirSync(dir).map(name => path.join(dir, name))
+    } catch {
+      return []
+    }
+  })
+}
+
+/**
+ * The mount points the manifests name, on one reading of every directory this
+ * process believes (see {@link believedManifestDirectories}): `live`, by a
+ * manifest whose sandbox may still be running, and `named`, by any manifest at
+ * all. What only a finished manifest names is what a sandbox that has ended
+ * left behind and no pass has collected yet, and the next pass in any process
+ * removes it on that manifest's word.
  *
- * `live` is empty when /proc/locks cannot be read, and both are when the
- * directory cannot be. A wrap takes an existing path for a mount point on a
- * manifest's word only, never by the look of it, so it then takes every
- * existing path for the caller's own.
+ * `live` is empty when /proc/locks cannot be read, and a directory that
+ * cannot be listed adds to neither. A wrap takes an existing path for a mount
+ * point on a manifest's word only, never by the look of it, so with none to
+ * be read it takes every existing path for the caller's own.
  */
 export function namedMountPoints(): { live: Set<string>; named: Set<string> } {
   const live = new Set<string>()
   const named = new Set<string>()
-  const dir = onLinux() ? ensureManifestDirectory() : undefined
-  if (dir === undefined) {
+  if (!onLinux()) {
     return { live, named }
   }
-  const locks = readLocks(dir)
-  let names: string[]
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return { live, named }
-  }
-  for (const name of names) {
-    if (!name.endsWith(MANIFEST_SUFFIX)) continue
-    const manifest = readManifest(path.join(dir, name))
+  ensureManifestDirectory()
+  const dirs = believedManifestDirectories()
+  const locks = dirs.length > 0 ? readLocks(dirs) : undefined
+  for (const file of filesIn(dirs)) {
+    if (!file.endsWith(MANIFEST_SUFFIX)) continue
+    const manifest = readManifest(file)
     if (manifest === undefined) continue
     const isLiveOne = locks !== undefined && isLive(manifest, locks)
     for (const mountPoint of manifest.paths) {
@@ -1132,19 +1320,6 @@ export function namedMountPoints(): { live: Set<string>; named: Set<string> } {
     }
   }
   return { live, named }
-}
-
-/**
- * The directory this process keeps its manifests in, if it is there already:
- * the one it has settled on, else the first of the shared names that is a
- * directory of the user's alone. Nothing is made, and nothing is settled: for
- * a look that has to leave the host as it found it.
- */
-function existingManifestDirectory(): string | undefined {
-  return manifestDirectory !== undefined &&
-    isOurPrivateDirectory(manifestDirectory)
-    ? manifestDirectory
-    : sharedManifestDirectoryNames().find(isOurPrivateDirectory)
 }
 
 /**
@@ -1174,7 +1349,7 @@ function isEmptyMountPoint(p: string): boolean {
  * its own accord after a command, to leave out the ones in this set. Removing
  * a mount point from under a running sandbox lifts the deny there.
  *
- * It is a snapshot, taken without a lock, from one listing of the manifest
+ * It is a snapshot, taken without a lock, from one listing of each manifest
  * directory and one reading of /proc/locks, and it may be out of date by the
  * time the caller acts on it: a sandbox can start on a path the moment after.
  * Its only safe use is to SKIP a removal. That a path is not in it never
@@ -1196,39 +1371,33 @@ function isEmptyMountPoint(p: string): boolean {
  * directories above the last component resolved and the last component as it
  * stands. A caller compares its own paths in that form.
  *
- * The manifests are believed as found. Their directory can be written by the
- * user's own processes outside any sandbox; every sandbox that restricts
- * writes has it bound read-only, with the directories between it and the
- * write root it lies in pinned, which does not reach a runtime or temp
- * directory whose name is a link inside a write root, nor a runtime directory
- * that is not there yet below one. It answers for one manifest directory,
- * the one this process keeps its manifests in or, before it has kept any, the
- * first of the shared names that is there, so a sandbox of a process that
- * keeps its manifests elsewhere, or of something that writes none, is not
- * seen.
+ * The manifests are believed as found. Their directories can be written by
+ * the user's own processes outside any sandbox; every sandbox that restricts
+ * writes has each of them bound read-only, with the directories between it
+ * and the write root it lies in pinned, which does not reach a directory
+ * whose name, or a name above it, is a link inside a write root, nor one
+ * whose parent is not there yet below one. It answers for every manifest
+ * directory this process believes (see {@link believedManifestDirectories}),
+ * whichever of them it writes to, so a sandbox of a process that keeps its
+ * manifests under a name its environment gives, or in a directory of its own,
+ * for want of a name from the user id that it can use, or of something that
+ * writes none, is not seen.
  *
- * Makes nothing on the host, the manifest directory included. Empty where
+ * Makes nothing on the host, a manifest directory included. Empty where
  * there is no manifest directory, and anywhere but on Linux.
  */
 export function liveMountPoints(): ReadonlySet<string> {
   const spared = new Set<string>()
-  const dir = onLinux() ? existingManifestDirectory() : undefined
-  if (dir === undefined) {
+  const dirs = onLinux() ? believedManifestDirectories() : []
+  if (dirs.length === 0) {
     return spared
   }
-  const locks = readLocks(dir)
-  let names: string[]
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return spared
-  }
+  const locks = readLocks(dirs)
   const live = new Set<string>()
   const named = new Set<string>()
   let cannotTell = locks === undefined
-  for (const name of names) {
-    if (!name.endsWith(MANIFEST_SUFFIX)) continue
-    const file = path.join(dir, name)
+  for (const file of filesIn(dirs)) {
+    if (!file.endsWith(MANIFEST_SUFFIX)) continue
     const manifest = readManifest(file)
     if (manifest === undefined) {
       // Gone since the listing, or not to be read: held to what the clean-up
@@ -1238,6 +1407,7 @@ export function liveMountPoints(): ReadonlySet<string> {
         cannotTell ||=
           locks === undefined ||
           holdsLock(locks, {
+            file,
             inode: String(stat.ino),
             device: deviceOf(stat.dev),
           }) ||
@@ -1268,6 +1438,11 @@ export function liveMountPoints(): ReadonlySet<string> {
  * over, and remove every mount point no live manifest names, from any process,
  * at any time, any number of times. Returns the mount points removed. Does
  * nothing anywhere but on Linux.
+ *
+ * One pass for each directory this process believes, under that directory's
+ * lock: a pass takes off the disk what the finished manifests of its own
+ * directory name, and those manifests, and goes by the manifests of every
+ * directory for what is still relied on.
  */
 export function collectMountPoints(
   release: OwnManifestRelease = 'all',
@@ -1287,24 +1462,32 @@ export function collectMountPoints(
       own.over = true
     }
   }
-  const dir = ensureManifestDirectory()
-  if (dir === undefined) {
-    return []
-  }
-  const collected = withDirectoryLock(dir, () => collectUnderLock(dir))
-  if (!collected.ran) {
+  ensureManifestDirectory()
+  const dirs = believedManifestDirectories()
+  const removed: string[] = []
+  for (const dir of dirs) {
+    const collected = withDirectoryLock(dir, () => collectUnderLock(dir, dirs))
+    if (collected.ran) {
+      removed.push(...collected.value)
+      continue
+    }
     logForDebugging(
       collected.held
         ? `[Sandbox Linux] The lock on the mount point directory could not be had, leaving this pass to whoever has it: ${dir}`
         : `[Sandbox Linux] No lock can be taken on the mount point directory from here, so nothing is collected from it until that is put right: ${dir}`,
     )
-    return []
   }
-  return collected.value
+  return removed
 }
 
 /**
- * One pass, which the caller makes under the directory lock where it can.
+ * One pass over `dir`, which the caller makes under that directory's lock
+ * where it can. `dirs` is every directory this process believes, `dir` among
+ * them. The pass reads the manifests of all of them, and a mount point stays
+ * while a live manifest in any of them names it; what it takes off the disk
+ * is what the finished manifests of `dir` name, and those manifests. What the
+ * finished manifests of another directory name goes at the pass over that
+ * one, under its lock.
  *
  * Nothing is taken off the disk until the end. A manifest is all that names
  * its mount points, so it goes last, after them, and only when every one of
@@ -1317,7 +1500,7 @@ export function collectMountPoints(
  * The lock does not exclude (see {@link withDirectoryLock}), so the pass does
  * not rely on the directory staying as first listed. Immediately before it
  * removes anything, and again whenever its last listing is more than
- * {@link LISTING_GOOD_FOR_MS} old, it lists the directory again, where a
+ * {@link LISTING_GOOD_FOR_MS} old, it lists every directory again, where a
  * manifest that was not there at first keeps everything it names whatever
  * else is true of it: that is how a sandbox about to start on the same path
  * shows. And before the first removal, and again every
@@ -1332,10 +1515,17 @@ export function collectMountPoints(
  * longer than that between looking and removing, with a sandbox starting on
  * the same path in that time, still takes that sandbox's mount point away.
  */
-function collectUnderLock(dir: string): string[] {
-  let names: string[]
+function collectUnderLock(dir: string, dirs: readonly string[]): string[] {
+  // Every file in every directory, or nothing: a directory that is believed
+  // and cannot be listed may hold the manifest of a running sandbox.
+  const listEveryDirectory = (): string[] =>
+    dirs.flatMap(each =>
+      fs.readdirSync(each).map(name => path.join(each, name)),
+    )
+  const isHere = (file: string): boolean => path.dirname(file) === dir
+  let files: string[]
   try {
-    names = fs.readdirSync(dir)
+    files = listEveryDirectory()
   } catch (e) {
     logForDebugging(
       `[Sandbox Linux] The mount point manifests could not be listed (${String(e)}) - nothing removed`,
@@ -1345,9 +1535,8 @@ function collectUnderLock(dir: string): string[] {
   }
   const manifests: Manifest[] = []
   const unreadable: string[] = []
-  for (const name of names) {
-    if (!name.endsWith(MANIFEST_SUFFIX)) continue
-    const file = path.join(dir, name)
+  for (const file of files) {
+    if (!file.endsWith(MANIFEST_SUFFIX)) continue
     const manifest = readManifest(file)
     if (manifest === undefined) {
       unreadable.push(file)
@@ -1355,17 +1544,17 @@ function collectUnderLock(dir: string): string[] {
       manifests.push(manifest)
     }
   }
-  const locks = readLocks(dir)
+  const locks = readLocks(dirs)
   if (locks === undefined) {
     return []
   }
   // What the pass knows of: the first listing, so that everything found
   // later is a newcomer.
-  const known = new Set(names)
+  const known = new Set(files)
   // A manifest of this process that something else has taken off the disk is
   // nothing to remember.
   for (const file of ownManifests.keys()) {
-    if (path.dirname(file) === dir && !known.has(path.basename(file))) {
+    if (isHere(file) && !known.has(file)) {
       ownManifests.delete(file)
     }
   }
@@ -1387,13 +1576,14 @@ function collectUnderLock(dir: string): string[] {
     const age = Date.now() - Number(stat.mtimeMs)
     if (
       holdsLock(locks, {
+        file,
         inode: String(stat.ino),
         device: deviceOf(stat.dev),
       }) ||
       age < MANIFEST_GRACE_MS
     ) {
       unreadableIsLive = true
-    } else if (age > UNREADABLE_MANIFEST_MAX_AGE_MS) {
+    } else if (isHere(file) && age > UNREADABLE_MANIFEST_MAX_AGE_MS) {
       try {
         fs.unlinkSync(file)
       } catch {
@@ -1411,9 +1601,8 @@ function collectUnderLock(dir: string): string[] {
 
   // What a process killed between writing a file and moving it into place
   // left. Nothing reads these, and nothing else removes them.
-  for (const name of names) {
-    if (!name.endsWith(TEMPORARY_SUFFIX)) continue
-    const file = path.join(dir, name)
+  for (const file of files) {
+    if (!isHere(file) || !file.endsWith(TEMPORARY_SUFFIX)) continue
     try {
       if (
         Date.now() - fs.lstatSync(file).mtimeMs >
@@ -1450,8 +1639,11 @@ function collectUnderLock(dir: string): string[] {
     }
   }
   // Each path once, and as a mount point where a manifest names it as one.
+  // Only what the finished manifests of this directory name: the others are
+  // kept in `finished` to be asked after again, not to be acted on.
   const candidates = new Map<string, boolean>()
   for (const manifest of finished) {
+    if (!isHere(manifest.file)) continue
     for (const mountPoint of manifest.paths) {
       if (!claimed.has(mountPoint)) {
         candidates.set(mountPoint, false)
@@ -1479,7 +1671,7 @@ function collectUnderLock(dir: string): string[] {
   const listingIsFresh = (): boolean =>
     listedAt !== undefined && performance.now() - listedAt < LISTING_GOOD_FOR_MS
   const readTheLocksAgain = (): boolean => {
-    const locksNow = readLocks(dir)
+    const locksNow = readLocks(dirs)
     if (locksNow === undefined) {
       return false
     }
@@ -1494,16 +1686,15 @@ function collectUnderLock(dir: string): string[] {
     return true
   }
   const listTheDirectoryAgain = (): boolean => {
-    let namesNow: string[]
+    let filesNow: string[]
     try {
-      namesNow = fs.readdirSync(dir)
+      filesNow = listEveryDirectory()
     } catch {
       return false
     }
-    for (const name of namesNow) {
-      if (!name.endsWith(MANIFEST_SUFFIX) || known.has(name)) continue
-      known.add(name)
-      const file = path.join(dir, name)
+    for (const file of filesNow) {
+      if (!file.endsWith(MANIFEST_SUFFIX) || known.has(file)) continue
+      known.add(file)
       const arrived = readManifest(file)
       if (arrived !== undefined) {
         // Published since the pass began: a sandbox is about to start under
@@ -1551,6 +1742,7 @@ function collectUnderLock(dir: string): string[] {
   // The manifests themselves, last. Only a lock taken since can speak for one
   // of these; a manifest somebody else has published in the meantime cannot.
   for (const manifest of finished) {
+    if (!isHere(manifest.file)) continue
     if (!locksAreFresh() && !readTheLocksAgain()) {
       return removed
     }
@@ -1579,13 +1771,23 @@ function collectUnderLock(dir: string): string[] {
 }
 
 /**
- * Forget which directory the manifests are kept in, so that the next use
- * works it out again from the environment. Test seam: a test gives itself a
- * runtime directory of its own, so that what it lists, attacks and collects
- * is never another process's, and this module may have settled on the real
- * one before the test was loaded.
+ * Put directories of a test's own in the place of those the manifest
+ * directories are looked for in (see {@link ManifestDirectoryPlaces}), or,
+ * with nothing, put the real ones back. Test seam, and nothing else may call
+ * it: the real places are every other process's of the user, and a test that
+ * lists, attacks or collects there does so to the sandboxes that user is
+ * running. A place that is left out stays what it really is, so a test can
+ * stand in for `/run/user/UID` and `/tmp` and leave the environment to say the
+ * rest.
+ *
+ * Which directory the manifests are written to is forgotten with it, so that
+ * the next use works it out again: this module may have settled on one before
+ * the test that wants another was loaded.
  */
-export function forgetMountPointManifestDirectory(): void {
+export function setMountPointManifestPlacesForTesting(
+  places?: Partial<ManifestDirectoryPlaces>,
+): void {
+  placesForTesting = places
   manifestDirectory = undefined
   manifestDirectoryIsPrivate = false
   manifestDirectoryUnavailable = false

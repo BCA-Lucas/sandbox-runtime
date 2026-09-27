@@ -2963,10 +2963,10 @@ async function generateFilesystemArgs(
   // a manifest could name any path at all for a collect on the host to
   // remove. That holds for a sandbox whose own wrap names no manifest as much
   // as for one that does, and for the directory some other process of this
-  // user keeps its manifests in as much as for this one's: the directory sits
-  // under the system temp dir wherever there is no $XDG_RUNTIME_DIR, which a
-  // caller's allowWrite commonly covers, and what is in it then belongs to
-  // OTHER sandboxes. So every wrap that restricts writes binds every one of
+  // user keeps its manifests in as much as for this one's: one of them sits
+  // under /tmp whether or not this process writes there, where a caller's
+  // allowWrite commonly reaches, and what is in it then belongs to OTHER
+  // sandboxes. So every wrap that restricts writes binds every one of
   // them read-only (see mountPointManifestDirectories), with what lies above
   // them pinned (they are seeds of the ancestor pins), and a wrap with mount
   // points of its own adds the lock. Emitted after every allow and deny bind,
@@ -2976,8 +2976,8 @@ async function generateFilesystemArgs(
   // the mounts, so a profile with a tmpfs over the temp dir would otherwise
   // leave nothing there to open.
   //
-  // Each is bound where it really is, like a pin, and not at the name the
-  // environment gave for it: bubblewrap makes a bind's destination by name
+  // Each is bound where it really is, like a pin, and not at the name it
+  // was worked out as: bubblewrap makes a bind's destination by name
   // inside the new root before it mounts, and a link on the way whose target
   // is absolute leads nowhere from there ("Can't mkdir"), so with the temp dir
   // reached through such a link no command that restricts writes started.

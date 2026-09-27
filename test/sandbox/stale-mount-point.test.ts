@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import * as fs from 'node:fs'
 import {
   chmodSync,
   existsSync,
@@ -6,7 +7,9 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   rmdirSync,
@@ -51,9 +54,14 @@ function run(
  * For a path whose existence is its meaning that is a lasting fault on the
  * host: a leftover `.git/config.lock` makes every `git config` write outside
  * the sandbox fail with "could not lock config file".
+ *
+ * The killed process leaves its manifest as well, and that is what says the
+ * file is a leftover. The file alone does not: an empty read-only file is
+ * also what somebody keeps at such a path on purpose, and one taken for a
+ * leftover by its shape was removed after the first command.
  */
 describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
-  usePrivateManifestDirectory()
+  const runtime = usePrivateManifestDirectory()
   const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
   let BASE: string
   let AREA: string // allowed write area
@@ -88,22 +96,90 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     })
   }
 
-  /** What bwrap's ensure_file(dest, 0444) leaves on the host. */
-  function plantLeftover(p: string): void {
+  /**
+   * What bwrap's ensure_file(dest, 0444) leaves on the host, and what
+   * somebody's own empty read-only file looks like.
+   */
+  function plantEmptyReadOnlyFile(p: string): void {
     writeFileSync(p, '')
     chmodSync(p, 0o444)
   }
 
-  it('is covered with /dev/null like an absent path, and removed after the command', async () => {
-    plantLeftover(LOCK)
+  /**
+   * The manifest of a wrap that named `paths`, written by `pid`: a process
+   * that is gone, a minute ago, unless told otherwise. Where it is written.
+   */
+  function manifestNaming(
+    paths: string[],
+    writer: { pid: number; start: string } = { pid: deadPid(), start: '1' },
+  ): string {
+    const dir = runtime.manifestDir()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    chmodSync(dir, 0o700)
+    const file = join(
+      dir,
+      `${writer.pid}-${Math.random().toString(16).slice(2).padEnd(16, '0')}.json`,
+    )
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        ...writer,
+        ns: readlinkSync('/proc/self/ns/pid'),
+        created: Date.now() - 60_000,
+        paths,
+        sources: [],
+      }),
+      { mode: 0o600 },
+    )
+    return file
+  }
+
+  /** A pid nothing in this PID namespace has. */
+  function deadPid(): number {
+    let pid = 4194000
+    while (existsSync(`/proc/${pid}`)) pid--
+    return pid
+  }
+
+  /** This process, as a manifest names its writer: running, so it is live. */
+  function thisProcess(): { pid: number; start: string } {
+    const stat = readFileSync('/proc/self/stat', 'utf8')
+    return {
+      pid: process.pid,
+      start: stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(' ')[19]!,
+    }
+  }
+
+  /** What a killed process leaves: the file, and the manifest that names it. */
+  function plantLeftover(p: string): string {
+    plantEmptyReadOnlyFile(p)
+    return manifestNaming([p])
+  }
+
+  /** The mount points the wrap named in its manifest, none without one. */
+  function namedBy(command: string): string[] {
+    const file = /--lock-file (\S+)/.exec(command)?.[1]
+    return file === undefined
+      ? []
+      : (JSON.parse(readFileSync(file, 'utf8')) as { paths: string[] }).paths
+  }
+
+  it('is covered with /dev/null like an absent path, named, and removed after the command', async () => {
+    const left = plantLeftover(LOCK)
 
     const command = await wrap([LOCK])
 
     expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
     expect(countMounts(command, '--ro-bind', LOCK, LOCK)).toBe(0)
+    expect(namedBy(command)).toEqual([LOCK])
 
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(false)
+    expect(existsSync(left)).toBe(false)
   })
 
   it('stays while a wrap of this process is outstanding, and goes with the last of them', async () => {
@@ -127,7 +203,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   // Everything below only LOOKS like a leftover in one respect. Each is
   // somebody's file: bound onto itself as an existing deny path, and still
   // there afterwards.
-  it.each([
+  const somebodysFiles: [string, (p: string) => void][] = [
     [
       'an empty file with write bits (a lockfile, a file made empty on purpose)',
       (p: string) => {
@@ -145,11 +221,12 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     [
       'an empty read-only file with a second link',
       (p: string) => {
-        plantLeftover(p)
+        plantEmptyReadOnlyFile(p)
         linkSync(p, `${p}.other-name`)
       },
     ],
-  ])('leaves %s alone', async (_what, plant) => {
+  ]
+  it.each(somebodysFiles)('leaves %s alone', async (_what, plant) => {
     plant(LOCK)
 
     const command = await wrap([LOCK])
@@ -160,9 +237,211 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     expect(existsSync(LOCK)).toBe(true)
   })
 
+  // A manifest is only a claim about a path: what it names is a leftover
+  // only while it also looks like one.
+  it.each(somebodysFiles)(
+    'leaves %s alone though the manifest of a killed process names it',
+    async (_what, plant) => {
+      plant(LOCK)
+      manifestNaming([LOCK])
+
+      const command = await wrap([LOCK])
+
+      expect(lastMountAt(command, LOCK)).toBe(`--ro-bind ${LOCK} ${LOCK}`)
+      expect(countMounts(command, '--ro-bind', '/dev/null', LOCK)).toBe(0)
+      expect(namedBy(command)).toEqual([])
+      cleanupBwrapMountPoints()
+      expect(existsSync(LOCK)).toBe(true)
+    },
+  )
+
+  // ---- an empty read-only file that no manifest names --------------------
+  //
+  // It is the caller's own, whatever it looks like: an empty `.mcp.json` of
+  // mode 0444, a lockfile somebody keeps in place. It is denied like any
+  // existing path, by a read-only bind onto itself, and nothing ever removes
+  // it.
+
+  it("is the caller's own where no manifest names it: bound onto itself, named by the wrap nowhere, and never removed", async () => {
+    plantEmptyReadOnlyFile(LOCK)
+    // A manifest that names something else changes nothing about it.
+    manifestNaming([join(GIT_DIR, 'other.lock')])
+
+    const command = await wrap([LOCK])
+
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind ${LOCK} ${LOCK}`)
+    expect(countMounts(command, '--ro-bind', '/dev/null', LOCK)).toBe(0)
+    expect(namedBy(command)).toEqual([])
+
+    cleanupBwrapMountPoints()
+    cleanupBwrapMountPoints({ force: true })
+    const kept = lstatSync(LOCK)
+    expect(kept.size).toBe(0)
+    expect(kept.mode & 0o777).toBe(0o444)
+  })
+
+  it("is the caller's own at a mandatory deny path as well, beside the mount points the wrap makes for the others", async () => {
+    const project = join(AREA, 'repo')
+    const own = join(project, '.mcp.json')
+    plantEmptyReadOnlyFile(own)
+    const cwd = process.cwd()
+    process.chdir(project)
+    let command: string
+    try {
+      command = await wrap([])
+    } finally {
+      process.chdir(cwd)
+    }
+
+    expect(lastMountAt(command, own)).toBe(`--ro-bind ${own} ${own}`)
+    // The mandatory denies that are absent get their mount points, and the
+    // manifest names those and not the file that was there.
+    const bashrc = join(project, '.bashrc')
+    expect(lastMountAt(command, bashrc)).toBe(`--ro-bind /dev/null ${bashrc}`)
+    expect(namedBy(command)).toContain(bashrc)
+    expect(namedBy(command)).not.toContain(own)
+
+    cleanupBwrapMountPoints()
+    expect(lstatSync(own).mode & 0o777).toBe(0o444)
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'cannot be written or removed by the command, and is still there, as it was, after the session',
+    async () => {
+      const project = join(AREA, 'repo')
+      const mandatory = join(project, '.mcp.json')
+      plantEmptyReadOnlyFile(mandatory)
+      plantEmptyReadOnlyFile(LOCK)
+      const before = [mandatory, LOCK].map(p => lstatSync(p).ino)
+
+      const attempts = [mandatory, LOCK]
+        .map(
+          p =>
+            `echo x >> ${p}; echo "write $?"; rm -f ${p}; echo "rm $?"; ` +
+            `mv ${p} ${p}.aside; echo "mv $?"; chmod 644 ${p}; echo "chmod $?"`,
+        )
+        .join('; ')
+      const cwd = process.cwd()
+      process.chdir(project)
+      let command: string
+      try {
+        command = await wrap([LOCK], `echo ${BOOTED}; ${attempts}`)
+      } finally {
+        process.chdir(cwd)
+      }
+      expect(namedBy(command)).not.toContain(mandatory)
+      expect(namedBy(command)).not.toContain(LOCK)
+      // The wrap has mount points of its own, for the mandatory denies that
+      // are absent: the clean-up below has something to remove, and removes
+      // that and nothing else.
+      expect(namedBy(command)).toContain(join(project, '.bashrc'))
+
+      const session = run(command, project)
+      expect(session.stdout).toContain(BOOTED)
+      expect(session.stdout).not.toMatch(/(write|rm|mv|chmod) 0/)
+      expect(session.stdout.match(/(write|rm|mv|chmod) [1-9]/g)).toHaveLength(8)
+
+      cleanupBwrapMountPoints()
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(join(project, '.bashrc'))).toBe(false)
+      for (const [i, p] of [mandatory, LOCK].entries()) {
+        const kept = lstatSync(p)
+        expect(kept.ino).toBe(before[i]!)
+        expect(kept.size).toBe(0)
+        expect(kept.mode & 0o777).toBe(0o444)
+        expect(existsSync(`${p}.aside`)).toBe(false)
+      }
+    },
+    30000,
+  )
+
+  it('is asked after again, where the manifests were read before another sandbox named it and made it', async () => {
+    // A wrap reads the manifests once. What was read before the file was
+    // there cannot say whose it is: a sandbox that started in between
+    // published its manifest first and had bubblewrap make the file after.
+    // Taken for the caller's own it was bound onto itself and named by this
+    // wrap nowhere, and went from under its sandbox at the other's clean-up.
+    const earlier = join(GIT_DIR, 'earlier.lock')
+    plantLeftover(earlier)
+    const exists = fs.existsSync
+    let made = false
+    const spy = spyOn(fs, 'existsSync').mockImplementation(((file: unknown) => {
+      if (file === LOCK && !made) {
+        made = true
+        manifestNaming([LOCK], thisProcess())
+        plantEmptyReadOnlyFile(LOCK)
+      }
+      return exists(file as string)
+    }) as never)
+    let command: string
+    try {
+      // `earlier` comes first, and has the manifests read for it.
+      command = await wrap([earlier, LOCK])
+    } finally {
+      spy.mockRestore()
+    }
+    expect(made).toBe(true)
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+    expect(namedBy(command).sort()).toEqual([LOCK, earlier].sort())
+  })
+
+  it('is taken for absent where it has gone, with the manifest that named it, while the wrap was looking', async () => {
+    // Seen with the shape of a mount point, and named by no manifest a moment
+    // later: the sandbox it was made for has ended and been cleaned up after
+    // in between. Bound onto itself it was a source that is not there, and
+    // the command did not start.
+    const left = plantLeftover(LOCK)
+    const readdir = fs.readdirSync
+    let collected = false
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      dir: unknown,
+      options: unknown,
+    ) => {
+      if (dir === runtime.manifestDir() && !collected) {
+        collected = true
+        rmSync(LOCK, { force: true })
+        rmSync(left)
+      }
+      return (readdir as (d: unknown, o: unknown) => unknown)(dir, options)
+    }) as never)
+    let command: string
+    try {
+      command = await wrap([LOCK])
+    } finally {
+      spy.mockRestore()
+    }
+    expect(collected).toBe(true)
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+    expect(namedBy(command)).toEqual([LOCK])
+  })
+
+  // ---- an empty read-only file that a live manifest names ----------------
+
+  it('stays, covered and named, for as long as the manifest of a running sandbox names it, and goes once none does', async () => {
+    plantEmptyReadOnlyFile(LOCK)
+    // Of another wrap, whose writer is running: live.
+    const live = manifestNaming([LOCK], thisProcess())
+
+    const command = await wrap([LOCK])
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+    expect(namedBy(command)).toEqual([LOCK])
+
+    // This wrap is over; the other sandbox still relies on the file.
+    cleanupBwrapMountPoints()
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(LOCK)).toBe(true)
+    expect(existsSync(live)).toBe(true)
+
+    // And that one is over too: what it leaves is a finished manifest.
+    rmSync(live)
+    manifestNaming([LOCK])
+    cleanupBwrapMountPoints()
+    expect(existsSync(LOCK)).toBe(false)
+  })
+
   it('leaves an empty read-only file alone where no sandbox could have made it: outside every allowed write path', async () => {
     const outsideFile = join(OUTSIDE, 'config.lock')
-    plantLeftover(outsideFile)
+    plantEmptyReadOnlyFile(outsideFile)
 
     const command = await wrap([outsideFile])
 

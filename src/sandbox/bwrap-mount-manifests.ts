@@ -29,10 +29,15 @@
  * restricts writes at all, whether or not its own invocation names a manifest
  * in it, and so is the other name a process of the same user would keep its
  * manifests under (see {@link mountPointManifestDirectories}), so a sandboxed
- * command can neither delete nor rewrite one, its own or another sandbox's.
+ * command can neither delete nor rewrite one, its own or another sandbox's;
+ * and the directories between each of them and the write root it lies in are
+ * pinned there, so that the command cannot rename one aside and make the
+ * directory again under the old name, with manifests of its own in it.
  * What that leaves out is a sandbox this library did not start, or an older
- * release of it did, with the directory writable, and a process that looks
- * for its runtime or temp directory somewhere this one does not.
+ * release of it did, with the directory writable, a process that looks
+ * for its runtime or temp directory somewhere this one does not, and a
+ * runtime or temp directory whose name is a link inside a write root, or not
+ * there yet below one: neither can be pinned.
  *
  * Both of the kernel's answers are relative to a PID namespace: /proc/locks
  * lists a lock only when its holder has a pid in the namespace of the /proc
@@ -117,6 +122,13 @@ const LISTING_GOOD_FOR_MS = 0.25
  * to the same directory keeps its manifests for as long as it needs them.
  */
 const UNREADABLE_MANIFEST_MAX_AGE_MS = 60 * 60 * 1000
+
+/**
+ * The largest file that is read as a manifest. One names a wrap's mount
+ * points, some dozens of paths, and is a few kilobytes; whatever is larger
+ * than this is not one, and is not read into memory to find that out.
+ */
+const MANIFEST_MAX_BYTES = 1024 * 1024
 
 /**
  * What a manifest, and the directory lock, is written as before it is moved
@@ -537,9 +549,12 @@ function isOurDirectory(dir: string): boolean {
  * it first and fill it before the process that will believe it comes along;
  * one that is there and the user's is listed even when it cannot be written
  * from here. The last resort is not made for this: there is nothing to keep
- * out of reach in a directory nobody has made.
+ * out of reach in a directory nobody has made. A wrap that is about to record
+ * says so with `recording`, and the directory its manifest will go to is then
+ * settled first, the last resort included: the wrap has to know every one of
+ * these before it publishes, to pin what lies above them.
  */
-export function mountPointManifestDirectories(): string[] {
+export function mountPointManifestDirectories(recording = false): string[] {
   if (!onLinux()) {
     return []
   }
@@ -549,6 +564,9 @@ export function mountPointManifestDirectories(): string[] {
     if (isOurDirectory(candidate)) {
       dirs.add(candidate)
     }
+  }
+  if (recording) {
+    ensureManifestDirectory()
   }
   if (manifestDirectory !== undefined && isOurDirectory(manifestDirectory)) {
     dirs.add(manifestDirectory)
@@ -764,14 +782,33 @@ function withDirectoryLock<T>(
   }
 }
 
+/**
+ * What is at a manifest's name, read as one, or `undefined` when it is not a
+ * manifest this version can read. Only a regular file of the user's, no
+ * larger than {@link MANIFEST_MAX_BYTES}, is read at all, and it is looked at
+ * through the descriptor it is then read from, opened without following a
+ * link and without blocking: opening a FIFO to read waits for a writer, a
+ * link leads wherever whoever planted it likes, and nothing but such a file
+ * is a manifest this library wrote.
+ */
 function readManifest(file: string): Manifest | undefined {
   let inode: string
   let device: string
   let text: string
   try {
-    const fd = fs.openSync(file, 'r')
+    const fd = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    )
     try {
       const stat = fs.fstatSync(fd, { bigint: true })
+      if (
+        !stat.isFile() ||
+        Number(stat.uid) !== process.getuid?.() ||
+        stat.size > MANIFEST_MAX_BYTES
+      ) {
+        return undefined
+      }
       inode = String(stat.ino)
       device = deviceOf(stat.dev)
       text = fs.readFileSync(fd, 'utf8')
@@ -984,9 +1021,8 @@ export type MountPointManifest = {
  * written, in which case the caller must not track those mount points at all:
  * what this process cannot record it does not remove. That is as far as it
  * goes. Nothing on disk then says a sandbox relies on them, so a wrap in
- * another process that denies the same path takes the file for a leftover,
- * covers it, names it, and removes it after its own command, whether or not
- * the sandbox that could not be recorded is still running.
+ * another process that denies the same path takes the file for the caller's
+ * own: it binds it onto itself and names it nowhere, and nobody removes it.
  */
 export function publishMountPointManifest(
   mountPoints: readonly string[],
@@ -1058,38 +1094,173 @@ export function discardMountPointManifest(file: string): void {
 }
 
 /**
- * The mount points named by a manifest whose sandbox may still be running.
+ * The mount points the manifests name, on one reading of the directory:
+ * `live`, by a manifest whose sandbox may still be running, and `named`, by
+ * any manifest at all. What only a finished manifest names is what a sandbox
+ * that has ended left behind and no pass has collected yet, and the next pass
+ * in any process removes it on that manifest's word.
  *
- * An empty set when the directory or /proc/locks cannot be read: the shape of
- * the file on the host still recognises a mount point an earlier sandbox left
- * behind, and this only adds the ones a live manifest vouches for.
+ * `live` is empty when /proc/locks cannot be read, and both are when the
+ * directory cannot be. A wrap takes an existing path for a mount point on a
+ * manifest's word only, never by the look of it, so it then takes every
+ * existing path for the caller's own.
  */
-export function liveMountPoints(): Set<string> {
+export function namedMountPoints(): { live: Set<string>; named: Set<string> } {
   const live = new Set<string>()
-  if (!onLinux()) {
-    return live
+  const named = new Set<string>()
+  const dir = onLinux() ? ensureManifestDirectory() : undefined
+  if (dir === undefined) {
+    return { live, named }
   }
-  const dir = ensureManifestDirectory()
-  const locks = dir === undefined ? undefined : readLocks(dir)
-  if (dir === undefined || locks === undefined) {
-    return live
-  }
+  const locks = readLocks(dir)
   let names: string[]
   try {
     names = fs.readdirSync(dir)
   } catch {
-    return live
+    return { live, named }
   }
   for (const name of names) {
     if (!name.endsWith(MANIFEST_SUFFIX)) continue
     const manifest = readManifest(path.join(dir, name))
-    if (manifest !== undefined && isLive(manifest, locks)) {
-      for (const mountPoint of manifest.paths) {
+    if (manifest === undefined) continue
+    const isLiveOne = locks !== undefined && isLive(manifest, locks)
+    for (const mountPoint of manifest.paths) {
+      named.add(mountPoint)
+      if (isLiveOne) {
         live.add(mountPoint)
       }
     }
   }
-  return live
+  return { live, named }
+}
+
+/**
+ * The directory this process keeps its manifests in, if it is there already:
+ * the one it has settled on, else the first of the shared names that is a
+ * directory of the user's alone. Nothing is made, and nothing is settled: for
+ * a look that has to leave the host as it found it.
+ */
+function existingManifestDirectory(): string | undefined {
+  return manifestDirectory !== undefined &&
+    isOurPrivateDirectory(manifestDirectory)
+    ? manifestDirectory
+    : sharedManifestDirectoryNames().find(isOurPrivateDirectory)
+}
+
+/**
+ * Whether what is at `p` now is still something a clean-up would take away on
+ * a manifest's word: the empty file bubblewrap made (see
+ * {@link isBwrapFileMountPoint}), or an empty directory of the user's.
+ */
+function isEmptyMountPoint(p: string): boolean {
+  if (isBwrapFileMountPoint(p)) {
+    return true
+  }
+  try {
+    const stat = fs.lstatSync(p)
+    return (
+      stat.isDirectory() &&
+      stat.uid === process.getuid?.() &&
+      fs.readdirSync(p).length === 0
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The mount points a sandbox that may still be running relies on, as the
+ * manifests say at the moment of the call: for a caller that removes paths of
+ * its own accord after a command, to leave out the ones in this set. Removing
+ * a mount point from under a running sandbox lifts the deny there.
+ *
+ * It is a snapshot, taken without a lock, from one listing of the manifest
+ * directory and one reading of /proc/locks, and it may be out of date by the
+ * time the caller acts on it: a sandbox can start on a path the moment after.
+ * Its only safe use is to SKIP a removal. That a path is not in it never
+ * means the path is free to be written, or that nothing will rely on it.
+ *
+ * A path is in the set only when both of these hold:
+ * - a manifest names it, and that manifest is live by the rule the clean-up
+ *   goes by, or its liveness cannot be told. It cannot be told when
+ *   /proc/locks cannot be read, or while a manifest that cannot be read is
+ *   locked or new; every path that any readable manifest names then counts.
+ *   What a manifest that cannot be read names cannot be listed at all;
+ * - what is at the path now still has the shape of a mount point: an empty
+ *   regular file with no write bit and one link, or an empty directory, and
+ *   the user's. So whatever a caller spares on the word of this set is an
+ *   empty placeholder, and a manifest that is out of date, or forged, never
+ *   makes it spare a file with something in it.
+ *
+ * The paths are as the wraps recorded them: absolute, with the links in the
+ * directories above the last component resolved and the last component as it
+ * stands. A caller compares its own paths in that form.
+ *
+ * The manifests are believed as found. Their directory can be written by the
+ * user's own processes outside any sandbox; every sandbox that restricts
+ * writes has it bound read-only, with the directories between it and the
+ * write root it lies in pinned, which does not reach a runtime or temp
+ * directory whose name is a link inside a write root, nor a runtime directory
+ * that is not there yet below one. It answers for one manifest directory,
+ * the one this process keeps its manifests in or, before it has kept any, the
+ * first of the shared names that is there, so a sandbox of a process that
+ * keeps its manifests elsewhere, or of something that writes none, is not
+ * seen.
+ *
+ * Makes nothing on the host, the manifest directory included. Empty where
+ * there is no manifest directory, and anywhere but on Linux.
+ */
+export function liveMountPoints(): ReadonlySet<string> {
+  const spared = new Set<string>()
+  const dir = onLinux() ? existingManifestDirectory() : undefined
+  if (dir === undefined) {
+    return spared
+  }
+  const locks = readLocks(dir)
+  let names: string[]
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return spared
+  }
+  const live = new Set<string>()
+  const named = new Set<string>()
+  let cannotTell = locks === undefined
+  for (const name of names) {
+    if (!name.endsWith(MANIFEST_SUFFIX)) continue
+    const file = path.join(dir, name)
+    const manifest = readManifest(file)
+    if (manifest === undefined) {
+      // Gone since the listing, or not to be read: held to what the clean-up
+      // holds it to.
+      try {
+        const stat = fs.statSync(file, { bigint: true })
+        cannotTell ||=
+          locks === undefined ||
+          holdsLock(locks, {
+            inode: String(stat.ino),
+            device: deviceOf(stat.dev),
+          }) ||
+          Date.now() - Number(stat.mtimeMs) < MANIFEST_GRACE_MS
+      } catch {
+        // Gone.
+      }
+      continue
+    }
+    const isLiveOne = locks !== undefined && isLive(manifest, locks)
+    for (const mountPoint of manifest.paths) {
+      named.add(mountPoint)
+      if (isLiveOne) {
+        live.add(mountPoint)
+      }
+    }
+  }
+  for (const mountPoint of cannotTell ? named : live) {
+    if (isEmptyMountPoint(mountPoint)) {
+      spared.add(mountPoint)
+    }
+  }
+  return spared
 }
 
 /**

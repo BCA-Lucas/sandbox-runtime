@@ -13,8 +13,8 @@ import {
   discardMountPointManifest,
   isBwrapFileMountPoint,
   kindOfMountPoint,
-  liveMountPoints,
   mountPointManifestDirectories,
+  namedMountPoints,
   publishMountPointManifest,
   removePrivateManifestDirectory,
   type MountPointManifest,
@@ -1412,7 +1412,8 @@ const KERNEL_TOP_LEVEL_DIRS = ['/proc', '/dev', '/sys']
 
 /**
  * A self-bind ("pin") for every directory between a seed (where a deny bind,
- * file mask or read-deny tmpfs lands) and the allowed write root covering it,
+ * file mask or read-deny tmpfs lands, or a directory of this library's own
+ * that is bound read-only) and the allowed write root covering it,
  * shallow-first, which makes each one a mountpoint the kernel refuses to
  * rename or remove. A directory that is not there is skipped: bwrap cannot
  * bind a missing source and there is nothing to rename. One that exists but
@@ -1632,9 +1633,10 @@ async function generateFilesystemArgs(
   // wrap covers again. They are named in a manifest below, and nothing removes
   // them while a sandbox that named them runs (see bwrap-mount-manifests.ts).
   const mountPoints: string[] = []
-  // The mount points a manifest says a running sandbox relies on, read once
-  // per wrap: they are mount points whatever their mode on the host says.
-  let liveMountPointsCache: Set<string> | undefined
+  // The mount points the manifests name, read once per wrap. The ones a
+  // manifest says a running sandbox relies on are mount points whatever their
+  // mode on the host says.
+  let namedMountPointsCache: ReturnType<typeof namedMountPoints> | undefined
 
   // Collect normalized allowed write paths. Populated in the writeConfig
   // block, read again in the denyRead loop to re-bind writes under tmpfs.
@@ -2358,49 +2360,80 @@ async function generateFilesystemArgs(
       // A mount point another sandbox made is an absent deny path in all but
       // name. Bound onto itself as an existing path it would never be named in
       // this wrap's manifest, so it would go, with this sandbox still bound
-      // over it, as soon as the sandbox that made it was cleaned up after;
-      // and a leftover nobody names would never go at all, where on the host
-      // its existence can be the whole meaning (a lockfile's). There are two
-      // ways to know one, and what is done with it depends on its kind:
-      // - a FILE, by its shape (see isBwrapFileMountPoint), or because a live
-      //   manifest names the path and it is still an empty regular file. It is
-      //   covered with /dev/null like the absent leaf below, and named. Under
-      //   a read-only denied directory nothing needs covering (the file is
-      //   already unwritable there), but it is still named: it is no more the
-      //   caller's file for being there;
-      // - a DIRECTORY, only because a live manifest names it: an empty
-      //   directory looks like anyone's. It is the first missing component of
-      //   some other sandbox's deny. /dev/null cannot be bound over a
-      //   directory (bubblewrap refuses to start), so it is named and then
-      //   treated as the existing directory it is, further down: bound onto
-      //   itself read-only, which is also what the pre-pass above recorded it
-      //   as;
-      // - anything else a live manifest names (a file that has been written
-      //   to since, a link) is the caller's by now, and is neither.
+      // over it, as soon as the sandbox that made it was cleaned up after.
+      // Only a manifest says that a path is one. An empty read-only file
+      // looks like anyone's, and so does an empty directory: taken for a
+      // leftover by its shape alone, a file its owner keeps empty and
+      // read-only was covered, named, and removed after the command. What no
+      // manifest names is the caller's, bound onto itself further down like
+      // any existing path and never removed, which leaves on the host what a
+      // killed process of a release that wrote no manifest left there. Any
+      // manifest will do, a finished one as much as a live one: a finished
+      // manifest is what a killed process leaves, the next clean-up in any
+      // process removes what it names on its word unless a live manifest
+      // names it too, and this wrap's is then the only one that can. What is
+      // done with a path a manifest names depends on its kind:
+      // - a FILE that has the shape bubblewrap leaves (see
+      //   isBwrapFileMountPoint), or, where the manifest is live, that is
+      //   still an empty regular file. It is covered with /dev/null like the
+      //   absent leaf below, and named. Under a read-only denied directory
+      //   nothing needs covering (the file is already unwritable there), but
+      //   it is still named: it is no more the caller's file for being there;
+      // - a DIRECTORY, which is the first missing component of some other
+      //   sandbox's deny. /dev/null cannot be bound over a directory
+      //   (bubblewrap refuses to start), so it is named and then treated as
+      //   the existing directory it is, further down: bound onto itself
+      //   read-only, which is also what the pre-pass above recorded it as;
+      // - anything else (a file that has been written to since, a link) is
+      //   the caller's by now, and is neither.
       // The shape is asked before the existence: another process's collect can
-      // take a leftover away at any moment, and a path found to exist and then
-      // found not to be a mount point because it has just gone would be bound
-      // onto itself as a file that is not there. And once more after it, when
-      // the two disagree: another sandbox starting on the same path makes its
-      // mount point at any moment too, and one made between the two questions
-      // would be bound onto itself as the caller's own file, named by this
-      // wrap nowhere, and gone from under it at that sandbox's clean-up.
-      let isFileMountPoint = isBwrapFileMountPoint(normalizedPath)
-      // Whether anything is at the path, asked once for the branches below.
-      const pathExists = isFileMountPoint || fs.existsSync(normalizedPath)
-      if (pathExists && !isFileMountPoint) {
-        isFileMountPoint = isBwrapFileMountPoint(normalizedPath)
+      // take a mount point away at any moment, and a path found to exist and
+      // then found not to have the shape because it has just gone would be
+      // bound onto itself as a file that is not there. And once more after it,
+      // when the two disagree: another sandbox starting on the same path makes
+      // its mount point at any moment too.
+      let hasFileShape = isBwrapFileMountPoint(normalizedPath)
+      // Whether anything is at the path, asked once for the branches below,
+      // and once more where the manifests say the file is nobody's.
+      let pathExists = hasFileShape || fs.existsSync(normalizedPath)
+      if (pathExists && !hasFileShape) {
+        hasFileShape = isBwrapFileMountPoint(normalizedPath)
       }
       if (
         isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
         isWithinAnyAllowedWritePath(normalizedPath)
       ) {
-        const kind = isFileMountPoint
-          ? 'file'
-          : pathExists &&
-              (liveMountPointsCache ??= liveMountPoints()).has(normalizedPath)
-            ? kindOfMountPoint(normalizedPath)
-            : undefined
+        // The manifests are read once per wrap, and a reading that names the
+        // path is believed whenever it was taken. One that does not name a
+        // file of that shape is believed only if it was taken after the file
+        // was seen: a sandbox publishes its manifest before bubblewrap makes
+        // the file, so such a reading names every mount point that is there,
+        // and an older one misses that of a sandbox that has started since,
+        // which would be bound onto itself as the caller's own file, named by
+        // this wrap nowhere, and gone from under it at that sandbox's
+        // clean-up. A file of that shape which such a reading does not name
+        // is the caller's, or has gone since it was seen, its manifest with
+        // it: whether it is still there is asked again.
+        let named = pathExists ? namedMountPointsCache : undefined
+        if (
+          pathExists &&
+          (named === undefined ||
+            (hasFileShape && !named.named.has(normalizedPath)))
+        ) {
+          named = namedMountPointsCache = namedMountPoints()
+          if (hasFileShape && !named.named.has(normalizedPath)) {
+            pathExists = fs.existsSync(normalizedPath)
+          }
+        }
+        const kind = !named?.named.has(normalizedPath)
+          ? undefined
+          : hasFileShape
+            ? 'file'
+            : named.live.has(normalizedPath)
+              ? kindOfMountPoint(normalizedPath)
+              : kindOfMountPoint(normalizedPath) === 'directory'
+                ? 'directory'
+                : undefined
         if (kind === 'file') {
           if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
             denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
@@ -2757,11 +2790,29 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
+  //
+  // The directories of this library's own that are bound read-only at the end
+  // of this function are seeds as well: the manifest directories, the store of
+  // fake files and the empty directory the placeholders bind from. What is
+  // found at each of those names is believed on the host, by the next
+  // clean-up or the next wrap, and the read-only bind keeps a command out of
+  // the directory only for as long as the name leads to it: with the temp dir
+  // strictly inside a write root, a command could rename the temp dir aside
+  // and make the name again, with a manifest directory of its own in it.
+  const manifestDirs =
+    writeConfig !== undefined
+      ? mountPointManifestDirectories(
+          mountPoints.length > 0 || emptySource !== undefined,
+        )
+      : []
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
+      ...[...manifestDirs, maskedFileStoreDir, emptySource].flatMap(dir =>
+        dir === undefined ? [] : [canonicalForm(dir)],
+      ),
     ],
     {
       rootIsWriteRoot: isAllowedWriteRoot('/'),
@@ -2916,13 +2967,20 @@ async function generateFilesystemArgs(
   // under the system temp dir wherever there is no $XDG_RUNTIME_DIR, which a
   // caller's allowWrite commonly covers, and what is in it then belongs to
   // OTHER sandboxes. So every wrap that restricts writes binds every one of
-  // them read-only (see mountPointManifestDirectories), and a wrap with mount
+  // them read-only (see mountPointManifestDirectories), with what lies above
+  // them pinned (they are seeds of the ancestor pins), and a wrap with mount
   // points of its own adds the lock. Emitted after every allow and deny bind,
   // for the same reason as the two stores below (they are all directories of
   // their own, so their order among themselves does not matter). It is also
   // what lets bwrap open the manifest: it does that inside the sandbox, after
   // the mounts, so a profile with a tmpfs over the temp dir would otherwise
   // leave nothing there to open.
+  //
+  // Each is bound where it really is, like a pin, and not at the name the
+  // environment gave for it: bubblewrap makes a bind's destination by name
+  // inside the new root before it mounts, and a link on the way whose target
+  // is absolute leads nowhere from there ("Can't mkdir"), so with the temp dir
+  // reached through such a link no command that restricts writes started.
   const manifest = publishMountPointManifest(
     mountPoints,
     emptySource === undefined ? [] : [emptySource],
@@ -2931,12 +2989,13 @@ async function generateFilesystemArgs(
   if (manifest !== undefined) {
     // This wrap needs the directory there: bubblewrap opens the manifest in
     // it, after the mounts.
+    const dir = canonicalForm(manifest.dir)
     args.push(
       '--ro-bind',
-      manifest.dir,
-      manifest.dir,
+      dir,
+      dir,
       '--lock-file',
-      manifest.file,
+      path.join(dir, path.basename(manifest.file)),
     )
     registerExitCleanupHandler()
   }
@@ -2944,9 +3003,10 @@ async function generateFilesystemArgs(
     // The others need only be kept out of the command's reach, so one that has
     // gone by the time the command starts - a temp dir whose parent was
     // replaced - is not an error.
-    for (const manifestDir of mountPointManifestDirectories()) {
+    for (const manifestDir of manifestDirs) {
       if (manifestDir !== manifest?.dir) {
-        args.push('--ro-bind-try', manifestDir, manifestDir)
+        const dir = canonicalForm(manifestDir)
+        args.push('--ro-bind-try', dir, dir)
       }
     }
   }
@@ -2956,9 +3016,12 @@ async function generateFilesystemArgs(
   // symlink at a fake path and a later host-side write() would follow it,
   // or replace a fake's content so the bind exposes attacker bytes. Emit
   // last so it overlays any earlier --bind that covers the store dir
-  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
+  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()). Bound
+  // where it really is, like the manifest directories above and for the same
+  // reason.
   if (maskedFileStoreDir !== undefined) {
-    args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+    const dir = canonicalForm(maskedFileStoreDir)
+    args.push('--ro-bind', dir, dir)
   }
 
   // INVARIANT, for the same reason: the empty directory the placeholders above
@@ -2966,11 +3029,13 @@ async function generateFilesystemArgs(
   // the system temp dir, so a caller's allowWrite or a host $TMPDIR under a
   // default write path makes it writable — and a placeholder binds it onto a
   // DENIED destination, so a write to the source lands at the deny. Emit last,
-  // like the store, to overlay any earlier --bind that covers it. A same-uid
-  // process on the host can still swap the source between wrap and run, which
-  // is outside what this library defends against.
+  // like the store, to overlay any earlier --bind that covers it, and where it
+  // really is, like the store. A same-uid process on the host can still swap
+  // the source between wrap and run, which is outside what this library
+  // defends against.
   if (emptySource !== undefined) {
-    args.push('--ro-bind', emptySource, emptySource)
+    const dir = canonicalForm(emptySource)
+    args.push('--ro-bind', dir, dir)
   }
 
   return { args, manifest }

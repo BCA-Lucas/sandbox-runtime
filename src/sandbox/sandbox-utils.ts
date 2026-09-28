@@ -1138,11 +1138,12 @@ export interface ExpandGlobOptions {
 }
 
 /** The most directory entries the read-deny expansions of one read
- *  configuration look at, all its patterns together. */
-export const GLOB_WALK_MAX_ENTRIES = 2_000_000
+ *  configuration look at, all its patterns together, unless
+ *  `filesystem.denyReadGlobBudget` sets another. */
+export const GLOB_WALK_MAX_ENTRIES = 20_000_000
 
-/** The longest they take, all together, in milliseconds. */
-export const GLOB_WALK_TIMEOUT_MS = 10_000
+/** The longest they take, all together, in milliseconds; likewise. */
+export const GLOB_WALK_TIMEOUT_MS = 60_000
 
 /**
  * What the walks handed it may spend between them: one count and one

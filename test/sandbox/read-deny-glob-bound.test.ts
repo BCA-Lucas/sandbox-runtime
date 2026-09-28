@@ -20,6 +20,7 @@ import {
   newGlobWalkBudget,
   walkGlobPattern,
 } from '../../src/sandbox/sandbox-utils.js'
+import { FilesystemConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { LinuxSandboxProfileError } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
@@ -151,13 +152,13 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     rmSync(ROOT, { recursive: true, force: true })
   })
 
-  it('defaults to two million entries and ten seconds', () => {
-    expect(GLOB_WALK_MAX_ENTRIES).toBe(2_000_000)
-    expect(GLOB_WALK_TIMEOUT_MS).toBe(10_000)
+  it('defaults to twenty million entries and sixty seconds', () => {
+    expect(GLOB_WALK_MAX_ENTRIES).toBe(20_000_000)
+    expect(GLOB_WALK_TIMEOUT_MS).toBe(60_000)
     const budget = newGlobWalkBudget()
-    expect(budget.maxEntries).toBe(2_000_000)
+    expect(budget.maxEntries).toBe(20_000_000)
     // Rounded: a floating-point sum less its first term need not be exact.
-    expect(Math.round(budget.deadline - budget.startedAt)).toBe(10_000)
+    expect(Math.round(budget.deadline - budget.startedAt)).toBe(60_000)
     expect(budget.entries).toBe(0)
   })
 
@@ -476,7 +477,7 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
       entries: 26,
       elapsedMs: expect.any(Number),
       maxEntries: 25,
-      timeoutMs: 10_000,
+      timeoutMs: 60_000,
     })
     // A rejected promise, which is how every caller of the wrap meets it.
     await withBudgetOf({ maxEntries: 25 }, async () => {
@@ -606,6 +607,123 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
       )
     } finally {
       await SandboxManager.reset()
+    }
+  })
+
+  it('takes its limits from filesystem.denyReadGlobBudget: initialized, updated, or of one wrap', async () => {
+    const pattern = join(PROJ, '**/.env')
+    const masked = `--ro-bind /dev/null ${join(PROJ, 'pkg9', '.env')}`
+    const configOf = (denyReadGlobBudget: {
+      maxEntries?: number
+      timeoutMs?: number
+    }) => ({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { ...filesystemOf([pattern]).filesystem, denyReadGlobBudget },
+    })
+    /** The limits named by the refusal `run` ends in. */
+    async function refusedWith(run: () => unknown): Promise<unknown> {
+      let error: unknown
+      try {
+        await run()
+      } catch (thrown) {
+        error = thrown
+      }
+      expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+      const profileError = error as LinuxSandboxProfileError
+      expect(profileError.code).toBe('deny_glob_too_large')
+      expect(profileError.message).toContain(
+        'or raise filesystem.denyReadGlobBudget',
+      )
+      const { maxEntries, timeoutMs } =
+        profileError.cause as GlobWalkBudgetError
+      return { maxEntries, timeoutMs }
+    }
+
+    await SandboxManager.reset()
+    // PROJ is 40 entries.
+    await SandboxManager.initialize(
+      configOf({ maxEntries: 39, timeoutMs: 1234 }),
+    )
+    try {
+      for (const run of [
+        () => SandboxManager.getFsReadConfig(),
+        () => SandboxManager.wrapWithSandbox('echo hello'),
+        () => SandboxManager.wrapWithSandboxArgv('echo hello'),
+        // A filesystem of one wrap that names no budget keeps the initialized.
+        () =>
+          SandboxManager.wrapWithSandbox(
+            'echo hello',
+            undefined,
+            filesystemOf([pattern]),
+          ),
+      ]) {
+        expect(await refusedWith(run)).toEqual({
+          maxEntries: 39,
+          timeoutMs: 1234,
+        })
+      }
+      // One that names a budget is held to that.
+      expect(
+        await SandboxManager.wrapWithSandbox(
+          'echo hello',
+          undefined,
+          configOf({ maxEntries: 40 }),
+        ),
+      ).toContain(masked)
+
+      SandboxManager.updateConfig(configOf({ maxEntries: 40 }))
+      expect(SandboxManager.getFsReadConfig().denyOnly).toHaveLength(10)
+      expect(await SandboxManager.wrapWithSandbox('echo hello')).toContain(
+        masked,
+      )
+      expect(
+        await refusedWith(() =>
+          SandboxManager.wrapWithSandbox(
+            'echo hello',
+            undefined,
+            configOf({ maxEntries: 39 }),
+          ),
+        ),
+      ).toEqual({ maxEntries: 39, timeoutMs: 60_000 })
+    } finally {
+      await SandboxManager.reset()
+    }
+  })
+})
+
+describe('the filesystem.denyReadGlobBudget option', () => {
+  const parse = (denyReadGlobBudget: unknown) =>
+    FilesystemConfigSchema.safeParse({
+      denyRead: [],
+      allowWrite: [],
+      denyWrite: [],
+      denyReadGlobBudget,
+    })
+
+  it('takes positive integers, either or both, and nothing else', () => {
+    for (const budget of [
+      undefined,
+      {},
+      { maxEntries: 1 },
+      { timeoutMs: 120_000 },
+      { maxEntries: 50_000_000, timeoutMs: 1 },
+    ]) {
+      const parsed = parse(budget)
+      expect(parsed.success).toBe(true)
+      expect(parsed.data?.denyReadGlobBudget).toEqual(budget)
+    }
+    for (const budget of [
+      { maxEntries: 0 },
+      { maxEntries: -1 },
+      { maxEntries: 1.5 },
+      { maxEntries: '1000' },
+      { maxEntries: Infinity },
+      { timeoutMs: 0 },
+      { timeoutMs: 0.5 },
+      { timeoutMs: null },
+      1000,
+    ]) {
+      expect(parse(budget).success).toBe(false)
     }
   })
 })

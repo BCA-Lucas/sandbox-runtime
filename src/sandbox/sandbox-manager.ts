@@ -1310,14 +1310,16 @@ function expandAllowReadGlob(pattern: string): string[] {
 
 /**
  * The expansion of every denyRead glob of one read configuration, on Linux,
- * all on one budget. When it runs out the returned function throws
- * {@link LinuxSandboxProfileError} `deny_glob_too_large`.
+ * all on one budget of `limits` (`filesystem.denyReadGlobBudget`). When it
+ * runs out the returned function throws {@link LinuxSandboxProfileError}
+ * `deny_glob_too_large`.
  */
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
   unlistableDenyDirs: Set<string>,
+  limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
 ): (pattern: string) => string[] {
-  const budget = newGlobWalkBudget()
+  const budget = newGlobWalkBudget(limits)
   return pattern => {
     try {
       return expandReadDenyGlobLinux(
@@ -1333,7 +1335,7 @@ function readDenyGlobExpander(
         `denyRead pattern "${pattern}" could not be expanded: the denyRead patterns of one configuration share ` +
           `${error.maxEntries} directory entries and ${error.timeoutMs} ms, and the ${error.exhausted} ran out ` +
           `with ${error.entries} entries looked at after ${error.elapsedMs} ms, while listing ${error.directory}; ` +
-          `narrow the pattern, or remove or move what it walks into`,
+          `narrow the pattern, remove or move what it walks into, or raise filesystem.denyReadGlobBudget`,
         error,
       )
     }
@@ -1369,7 +1371,11 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const unlistableDenyDirs = new Set<string>()
   const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
+    readDenyGlobExpander(
+      reExposedPaths,
+      unlistableDenyDirs,
+      config.filesystem.denyReadGlobBudget,
+    ),
     credentialRestrictions.degradeToDenyPaths,
   )
 
@@ -1757,7 +1763,12 @@ async function wrapWithSandbox(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
         credentialRestrictions,
       ),
-      readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
+      readDenyGlobExpander(
+        reExposedPaths,
+        unlistableDenyDirs,
+        customConfig?.filesystem?.denyReadGlobBudget ??
+          config?.filesystem.denyReadGlobBudget,
+      ),
       credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {
@@ -2465,6 +2476,8 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): Promise<SandboxDependencyCheck>
+  /** On Linux it expands the `denyRead` globs, and throws
+   *  {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does. */
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig

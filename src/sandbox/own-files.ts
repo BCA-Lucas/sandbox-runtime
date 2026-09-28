@@ -11,42 +11,33 @@ import {
 /**
  * The library's own files, as a thing to write-deny.
  *
- * The host side of the library runs with the user's full authority, outside
- * any sandbox, so it must not execute a file the sandbox policy lets the
- * wrapped command write. That holds for its own code as much as for any
- * program it runs. Installed as a dependency of a project, the library lives
- * in `<project>/node_modules/`, and the project is usually what `allowWrite`
- * names. A wrapped command could then rewrite `dist/*.js` here, the bundled
- * seccomp helper, or one of the packages this one loads, and the next `srt`
- * run would execute the result outside any sandbox.
+ * The host side of the library runs outside any sandbox, so it must not
+ * execute a file the wrapped command may write. Installed as a dependency,
+ * the library lives in `<project>/node_modules/`, and the project is usually
+ * what `allowWrite` names: a wrapped command could rewrite `dist/*.js` here,
+ * the bundled seccomp helper or a package this one loads, and the next `srt`
+ * run would execute the result unsandboxed.
  *
- * So what this copy is loaded from is denied to every wrapped command whenever
- * it lies inside a path the command may write:
+ * So every wrapped command is denied, inside the paths it may write:
  *
- * - the package's own directory and the directory of every package it depends
- *   on at run time, found the way the module loader finds them;
- * - every place the loader looks for one of those packages BEFORE the place it
- *   is found. A scoped package is asked for its dependency in
- *   `node_modules/@scope/node_modules/` ahead of the hoisted copy, and that
- *   directory does not exist, so a command could create it and be loaded
- *   instead. A path that is not there yet can be denied like any other;
- * - the package's launchers in `node_modules/.bin/`, which are links kept in a
- *   directory the command may write and are what `npx` and `npm run` start.
- *   Seatbelt denies such a name; on Linux a mount cannot hold a link's own
- *   name (it lands on what the link leads to), so there a launcher can still
- *   be re-pointed, and starting the library by the package's own path, or
- *   from an install outside the write paths, is what avoids it.
+ * - the package's own directory and that of every package it depends on at
+ *   run time, found the way the module loader finds them;
+ * - every place the loader looks for one of those BEFORE where it is found,
+ *   such as `node_modules/@scope/node_modules/`: it does not exist, so a
+ *   command could create it and be loaded instead;
+ * - the package's launchers in `node_modules/.bin/`, which `npx` and
+ *   `npm run` start. Seatbelt denies such a name; on Linux a mount lands on
+ *   what a link leads to, so a launcher can still be re-pointed there: start
+ *   the library by the package's own path, or from an install outside the
+ *   write paths.
  *
- * These are names the library read off the disk, not spellings a caller
- * wrote, so they travel as literal paths: a project directory with `[` or `*`
- * in its name is not read as a pattern.
+ * These are names read off the disk, so they travel as literal paths: `[` or
+ * `*` in a directory's name is not read as a pattern.
  *
- * Nothing is denied for a copy that is not installed under a `node_modules`
- * (a checkout of this repository, where the tree is the project being worked
- * on), and nothing where the library has been compiled into an application,
- * since there is then no file on disk to protect. What starts the library is
- * outside this: a program of the caller's own that loads it is found from
- * wherever that program is.
+ * Nothing is denied for a copy not installed under a `node_modules` (a
+ * checkout of this repository), nor where the library is compiled into an
+ * application (no file on disk to protect), and what starts the library is
+ * outside this: a caller's own program that loads it.
  */
 
 type PackageManifest = {
@@ -79,11 +70,10 @@ function exists(p: string): boolean {
 }
 
 /**
- * Where `name` is loaded from by code in `fromDir`: the nearest
- * `node_modules/<name>` on the way up that holds a package. `passed` is every
- * place looked at before that one. The CommonJS loader does not look for a
- * `node_modules` inside a directory that is itself called `node_modules`; the
- * ES module one does, and this package is one, so every level counts here.
+ * Where code in `fromDir` loads `name` from: the nearest `node_modules/<name>`
+ * on the way up that holds a package; `passed` is every place looked at
+ * before it. Every level counts: unlike the CommonJS loader, the ES module one
+ * (this package is one) looks in a `node_modules` inside a `node_modules`.
  */
 function resolveDependency(
   fromDir: string,
@@ -96,15 +86,13 @@ function resolveDependency(
       return { found: candidate, passed }
     }
     passed.push(candidate)
-    // Not installed at all (an optional dependency, say): everywhere it was
-    // looked for is somewhere it could still be put.
+    // Not installed (optional, say): it could be put anywhere it was sought.
     if (dir === path.dirname(dir)) return { found: undefined, passed }
   }
 }
 
-/** The deepest part of `absent` that can be denied in its place: the first
- *  component of it that does not exist, which is what would have to be
- *  created for anything to appear at `absent`. */
+/** What to deny in place of `absent`: its first component that does not
+ *  exist, which must be created for anything to appear at `absent`. */
 function firstMissing(absent: string): string {
   let missing = absent
   for (
@@ -133,19 +121,15 @@ function launchersOf(packageRoot: string, manifest: PackageManifest): string[] {
     .filter(launcher => exists(launcher))
 }
 
-/** A sanity bound on the walk of the dependency graph: this package has four
- *  dependencies and they have a handful between them. */
+/** Bounds the walk of the dependency graph; this package's is far smaller. */
 const MAX_PACKAGES = 200
 
 /**
- * What the installed package `moduleFile` belongs to is loaded from, each path
- * once: its directory and that of every package it depends on at run time,
- * the places the loader looks for those before it finds them, and the
- * package's launchers. Empty when that package is not installed under a
- * `node_modules`, or is not on disk at all.
- *
- * `moduleFile` is a file two levels below the package root, as every module
- * of `src/sandbox` and `dist/sandbox` is.
+ * What the installed package holding `moduleFile` is loaded from, each path
+ * once: package directories, places looked at first and launchers, as the top
+ * of this file lists them. Empty when the package is not installed under a
+ * `node_modules`, or is not on disk. `moduleFile` is two levels below the
+ * package root, as is every module of `src/sandbox` and `dist/sandbox`.
  */
 export function installedPackagePaths(moduleFile: string): string[] {
   const packageRoot = path.resolve(path.dirname(moduleFile), '..', '..')
@@ -204,12 +188,10 @@ function thisLibrarysInstall(): string[] {
 /**
  * The write-denies a wrap adds for the library's own files: those of
  * `installPaths` (by default this copy's, see {@link installedPackagePaths})
- * that lie at or under one of `allowedWritePaths`, judged both as the paths
- * are spelled and as they resolve. A path no allowed write path contains is
- * read-only in the sandbox already and costs nothing here. Where an allowed
- * write path is a pattern there is no judging by containment, and all of
- * them are denied: a deny on what cannot be written anyway changes nothing.
- * They are literal paths: see
+ * at or under one of `allowedWritePaths`, judged both as spelled and as
+ * resolved; the rest are read-only in the sandbox already. Where an allowed
+ * write path is a pattern, containment cannot be judged and all are denied: a
+ * deny on what cannot be written changes nothing. They are literal paths: see
  * `FsWriteRestrictionConfig.literalDenyWithinAllow`.
  */
 export function ownFilesWriteDenies(

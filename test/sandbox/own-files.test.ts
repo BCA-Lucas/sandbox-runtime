@@ -24,12 +24,8 @@ import {
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
-/**
- * The library installed as a dependency of a project lives inside the
- * project, and the project is what a wrapped command may write. Its own files,
- * and the packages it loads, are what the host runs the next time `srt` is
- * started there, so they are write-denied to every wrapped command.
- */
+/** The library's own files and the packages it loads are write-denied to
+ *  every wrapped command: src/sandbox/own-files.ts says why. */
 describe('The library own files under a write path', () => {
   let dir: string
 
@@ -64,8 +60,7 @@ describe('The library own files under a write path', () => {
     return at
   }
 
-  /** `<project>/node_modules/@scope/lib` with a module two levels down, the
-   *  way every module of dist/sandbox is. Returns that module's path. */
+  /** `<project>/node_modules/@scope/lib` with a module two levels down. */
   function installLibrary(
     project: string,
     dependencies: Record<string, string>,
@@ -99,8 +94,7 @@ describe('The library own files under a write path', () => {
           a,
           b,
           c,
-          // Where `a` and `c` are looked for before the hoisted copies are
-          // reached. Neither directory exists, so either could be made.
+          // Where `a` and `c` are looked for first: neither exists yet.
           join(project, 'node_modules', '@scope', 'node_modules'),
           join(project, 'node_modules', 'node_modules'),
         ].sort(),
@@ -108,9 +102,8 @@ describe('The library own files under a write path', () => {
     })
 
     it('counts a place looked at first by the name that would be made there', () => {
-      // The hoisted copy is a level further up, as in a workspace, and the
-      // project has a node_modules of its own: what could be planted is one
-      // entry in it, not the directory.
+      // The hoisted copy is a level up, as in a workspace, and the project's
+      // node_modules exists: what could be planted is one entry in it.
       const workspace = join(dir, 'workspace')
       const project = join(workspace, 'packages', 'app')
       const { root, moduleFile } = installLibrary(project, { a: '1' })
@@ -170,8 +163,7 @@ describe('The library own files under a write path', () => {
         installedPackagePaths(join(root, 'dist', 'sandbox', 'm.js')).sort(),
       ).toEqual([root, launcher].sort())
 
-      // A manifest that names one launcher by a string calls it after the
-      // package.
+      // A `bin` that is a string names one launcher, called after the package.
       const plain = makePackage(join(project, 'node_modules', 'tool'), {
         name: 'tool',
         bin: 'cli.js',
@@ -240,8 +232,7 @@ describe('The library own files under a write path', () => {
     })
 
     it('finds nothing for this repository itself', () => {
-      // The default argument, from a checkout: nothing to deny, so running
-      // the suite here is not what is under test anywhere else.
+      // The default argument, from a checkout: no other test gets these denies.
       expect(ownFilesWriteDenies(['/'])).toEqual([])
     })
   })
@@ -264,8 +255,7 @@ describe('The library own files under a write path', () => {
     })
 
     it('denies all of them where an allowed write path is a pattern', () => {
-      // A pattern cannot be judged by containment, and a deny on what is not
-      // writable anyway changes nothing.
+      // A pattern cannot be judged by containment: see ownFilesWriteDenies.
       const inside = join(dir, 'project', 'node_modules', 'lib')
       const elsewhere = join(dir, 'elsewhere', 'node_modules', 'far')
       expect(
@@ -313,10 +303,8 @@ describe('The library own files under a write path', () => {
     })
   })
 
-  /**
-   * The real thing: the BUILT package copied into a project's node_modules
-   * with what it depends on, run from there with the project writable.
-   */
+  /** The BUILT package copied into a project's node_modules with what it
+   *  depends on, run from there with the project writable. */
   describe('installed in a project and run from there', () => {
     const REPO = join(dirname(new URL(import.meta.url).pathname), '..', '..')
     const BUILT = existsSync(join(REPO, 'dist', 'cli.js'))
@@ -380,18 +368,15 @@ describe('The library own files under a write path', () => {
               `echo x >> ${entry} 2>/dev/null && echo LIBRARY-CHANGED || echo LIBRARY-DENIED`,
               `echo x >> ${dependency} 2>/dev/null && echo DEPENDENCY-CHANGED || echo DEPENDENCY-DENIED`,
               `mv ${installed} ${installed}.aside 2>/dev/null && echo LIBRARY-MOVED || echo MOVE-DENIED`,
-              // Nor by way of what holds it: every directory between the
-              // package and the write root is held in place with it, so a
-              // fresh tree cannot be put where the loader looks.
+              // Nor by way of what holds it: every directory up to the write
+              // root is held in place, so no fresh tree can replace it.
               `mv ${join(project, 'node_modules', '@anthropic-ai')} ${join(project, 'node_modules', 'scope.aside')} 2>/dev/null && echo SCOPE-MOVED || echo SCOPE-MOVE-DENIED`,
               `mv ${join(project, 'node_modules')} ${join(project, 'node_modules.aside')} 2>/dev/null && echo NODE-MODULES-MOVED || echo NODE-MODULES-MOVE-DENIED`,
               `mkdir -p ${join(project, 'node_modules', 'unrelated')} && echo OTHER-PACKAGE-ADDED`,
-              // Nor by putting a package where the loader looks first: beside
-              // the library inside its scope, and one level above that.
+              // Nor by putting a package where the loader looks first.
               `mkdir -p ${join(scope, 'node_modules', 'zod')} 2>/dev/null && echo SCOPE-SHADOW-MADE || echo SCOPE-SHADOW-DENIED`,
               `mkdir -p ${join(project, 'node_modules', 'node_modules', 'zod')} 2>/dev/null && echo UPPER-SHADOW-MADE || echo UPPER-SHADOW-DENIED`,
-              // Nor through a second name for the same file, made where
-              // writing is allowed.
+              // Nor through a second name for the same file.
               `ln ${entry} ${join(project, 'alias.js')} 2>/dev/null && echo x >> ${join(project, 'alias.js')} && echo ALIAS-WRITTEN || echo ALIAS-DENIED`,
               // Nor by re-pointing what npx and npm run start.
               `rm -f ${launcher} 2>/dev/null; ln -sf /bin/true ${launcher} 2>/dev/null && echo LAUNCHER-REPLACED || echo LAUNCHER-DENIED`,
@@ -414,9 +399,7 @@ describe('The library own files under a write path', () => {
         expect(output).toContain('ALIAS-DENIED')
         expect(output).toContain('SCOPE-SHADOW-DENIED')
         expect(output).toContain('UPPER-SHADOW-DENIED')
-        // A launcher is a link, and on Linux a link's own name cannot be held
-        // by a mount (one lands on what it leads to), so there it is the
-        // stated limit; Seatbelt denies the name itself.
+        // On Linux a launcher can be re-pointed: the limit own-files.ts states.
         if (!isLinux) expect(output).toContain('LAUNCHER-DENIED')
         expect(output).toContain('OTHER-LAUNCHER-ADDED')
         expect(readFileSync(entry, 'utf8')).toBe(before.entry)

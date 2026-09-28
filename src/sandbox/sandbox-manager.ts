@@ -1701,8 +1701,7 @@ async function wrapWithSandbox(
           config?.filesystem.denyWrite ??
           [],
       ),
-      // Whatever this wrap may write, the library's own files are not among
-      // it: see own-files.ts.
+      // No wrap may write the library's own files: see own-files.ts.
       literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
     }
 

@@ -2527,8 +2527,8 @@ async function generateFilesystemArgs(
         // Already unwritable under a read-only denied directory (the
         // existing-path twin of the stub skip above). Veto (ii) keeps the
         // covering bind through the emission filter; a dest ANY deny entry
-        // reaches through a symlink keeps its own bind, because the
-        // re-application passes below key off emitted raw spellings.
+        // reaches through a symlink keeps its own bind, so that the plan does
+        // not depend on which spelling of it the loop sees first.
         if (
           !symlinkedDenySpellingDests.has(normalizedPath) &&
           coveredBySafeReadOnlyDenyDir(normalizedPath)

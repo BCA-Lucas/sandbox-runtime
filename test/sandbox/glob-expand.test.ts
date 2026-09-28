@@ -784,6 +784,24 @@ describe.if(!isWindows)('a pattern walked beneath an anchor', () => {
     )
   })
 
+  it.each([
+    [
+      'another directory of the same length',
+      (a: string) => a.replace(/.$/, '_'),
+    ],
+    ['a longer path than the pattern', (a: string) => `${a}/deep/.env/more`],
+    ['a name cut short', (a: string) => a.slice(0, -1)],
+    ['the root', () => '/'],
+    ['nothing', () => ''],
+  ])('throws for an anchor that is %s', (_what, wrong) => {
+    // The tail is cut by length: taken as it comes, a wrong anchor would walk
+    // another directory and hand back what the tail matches there.
+    const anchor = join(root, '[WIP] project')
+    expect(() =>
+      expandGlobPattern(`${anchor}/deep/.env`, { anchor: wrong(anchor) }),
+    ).toThrow(TypeError)
+  })
+
   it('reads no character of the anchor as pattern', () => {
     // Without the anchor the same strings are patterns from end to end.
     const starred = join(root, 'build*')

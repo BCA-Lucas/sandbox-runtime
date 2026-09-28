@@ -4,9 +4,8 @@
  * Lives in its own module so the schema can import it without pulling
  * in sandbox-manager (which imports the schema — circular).
  *
- * The validity check for a list entry lives here too, for the converse
- * reason: the manager applies it to lists registered at run time, and gets it
- * from here without loading the schema module.
+ * The validity check for a list entry lives here too, so the manager can
+ * apply it to lists registered at run time without loading the schema module.
  */
 
 import { isIP } from 'node:net'
@@ -140,9 +139,8 @@ export function hasValidIpv6Bracketing(val: string): boolean {
 
 /**
  * The check an allow-list entry gets: a domain pattern with an optional
- * `:port` suffix. One function for both places such an entry arrives (the
- * `network.allowedDomains` schema, and a per-command list registered with the
- * manager at run time), so neither accepts what the other refuses.
+ * `:port` suffix. Shared by the `network.allowedDomains` schema and the lists
+ * registered at run time, so neither accepts what the other refuses.
  */
 export function isValidAllowedDomainEntry(val: string): boolean {
   return (

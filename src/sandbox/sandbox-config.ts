@@ -33,9 +33,7 @@ const domainPatternSchema = z
  * Domain pattern with an optional `:port` suffix (e.g., "example.com:443",
  * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
  * proxy knows the destination port; an entry without a port matches any port.
- * The check and its message live in domain-pattern.ts so the manager can hold
- * an allow list registered at run time to the same rule without loading this
- * module's schemas.
+ * The check and its message live in domain-pattern.ts, which says why.
  */
 const domainPortPatternSchema = z
   .string()

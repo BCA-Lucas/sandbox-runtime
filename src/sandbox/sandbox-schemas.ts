@@ -92,14 +92,12 @@ export interface CredentialRestrictionConfig {
  * Note: Empty `allowedHosts` means no host matches an allow rule (unlike
  * read's empty denyOnly). Whether an unmatched host is denied outright
  * depends on what else may decide it: deniedHosts are checked first and deny
- * unconditionally; under `network.strictAllowlist` a host matching neither
- * list is denied there and then; otherwise it is allowed when the allow list
- * registered for the invocation the connection presents
- * (`SandboxManager.registerCommandNetworkLists`) matches it, and failing
- * that falls through to the registered SandboxAskCallback when one exists,
- * and is denied when no callback is registered. Hosts needing a hard
- * block-all regardless of callback behavior should use a `deniedHosts`
- * wildcard.
+ * unconditionally; a host matching neither list is denied under
+ * `network.strictAllowlist`, else allowed by a matching per-command list
+ * (`SandboxManager.registerCommandNetworkLists`), else falls through to the
+ * registered SandboxAskCallback when one exists, and is denied when
+ * no callback is registered. Hosts needing a hard block-all regardless of
+ * callback behavior should use a `deniedHosts` wildcard.
  *
  * Entries are the raw config patterns and may carry an optional `:port`
  * suffix (`api.example.com:443`, `*:22`) meaning "this rule applies only
@@ -119,25 +117,19 @@ export type NetworkHostPattern = {
 
 /**
  * Asked about a host that no configured rule and no per-command allow list
- * decided (never asked under `network.strictAllowlist`). Only the value
- * `true` allows the connection. `false` denies it with the generic reason
- * "user denied". An object `{ allow: false, reason }` denies it with that
- * reason, which is what the violation line for the connection reports. Any
- * other answer, truthy or not, denies with the generic reason: a `reason` on
- * an object that does not say `allow: false` is not reported.
+ * decided (never asked under `network.strictAllowlist`). Only `true` allows.
+ * `{ allow: false, reason }` denies with that reason, which the violation
+ * line reports. `false` and every other answer, truthy or not, deny with the
+ * generic reason "user denied": a `reason` on an object that does not say
+ * `allow: false` is not reported.
  *
- * The reason is sanitized before it is stored, the way the rest of a
- * violation line is: each run of control characters (line breaks and tabs
- * included) or of invisible ones (zero-width characters, the joiner among
- * them, and bidi controls) becomes one space, `<` and `>` are removed, and
- * the ends are trimmed. It is then cut to 500 UTF-16 code units, what
- * `String.prototype.length` counts. A reason with nothing left after that
- * falls back to "user denied". So write it as one line of plain text, and do
- * not rely on angle brackets around a placeholder.
+ * The reason is sanitized like the rest of a violation line (runs of control
+ * or invisible characters become one space, `<` and `>` are removed, the
+ * ends are trimmed) and cut to 500 UTF-16 code units, so write it as one
+ * line of plain text. With nothing left, "user denied" is reported.
  *
- * Releases up to v0.0.77 allowed on any truthy answer, so an object answer
- * returned to one of those would be read as an allow. Check
- * `SandboxManager.askCallbackDenyReason` before returning one.
+ * Check `SandboxManager.askCallbackDenyReason` before returning an object:
+ * a release without it reads any truthy answer as an allow.
  */
 export type SandboxAskCallback = (
   params: NetworkHostPattern,

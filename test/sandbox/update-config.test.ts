@@ -434,9 +434,8 @@ function connectAs(
 
 /**
  * A listener on loopback for the proxy to dial, so an allow is observed as a
- * 200 without leaving the machine. An IP-literal destination is dialled as
- * it is, with no name to resolve and nothing for the resolved-address check
- * to refuse.
+ * 200 without leaving the machine: an IP literal has no name to resolve and
+ * nothing for the resolved-address check to refuse.
  */
 function listenOnLoopback(): Promise<{ server: Server; target: string }> {
   return new Promise(resolve => {
@@ -506,8 +505,7 @@ describe('per-command network allow lists', () => {
     expect(
       await connectAs(port, loopback.target, usernameFor(registered)),
     ).toBe(200)
-    // An id nothing was registered under, and no id at all, see the
-    // configured lists alone.
+    // Any other id, and no id at all, see the configured lists alone.
     expect(
       await connectAs(port, loopback.target, usernameFor(randomCommandId())),
     ).toBe(403)
@@ -541,8 +539,7 @@ describe('per-command network allow lists', () => {
     const port = await start({}, denyAndRecord)
     const registered = randomCommandId()
     const [host, listeningPort] = loopback.target.split(':')
-    // Any port but the listener's, and still a valid one: the listener can be
-    // handed 65535, the top of the range.
+    // Any valid port but the listener's, which can itself be 65535.
     const anotherPort =
       Number(listeningPort) === 65535 ? 65534 : Number(listeningPort) + 1
     SandboxManager.registerCommandNetworkLists(registered, {
@@ -619,9 +616,7 @@ describe('per-command network allow lists', () => {
     })
 
     SandboxManager.unregisterCommandNetworkLists(randomCommandId())
-    // Registering refuses what is not a string; unregistering has nothing to
-    // refuse, since no list can be registered under it, and lets it pass so
-    // that a cleanup path never throws.
+    // Unregistering lets a non-string pass, so a cleanup path never throws.
     for (const notAString of [null, undefined, 42]) {
       expect(() =>
         SandboxManager.unregisterCommandNetworkLists(
@@ -734,9 +729,8 @@ describe('per-command network allow lists', () => {
     expect(message).not.toContain(almost)
   })
 
-  // Accepted and refused by one predicate, so the two can only agree; this
-  // pins that a list arriving at run time cannot carry an entry the
-  // configuration would have refused, and the other way round.
+  // A list arriving at run time cannot carry an entry the configuration
+  // would have refused, and the other way round.
   it.each([
     ['example.com', true],
     ['*.example.com', true],
@@ -806,9 +800,8 @@ describe('per-command network allow lists', () => {
   })
 
   // An id is normalised before it keys the map, and what the proxy receives
-  // is decoded rather than compared as bytes. Each case here is an id or a
-  // username that differs from the registered one byte for byte and reaches
-  // its list all the same, or looks alike and does not.
+  // is decoded rather than compared as bytes, so an id can differ from the
+  // registered one byte for byte and reach its list all the same.
   describe('ids that differ byte for byte from the registered one', () => {
     it('share a list when they agree on their first 100 characters', async () => {
       const port = await start({})
@@ -818,8 +811,7 @@ describe('per-command network allow lists', () => {
         allowedDomains: [loopback.target],
       })
 
-      // A wrap given this other id mints the same username: the key is cut
-      // to 100 characters before it is encoded.
+      // Both ids mint one username: the key is cut to 100 characters.
       expect(usernameFor(`${prefix}-second`)).toBe(
         usernameFor(`${prefix}-first`),
       )
@@ -827,8 +819,7 @@ describe('per-command network allow lists', () => {
         await connectAs(port, loopback.target, usernameFor(`${prefix}-second`)),
       ).toBe(200)
 
-      // A username carrying all 105 characters was not minted here; it
-      // decodes to a longer key, which nothing is registered under.
+      // An uncut username decodes to a longer key, which has no list.
       const uncut = Buffer.from(`${prefix}-first`).toString('base64')
       expect(await connectAs(port, loopback.target, `srt.${uncut}`)).toBe(403)
 
@@ -976,7 +967,7 @@ describe('ask callback answers', () => {
     })
   })
 
-  // Every one of these was an allow while the filter tested truthiness.
+  // A filter that tested truthiness would allow every one of these.
   it.each([
     ['the number 1', 1],
     ['a non-empty string', 'yes'],
@@ -984,8 +975,7 @@ describe('ask callback answers', () => {
     ['an empty array', []],
     ['an object that says allow: true', { allow: true }],
     ['the string "true"', 'true'],
-    // A reason is reported only for an answer that says allow: false. One
-    // that says otherwise was not written as the explanation of a denial.
+    // A reason is reported only for an answer that says allow: false.
     [
       'an object that says allow: true and gives a reason',
       { allow: true, reason: 'approved for this session' },
@@ -1083,8 +1073,7 @@ describe('ask callback answers', () => {
   })
 
   it('counts the cut in what is displayed, not in what was stripped', async () => {
-    // 600 control characters collapse to one space, so nothing is cut off
-    // the text that follows them.
+    // 600 control characters collapse to one space, so `after` is not cut.
     const { lines } = await decideWith({
       allow: false,
       reason: `before${'\x07'.repeat(600)}after`,
@@ -1109,8 +1098,7 @@ describe('ask callback answers', () => {
     expect(violationLines()).toEqual(deniedBecause('permission prompt failed'))
   })
 
-  // The debug log is where an embedder caught by the change from "any truthy
-  // answer allows" finds out why its connections are now refused.
+  // The debug log tells an embedder why a truthy answer did not allow.
   it('warns in the debug log about an answer that is neither a boolean nor { allow: false }, and about no other', async () => {
     const before = process.env.SRT_DEBUG
     process.env.SRT_DEBUG = '1'

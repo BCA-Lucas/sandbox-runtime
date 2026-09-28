@@ -151,21 +151,16 @@ export function sanitizeUnregisteredCommandKey(decodedKey: string): string {
 
 /**
  * How much of a denial reason supplied by the ask callback a violation line
- * carries, in UTF-16 code units (what `String.prototype.length` counts, so a
- * character outside the Basic Multilingual Plane counts as two). The reason
- * is prose for whoever reads the violation, a model included: a few sentences
- * fit, a document does not.
+ * carries, in UTF-16 code units: a few sentences fit, a document does not.
  */
 export const MAX_DENIAL_REASON_LENGTH = 500
 
 /**
  * A denial reason the ask callback supplied, as a violation line may carry
- * it: sanitized like the rest of the line, and cut so that one answer cannot
- * flood the text a model reads. The store sanitizes the whole line again at
- * ingestion; doing it here first means the cut counts what is displayed. The
- * cut can land just after a space, and the reason sits inside parentheses
- * where the store's own trim of the line's ends does not reach, so the end is
- * trimmed again here.
+ * it: sanitized first, so the cut counts what is displayed, then cut so that
+ * one answer cannot flood the text a model reads. The end is trimmed after
+ * the cut: the reason sits inside parentheses, where the store's own trim of
+ * the line's ends does not reach.
  */
 export function sanitizeDenialReason(reason: string): string {
   return cutBetweenCharacters(

@@ -137,9 +137,8 @@ const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
 /**
  * An entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite`: a
  * spelling, which is a pattern when it reads as one, or a path marked
- * literal, which is never a pattern whether or not it exists. The mark is
- * `literal: true` and nothing else: an object without it, or with a key
- * this does not know, is refused rather than read one way or the other.
+ * `literal: true`, which never is. An object without the mark, or with a
+ * key this does not know, is refused rather than read either way.
  */
 const filesystemPathEntrySchema = z.union(
   [

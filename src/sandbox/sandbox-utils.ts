@@ -137,17 +137,15 @@ export function containsGlobCharsForPlatform(p: string): boolean {
 }
 
 /**
- * An entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite` as
- * configured: a spelling, which is a pattern when it reads as one, or a path
- * marked literal, which is never a pattern.
+ * An entry of a filesystem list as configured: a spelling, which is a
+ * pattern when it reads as one, or a path marked literal, which never is.
  */
 export type PathListEntry = string | { path: string; literal: true }
 
 /**
  * The path of an entry that is not a spelling. Throws unless the entry is
- * `{ path: string, literal: true }`: a config reaches the library without
- * going through the schema when an embedder builds it in code, and taking
- * `{ path }` for a name or for a pattern would be a guess about a deny.
+ * `{ path: string, literal: true }`: a config built in code skips the
+ * schema, and reading `{ path }` either way would be a guess about a deny.
  */
 export function markedLiteralPath(
   entry: Exclude<PathListEntry, string>,
@@ -419,9 +417,8 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  * name does — or the name a spelling with glob characters also is (see
  * path-entries.ts). The glob branches are skipped for it, so a component
  * like `a[b` is resolved and later compiled as the name it is. Without it,
- * a spelling with `*`, `?` or `[…]` in it keeps the character sniffing:
- * that is the pattern reading of what the caller wrote, where the brackets
- * are glob syntax. The interior collapse below is not one of the glob
+ * a spelling with `*`, `?` or `[…]` in it keeps the character sniffing, its
+ * pattern reading. The interior collapse below is not one of the glob
  * branches: `//` and `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
@@ -605,10 +602,9 @@ const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
  * match is a symlink to one of these directories is not seen. A glob
  * `allowRead` entry is not counted as re-opening anything.
  *
- * An entry marked `{ path, literal: true }` is a name whatever characters it
- * holds. A spelling is read by its characters alone here: the name that a
- * spelling with glob characters also is when it exists on disk is for the
- * caller to add as a marked entry, which the sandbox manager does.
+ * An entry marked `{ path, literal: true }` is a name whatever it holds. A
+ * spelling is read by its characters alone: the name it also is when that
+ * exists on disk is for the caller to add as a marked entry.
  */
 export function getDefaultWritePaths(readRules?: {
   denyRead: readonly PathListEntry[]
@@ -1167,8 +1163,7 @@ export function globToRegex(globPattern: string): string {
  * Takes a whole pattern, so every character in it is glob syntax: right for
  * the pattern reading of a spelling the caller wrote, which is what
  * {@link readRuleCovers} passes. A pattern anchored at a directory that is a
- * name on disk (one of the library's own, or one that exists and holds glob
- * characters) goes through the macOS `denyGlobEntryRegex`, which splices
+ * name on disk goes through the macOS `denyGlobEntryRegex`, which splices
  * that directory back in escaped and calls this for the tail.
  */
 export function denyGlobRegex(normalizedGlob: string): string {
@@ -1557,9 +1552,8 @@ export function walkGlobPattern(
     realOf: new Map(),
   }
 
-  // Beneath an anchor the pattern is the tail alone, rooted at the anchor:
-  // no character of the anchor is compiled, and the walk starts at the
-  // anchor plus the tail's own static directory.
+  // Beneath an anchor the pattern is the tail alone, so no character of the
+  // anchor is compiled; the walk starts at the anchor plus the tail's base.
   const anchor =
     opts.anchor === undefined ? undefined : toForwardSlashes(opts.anchor)
   const normalizedPattern =

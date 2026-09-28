@@ -17,12 +17,10 @@
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  *
- * A `literal…` list holds MORE entries for the list it is named after, not a
- * part of it: paths the caller marked `{ path, literal: true }`. They are
- * names, in which `[`, `*` and `?` are characters and never pattern syntax,
- * so no backend expands or compiles them. The key is absent when there are
- * none. Whatever reads `denyOnly` to learn what is denied has to read
- * `literalDenyOnly` too.
+ * A `literal…` list holds MORE entries for the list it is named after: the
+ * paths the caller marked `{ path, literal: true }`, names that no backend
+ * expands or compiles. The key is absent when there are none. Whatever reads
+ * `denyOnly` to learn what is denied has to read `literalDenyOnly` too.
  */
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
@@ -52,19 +50,13 @@ export interface FsReadRestrictionConfig {
  * Note: Empty `allowOnly` means NO paths are writable (unlike read's empty denyOnly).
  *
  * A `literal…` list holds MORE entries for the list it is named after, as in
- * {@link FsReadRestrictionConfig}: names and never patterns, among them the
- * paths the caller marked `{ path, literal: true }`. What the command may
- * write is `allowOnly` and `literalAllowOnly` together.
+ * {@link FsReadRestrictionConfig}: what the command may write is `allowOnly`
+ * and `literalAllowOnly` together.
  */
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
   literalAllowOnly?: string[]
   denyWithinAllow: string[]
-  /**
-   * More paths to deny within `allowOnly`, which the library read off the
-   * disk itself. They are names, not spellings a caller wrote: `[`, `*` and
-   * `?` in them are characters of the name and never pattern syntax.
-   */
   literalDenyWithinAllow?: string[]
 }
 

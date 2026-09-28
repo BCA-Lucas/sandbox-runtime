@@ -163,16 +163,16 @@ function pathFilter(entry: PathEntry): string {
 
 /**
  * Compiles `entry`'s pattern with one of the shared string compilers in
- * `sandbox-utils.ts`. An entry anchored at a directory (`anchor`) keeps
- * that directory as a literal — the cwd, or a directory a caller's pattern
- * lies beneath, is a name on disk and may itself contain `[`, `*` or `?` —
- * so only the tail below it goes through the compiler, and the anchor is
- * spliced back in escaped. Every compiler there returns '^…$'.
+ * `sandbox-utils.ts`. An entry anchored at a directory
+ * (`anchor`) keeps that directory as a literal — it is a name on disk
+ * and may itself contain `[`, `*` or `?` — so only the tail below it goes
+ * through the compiler, and the anchor is spliced back in escaped. Every
+ * compiler there returns '^…$'.
  *
  * This is the whole difference between the entry-taking wrappers here and
  * the string-taking compilers they call: those see a spelling in which
- * every character is glob syntax, which is right for the pattern reading
- * of what a caller wrote and wrong for a name on disk.
+ * every character is glob syntax, which is right for what a caller wrote
+ * as a pattern and wrong for a name on disk.
  */
 function anchorRegex(
   entry: GlobPathEntry,
@@ -253,10 +253,9 @@ export type PathEntry =
       path: string
       /**
        * Set when this glob is anchored at a directory that is a name on
-       * disk: the cwd, for the mandatory `**\/<name>` patterns, or a
-       * directory that exists and holds glob characters, for a caller's
-       * pattern beneath it. The prefix of `path` that is a literal path
-       * rather than part of the pattern.
+       * disk (the cwd, for the mandatory `**\/<name>` patterns, or an
+       * existing one that holds glob characters): the prefix of
+       * `path` that is a literal path rather than part of the pattern.
        */
       anchor?: string
     }
@@ -270,16 +269,13 @@ function anchoredGlobEntry(anchor: string, pattern: string): PathEntry {
 }
 
 /**
- * A spelling that came from the caller's config, read by its characters:
- * with `*`, `?` or `[…]` in what the caller wrote it is a pattern. The
- * decision is made on that raw spelling, because resolving a relative or
- * `~` path can splice in a cwd or home directory whose own name contains
- * those characters — read back, they would turn the caller's `secrets` into
- * a pattern that never matches the directory it was resolved to.
- *
- * Those characters may also be part of a name that exists, and then the
- * spelling is that name as well: {@link alsoReadAs} gives the readings this
- * one leaves out.
+ * A spelling that came from the caller's config: `*`, `?` and `[…]` in
+ * what the caller wrote are read as glob syntax here. The decision is
+ * made on that raw spelling, because resolving a relative or `~` path can
+ * splice in a cwd or home directory whose own name contains those
+ * characters — read back, they would turn the caller's `secrets` into a
+ * pattern that never matches the directory it was resolved to.
+ * {@link alsoReadAs} gives the readings this one leaves out.
  */
 function toPathEntry(pathPattern: string): PathEntry {
   return containsGlobChars(pathPattern)
@@ -296,8 +292,7 @@ function toPathEntry(pathPattern: string): PathEntry {
  * `subpath` filter whatever characters it contains — sniffed as a pattern,
  * a component like `a[b` would become a character class and the filter
  * would no longer match the path it was built from (the rule would be
- * inert). A path the caller marked literal is the same thing and comes
- * through here too. Never use this for a spelling the caller did not mark.
+ * inert). Never use this for a spelling the caller did not mark literal.
  */
 function toLiteralPathEntry(literalPath: string): PathEntry {
   return {
@@ -307,10 +302,8 @@ function toLiteralPathEntry(literalPath: string): PathEntry {
 }
 
 /**
- * The readings a caller's spellings have beside {@link toPathEntry}'s: the
- * name a spelling with glob characters also is, and its pattern beneath a
- * directory that holds such characters in its own name. Empty for every
- * spelling no part of which is such a name on disk.
+ * The readings a caller's spellings have beside {@link toPathEntry}'s; see
+ * {@link literalReadings}.
  */
 function alsoReadAs(
   spellings: readonly string[] | undefined,
@@ -319,11 +312,7 @@ function alsoReadAs(
   return (spellings ?? []).flatMap(spelling => literalReadings(spelling, kind))
 }
 
-/**
- * One of the caller's lists as entries: each spelling as its characters
- * read, then the other readings of the spellings, then the paths that
- * arrived marked literal.
- */
+/** One of the caller's lists as entries, in every reading each has. */
 function callerEntries(
   kind: PathListKind,
   spellings: readonly string[] | undefined,
@@ -910,8 +899,7 @@ function generateReadRules(
 
 /**
  * What a write config allows, as entries. Decided once per profile and
- * handed to the read section and the write section alike, so the two cannot
- * see different answers for one entry.
+ * handed to the read and the write section, so the two see the same answer.
  */
 function writeRootEntries(
   config: FsWriteRestrictionConfig | undefined,

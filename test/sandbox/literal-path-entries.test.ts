@@ -57,17 +57,12 @@ import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
- * A directory may hold `*`, `?`, `[` or `]` in its name. An entry of
- * `denyRead`, `allowRead`, `allowWrite` or `denyWrite` that lies inside one
- * has those characters in it, and read as a pattern alone it matches
- * nothing: the deny is lost and the allow opens nothing. Such an entry is
- * read as the pattern AND as the path it spells wherever the part that holds
- * the characters exists on disk; an entry marked `{ path, literal: true }`
- * is a path and nothing else.
+ * Entries inside a directory with `*`, `?`, `[` or `]` in its name, which
+ * match nothing when read as a pattern alone, and entries marked
+ * `{ path, literal: true }`: see src/sandbox/path-entries.ts.
  *
- * The Linux suites run real commands under bubblewrap. The macOS suites
- * read the generated profile, which is string building and runs on any
- * POSIX host; nothing here runs a profile under sandbox-exec.
+ * The Linux suites run real commands under bubblewrap. The macOS suites read
+ * the generated profile on any POSIX host; none runs it under sandbox-exec.
  */
 
 /** The folder every suite works in: a name a pattern reads as a class. */
@@ -85,15 +80,11 @@ function q(p: string): string {
   return `'${p.replace(/'/g, `'\\''`)}'`
 }
 
-/** `text` as it appears inside a regular expression that matches it. */
 function escapedForRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/**
- * The filter a spelling compiles to when its characters are read as a
- * pattern, which is the reading every entry with glob characters has.
- */
+/** The filter a spelling compiles to when read as a pattern. */
 function patternFilter(spelling: string, kind: 'allow' | 'deny'): string {
   const compile = kind === 'deny' ? denyGlobRegex : globToRegex
   return `(regex ${JSON.stringify(compile(normalizePathForSandbox(spelling)))})`
@@ -102,14 +93,12 @@ function patternFilter(spelling: string, kind: 'allow' | 'deny'): string {
 const subpath = (p: string): string => `(subpath ${JSON.stringify(p)})`
 const literalFilter = (p: string): string => `(literal ${JSON.stringify(p)})`
 
-/** Every `(regex "…")` the profile emits. */
 function emittedRegexes(profile: string): RegExp[] {
   return [...profile.matchAll(/\(regex ("(?:[^"\\]|\\.)*")\)/g)].map(
     match => new RegExp(JSON.parse(match[1]!) as string),
   )
 }
 
-/** Every `(subpath "…")` the profile emits. */
 function emittedSubpaths(profile: string): string[] {
   return [...profile.matchAll(/\(subpath ("(?:[^"\\]|\\.)*")\)/g)].map(
     match => JSON.parse(match[1]!) as string,
@@ -323,8 +312,7 @@ describe.if(!isWindows)('literalReadings', () => {
 
   it('leaves a relative name inside a bracketed cwd alone', () => {
     process.chdir(project)
-    // No glob character in what the caller wrote: it is a name already, and
-    // every backend takes it for one.
+    // No glob character in what the caller wrote: it is a name already.
     expect(bothKinds('./keep')).toEqual(forBoth([]))
     expect(bothKinds('keep')).toEqual(forBoth([]))
   })
@@ -388,8 +376,7 @@ describe.if(!isWindows)('literalReadings', () => {
   })
 
   it('reads [ab] as the class and as the directory of that name', () => {
-    // The pattern reading, which covers `a` and `b`, is the one every entry
-    // has; the name is what this adds.
+    // The class is the pattern reading every entry has; this adds the name.
     const inClass = join(root, 'plain', '[ab]', 'secret')
     expect(bothKinds(inClass)).toEqual(forBoth([name(inClass)]))
   })
@@ -426,8 +413,7 @@ describe.if(!isWindows)('literalReadings', () => {
   })
 
   it('anchors a pattern at the nearest directory when a file is in the way', () => {
-    // As beneath any folder: the walk then finds the file where it looked
-    // for a directory.
+    // The walk then finds the file where it looked for a directory.
     expect(literalReadings(`${project}/file/**/x`, 'deny')).toEqual([
       beneath(project, '/file/**/x'),
     ])
@@ -466,8 +452,7 @@ describe.if(!isWindows)('literalReadings', () => {
     })
 
     it('ends the pattern of an allow when it lies before the first pattern component', () => {
-      // The walk starts at the folder followed by `linked`, resolved: it
-      // would list what the link points at.
+      // The walk would start at `linked`, resolved, and list what it points at.
       for (const tail of ['/linked/*/x', '/linked/*', '/real/../linked/**/x']) {
         expect(literalReadings(project + tail, 'allow')).toEqual([])
       }
@@ -548,8 +533,7 @@ describe.if(!isWindows)('literalReadings', () => {
       'matches %p, which cannot be split, by its spelling from the anchor on',
       (tail, expected) => {
         // A wildcard inside a bracket expression: the walk matches such a
-        // pattern against whole paths, and beneath an anchor those are paths
-        // from the anchor on.
+        // pattern against whole paths, which beneath an anchor start at it.
         expect(
           expandGlobPattern(ordinary + tail)
             .map(match => match.slice(ordinary.length))
@@ -591,8 +575,7 @@ describe('path entries as configured', () => {
     ['a number', 1],
     ['a list', ['/a']],
   ])('refuses %s rather than guess', (_what, entry) => {
-    // initialize() does not run the schema, so this is the only check an
-    // embedder's hand-built config meets.
+    // initialize() runs no schema: this is a hand-built config's only check.
     expect(() =>
       splitPathEntries([entry as unknown as FilesystemPathEntry]),
     ).toThrow(TypeError)
@@ -753,8 +736,7 @@ describe.if(isLinux)(
       'opens a carve-out inside a folder named %p, whose name a pattern matches as itself',
       async name => {
         // The deny is spelled without a `/**`: with one it is the pattern as
-        // well in such a folder, under which every entry beneath the
-        // directory keeps a mask of its own.
+        // well, under which every entry beneath keeps a mask of its own.
         const folder = join(root, name)
         mkdirSync(join(folder, 'secrets', 'public'), { recursive: true })
         writeFileSync(join(folder, 'secrets', 'key'), 'SECRET-DIR\n')
@@ -806,9 +788,8 @@ describe.if(isLinux)(
     it.skipIf(!CAN_RUN)(
       'applies a deny beneath an allow that is spelled through a parent reference',
       async () => {
-        // The allow is recorded where it resolves to. Left as spelled, the
-        // deny beneath it would be judged outside every allowed path and
-        // skipped.
+        // The allow is recorded where it resolves to: left as spelled, the
+        // deny beneath it would be judged outside every allowed path.
         const denied = join(project, 'real', 'file')
         const { stdout } = await sandboxed(
           {
@@ -899,9 +880,8 @@ describe.if(isLinux)(
     ])(
       'makes nothing writable for a direct caller that spells %p, which is not there',
       async (tail, target) => {
-        // Nothing beneath the project is named `*` or `[ab]`. Resolved as a
-        // name the string loses the component with its parent reference, and
-        // what is left names a directory that is there.
+        // Nothing is named `*` or `[ab]`. Resolved as a name, the string would
+        // lose that component to its parent reference and name what is there.
         const kept = join(project, target)
         const before = readFileSync(kept, 'utf8')
         const wrapped = await wrapCommandWithSandboxLinux({
@@ -931,8 +911,7 @@ describe.if(isLinux)(
       'makes a path writable that is spelled through a folder that is not there, as beneath any folder',
       async () => {
         // The project's own name holds the glob characters and exists, so the
-        // string is the name of a path; a name is resolved, parent reference
-        // and all.
+        // string is a name, and a name is resolved, parent reference and all.
         const { stdout } = await sandboxed(
           { allowWrite: [`${project}/absent/../real`] },
           `echo hi > ${q(join(project, 'real', 'new'))} && echo WROTE; ` +
@@ -948,10 +927,9 @@ describe.if(isLinux)(
 )
 
 /**
- * What exists is looked at when a command is wrapped, and an earlier command
- * may have put it there. A deny takes every reading that may hold, so
- * nothing the command creates can switch one off. An allow takes the path
- * only as itself: a link with the name an entry spells is not the path.
+ * What exists is looked at on every wrap, and an earlier command may have
+ * put it there: nothing it creates may switch a deny off, and a link with
+ * the name an entry spells is not the path an allow takes.
  */
 describe.if(isLinux)(
   'Linux: what a command can change before the next wrap',
@@ -1042,9 +1020,8 @@ describe.if(isLinux)(
     ])(
       'does not open a denied directory through a link that a pattern spelled %p starts beneath',
       async (entry, dirName, linkName) => {
-        // The directory is one the command made, with the name the entry
-        // spells, and the link inside it is what the pattern would be walked
-        // from.
+        // The command made the directory the entry spells, and the link
+        // inside it is what the pattern would be walked from.
         const policy = {
           denyRead: [vault],
           allowRead: [join(work, entry)],
@@ -1156,10 +1133,9 @@ describe.if(isLinux)(
     it.skipIf(!CAN_RUN || process.getuid?.() === 0)(
       'takes any write deny with glob characters for the path it spells when the folder cannot be looked at',
       async () => {
-        // Whether anything in the folder has the name cannot be told, so an
-        // ordinary pattern is taken for a path as well, and is applied like
-        // a path that is not there: the name is kept from being created, and
-        // what the pattern would match is no more denied than anywhere else.
+        // Whether anything in the folder has the name cannot be told, so a
+        // pattern is also applied like a path that is not there: the name is
+        // kept from being created, and what it would match is not denied.
         const locked = join(root, 'locked')
         mkdirSync(locked)
         writeFileSync(join(locked, 'a.pem'), 'original\n')
@@ -1458,13 +1434,9 @@ describe.if(!isWindows)('an entry that is a pattern and a name', () => {
 // ============================================================================
 
 /**
- * Ordinary entries and ordinary patterns, under a root that does not exist.
- * The expectations are what the code gave for them before an entry could
- * have a second reading; they must stay what they are, byte for byte. That
- * goes for every entry none of whose glob characters can be part of a name
- * on disk. Beneath a directory that cannot be looked at they can, for all
- * anyone can tell, and there a deny is also the path it spells: see "takes
- * any write deny with glob characters for the path it spells" above.
+ * Ordinary entries and patterns, under a root that does not exist: no glob
+ * character of theirs can be part of a name on disk, so each has its
+ * pattern reading alone, and what it resolves to is pinned byte for byte.
  */
 describe.if(!isWindows)(
   'entries none of which is a name with glob characters',
@@ -1564,10 +1536,7 @@ describe.if(!isWindows)(
   },
 )
 
-/**
- * The file rules of the profile inside a wrapped command, with the log tag,
- * which differs from one process to the next, replaced.
- */
+/** The file rules of a wrapped command's profile, log tag replaced. */
 function fileRulesOf(wrapped: string): string {
   const from = wrapped.indexOf('; File read')
   const to = wrapped.indexOf("' ", from)
@@ -1813,8 +1782,7 @@ describe.if(!isWindows)('an entry marked literal', () => {
     expect(ruleOf(profile, '(deny file-write*')).toContain(
       subpath(join(root, 'keep[1]')),
     )
-    // What the characters of each path would match as a pattern is matched
-    // by no regex of the profile.
+    // No regex of the profile matches what a path would match as a pattern.
     const regexes = emittedRegexes(profile)
     for (const matched of [
       join(dir, 'a.env'),
@@ -1889,8 +1857,7 @@ describe.if(!isWindows)('an entry marked literal', () => {
     'denies a write to a path that is not there yet, in a folder that is not there yet',
     async () => {
       // An absent deny path gets a placeholder at its first missing
-      // component, which keeps the command from creating it; the placeholder
-      // is removed from the host once the command is done.
+      // component, which is removed from the host once the command is done.
       const folder = join(root, '[new]')
       const secret = join(folder, 'secret')
       const { stdout } = await sandboxed(
@@ -1912,8 +1879,7 @@ describe.if(!isWindows)('an entry marked literal', () => {
     'denies a read of a path that is not there yet from the wrap after it appears',
     async () => {
       // Nothing is mounted for a read deny whose path is absent, marked or
-      // not: there is nothing to hide. The path is looked at again for the
-      // next command.
+      // not; the path is looked at again for the next command.
       const late = join(root, '[late]', 'secret')
       const policy = { denyRead: [marked(late)] }
       const read = `cat ${q(late)} 2>/dev/null; echo END`
@@ -1931,11 +1897,9 @@ describe.if(!isWindows)('an entry marked literal', () => {
   it.skipIf(!CAN_RUN)(
     'keeps the masks of a deny pattern beneath a marked allow',
     async () => {
-      // The matches of a deny pattern are collapsed: one that a directory
-      // match above it already hides gets no mount of its own, unless a path
-      // that is bound back over that directory lies between the two. A
-      // marked allow is bound back like any other, so the match beneath it
-      // has to keep its mask.
+      // A match of a deny pattern that a directory match above it already
+      // hides gets no mount of its own, unless a path bound back over that
+      // directory lies between the two. A marked allow is one such path.
       const vault = join(root, 'tree', 'vault.key')
       const open = join(vault, 'open[1]')
       mkdirSync(open, { recursive: true })

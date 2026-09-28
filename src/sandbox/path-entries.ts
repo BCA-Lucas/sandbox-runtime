@@ -2,19 +2,14 @@
  * How an entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite` is
  * read: as the pattern its characters spell, as the path they name, or both.
  *
- * An entry is a pattern when it holds `*`, `?`, `[` or `]`. A directory may
- * hold those characters in its own name (`[WIP] project`, `notes (draft?)`),
- * and a caller that lists paths inside one means the paths. So an entry with
- * those characters keeps the pattern reading it always had, and is ALSO read
- * as what it names wherever the part of it that holds the characters exists
- * on disk. A caller that wants the name and nothing else marks the entry
- * `{ path, literal: true }`.
+ * An entry with `*`, `?`, `[` or `]` is a pattern. A directory may hold those
+ * in its own name (`[WIP] project`), so such an entry is ALSO read as what it
+ * names wherever the part that holds the characters exists on disk. An entry
+ * marked `{ path, literal: true }` is the name and nothing else.
  *
- * The decision is made here and nowhere else, once per entry per wrap, by
- * the first stage that needs it: the manager on Linux (bubblewrap takes no
- * patterns, so the manager is where they are expanded), the profile builder
- * on macOS, `expandWindowsFsPaths` on Windows. What comes out is carried with
- * the entry from then on; no later stage looks at its characters again.
+ * The decision is made here only, once per entry per wrap, by the first
+ * stage that needs it (the manager on Linux, the profile builder on macOS,
+ * `expandWindowsFsPaths` on Windows); no later stage reads the characters.
  */
 
 import * as fs from 'node:fs'
@@ -43,31 +38,25 @@ import type {
 export { markedLiteralPath }
 
 /**
- * Which way a list cuts. A reading added to a deny can only deny more, so a
- * deny takes every reading that may hold. A reading added to an allow opens
- * something, so an allow takes one only for a path that is there exactly as
- * spelled.
+ * Which way a list cuts. A deny takes every reading that may hold, since one
+ * more can only deny more; an allow takes one only for a path that is there
+ * exactly as spelled.
  */
 export type PathListKind = 'allow' | 'deny'
 
-/**
- * One reading of an entry. The same shape as the macOS builder's `PathEntry`,
- * so a reading is one without conversion.
- */
+/** One reading of an entry, shaped as the macOS builder's `PathEntry`. */
 export type PathReading =
   /** The entry is the name of this path. */
   | { glob: false; path: string }
   /**
    * The entry is a pattern beneath `anchor`, a directory taken as the name it
-   * is. `path` is `anchor` followed by the tail, and only the tail is
-   * pattern.
+   * is: `path` is `anchor` plus the tail, and only the tail is pattern.
    */
   | { glob: true; path: string; anchor: string }
 
 /**
  * The spellings and the marked paths of a list, apart. Throws on an entry
- * that is neither: `initialize()` does not run the schema, and reading
- * `{ path }` either way would be a guess about a deny.
+ * that is neither; see {@link markedLiteralPath}.
  */
 export function splitPathEntries(
   entries: readonly FilesystemPathEntry[] | undefined,
@@ -99,10 +88,9 @@ export function pathEntryKey(entry: FilesystemPathEntry): string {
 }
 
 /**
- * The spelling made absolute the way {@link normalizePathForSandbox} does it
- * for a pattern, with no symlink resolved and a trailing separator kept: the
- * path the caller wrote, which is what the disk is asked about. Undefined
- * for a Windows UNC path, which is never probed (see {@link isUncPath}).
+ * The spelling made absolute as {@link normalizePathForSandbox} does for a
+ * pattern: no symlink resolved, a trailing separator kept. Undefined for a
+ * Windows UNC path, which is never probed (see {@link isUncPath}).
  */
 function spelledAbsolute(spelling: string): string | undefined {
   const onWindows = getPlatform() === 'windows'
@@ -123,10 +111,9 @@ function spelledAbsolute(spelling: string): string | undefined {
 
 /**
  * Whether something may be at `p`, for a deny. A symbolic link counts,
- * dangling or not: the name is taken. So does a path that could not be
- * looked at, because unreadable now is not absent: a command running as the
- * same user can make a parent unsearchable and undo that from inside the
- * next sandbox, and a deny it could switch off that way would be no deny.
+ * dangling or not, and so does a path that cannot be looked at: otherwise a
+ * command running as the same user could switch the deny off by making a
+ * parent unsearchable, and undo that inside the next sandbox.
  */
 function mayBeThere(p: string): boolean {
   try {
@@ -138,11 +125,9 @@ function mayBeThere(p: string): boolean {
 }
 
 /**
- * Whether `p` is there and is not a symbolic link, for an allow. A link with
- * the name an entry spells is not the path the caller meant: whoever can
- * write the directory that holds it can plant one, and the allow would then
- * open what the link points at. Anything that cannot be looked at is not
- * there.
+ * Whether `p` is there and is not a symbolic link, for an allow. Whoever can
+ * write the directory that holds `p` can plant a link of that name, and the
+ * allow would open what it points at. What cannot be looked at is not there.
  */
 function isThereUnlinked(p: string): boolean {
   try {
@@ -165,34 +150,28 @@ function isDirectoryFor(kind: PathListKind, p: string): boolean {
 
 /**
  * The readings a caller's spelling has BESIDE the one its characters give
- * it. Empty for a spelling that does not read as a pattern (it is a name
- * already) and for a pattern none of whose glob characters are part of a
- * name on disk, which is every ordinary pattern: that one costs a single
- * `lstat`.
+ * it. Empty for a spelling that is no pattern, and for a pattern none of
+ * whose glob characters are part of a name on disk: that costs one `lstat`.
  *
- * A trailing `/**` is set aside first. Of the path components that hold glob
+ * A trailing `/**` is set aside first. Of the components that hold glob
  * characters, the leading ones that exist on disk as spelled are names:
  *
  * - When all of them exist, the entry is also the NAME it spells. What
  *   follows the last of them need not exist.
  * - When a pattern follows an existing one, the entry is also that pattern
- *   BENEATH the directory, which is taken as the name it is. There is one
- *   such reading for each of the existing components, the longest first, so
- *   creating or removing a directory adds or removes a reading and never
- *   turns one into another.
+ *   BENEATH the directory. There is one such reading per existing component,
+ *   the longest first, so creating or removing a directory adds or removes a
+ *   reading and never turns one into another.
  *
- * Whether a spelling is a pattern at all is decided on what the caller
- * wrote (`isPattern`, the platform's own check by default), as it always
- * was. Which components hold glob characters is decided by
- * {@link containsGlobChars} on every platform, because those are the
- * characters the pattern compiler and the walk take for syntax.
+ * Whether a spelling is a pattern is decided on what the caller wrote
+ * (`isPattern`); which components hold glob characters, by
+ * {@link containsGlobChars} on every platform, since those are what the
+ * pattern compiler and the walk take for syntax.
  *
- * For a deny, a component exists when something has its name, a symbolic
- * link included, or when it cannot be looked at. For an allow it exists only
- * as itself: no component from the first with glob characters on may be a
- * symbolic link, and none may be beyond looking at. That goes for a name to
- * its end and for a pattern up to its first pattern component, from where
- * the walk of an allow goes through no link.
+ * A component exists for a deny as {@link mayBeThere} has it. For an allow
+ * no component from the first with glob characters on may be a symbolic
+ * link or beyond looking at: a name to its end, a pattern up to its first
+ * pattern component, from where the walk of an allow goes through no link.
  */
 export function literalReadings(
   spelling: string,
@@ -231,9 +210,8 @@ export function literalReadings(
   }
 
   // The tail keeps a trailing separator, which makes a pattern match nothing
-  // (`/x/*/`): stripped, an allow spelled so would start matching every
-  // child. The `/**` set aside above goes back on, for the walk's directory
-  // form.
+  // (`/x/*/`): stripped, an allow spelled so would match every child. The
+  // `/**` set aside above goes back on, for the walk's directory form.
   const setAside = stripped === spelling ? '' : '/**'
   for (let n = globAt.length - 2; n >= 0; n--) {
     const at = globAt[n]!
@@ -244,9 +222,8 @@ export function literalReadings(
     let end = Math.min(next - 1, reach)
     while (end >= at && !isDirectoryFor(kind, prefix(end))) end--
     if (end < at) continue
-    // The walk starts at the anchor followed by what the tail spells before
-    // its first pattern component, and resolves that: a link there would
-    // have an allow list what the link points at.
+    // The walk resolves what the tail spells before its first pattern
+    // component: a link there would have an allow list what it points at.
     if (kind === 'allow' && !restIsUnlinked(next - 1, end, prefix)) continue
     const anchor = normalizePathForSandbox(prefix(end), { literal: true })
     readings.push({
@@ -283,10 +260,9 @@ export function hasNameReading(spelling: string, kind: PathListKind): boolean {
 }
 
 /**
- * What a Linux read entry resolves to: what `expandGlob` finds for the
- * pattern, exactly as it returns it, then what the entry's other readings
- * add. `name` is the entry as a name, in the caller's spelling like every
- * other name in these lists.
+ * What a Linux read entry resolves to: what `expandGlob` returns for the
+ * pattern, then what the entry's other readings add. `name` is the entry as
+ * a name, in the caller's spelling.
  */
 export function withOtherReadings(
   spelling: string,
@@ -311,9 +287,8 @@ export function withOtherReadings(
 }
 
 /**
- * The read rules `getDefaultWritePaths()` is given for a policy: its
- * entries, the credential denies, and beside each spelling the name it also
- * is, handed over as a marked path.
+ * The read rules `getDefaultWritePaths()` is given: the entries, the
+ * credential denies, and the name each spelling also is, as a marked path.
  */
 export function readRulesOf(
   denyRead: readonly FilesystemPathEntry[],
@@ -342,7 +317,6 @@ export function readRulesOf(
   }
 }
 
-/** `lists` without the keys whose list is empty. */
 function nonEmptyLists<T extends Record<string, string[]>>(
   lists: T,
 ): Partial<T> {
@@ -353,8 +327,7 @@ function nonEmptyLists<T extends Record<string, string[]>>(
 
 /**
  * The `literal…` lists of a read config: the marked entries of the two read
- * lists. A key is present only when its list is not empty, so a config
- * without marked entries gives the object it always gave.
+ * lists. A key is present only when its list is not empty.
  */
 export function literalReadLists(
   denyRead: readonly FilesystemPathEntry[] | undefined,
@@ -435,11 +408,9 @@ export function readNamesOf(
 /**
  * The same for a write config; see {@link readNamesOf}. A string of
  * `allowOnly` that holds glob characters is kept only when it is also the
- * name of a path (see {@link literalReadings}), the condition on which the
- * manager keeps one. Any other is a pattern that a caller of the backend
- * handed it, and no name: resolving a name folds a `..` by the text, so
- * `/home/*\/../.ssh` would make `/home/.ssh` writable where nothing is named
- * `*`. A path the caller marked is resolved like any name.
+ * name of a path (see {@link literalReadings}). Any other is a pattern and
+ * no name: resolving a name folds a `..` by the text, so `/home/*\/../.ssh`
+ * would make `/home/.ssh` writable where nothing is named `*`.
  */
 export function writeNamesOf(
   config: FsWriteRestrictionConfig | undefined,

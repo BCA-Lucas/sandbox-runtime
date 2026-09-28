@@ -1691,15 +1691,14 @@ export function uninstallWindowsSandbox(
  * still walks the share (user-trusted).
  *
  * `[` and `]` are characters of a name here, but the walk that expands a
- * glob reads them as a character class on every platform. So a glob that
- * lies beneath a directory with brackets in its name, which the walk alone
- * would expand to nothing, is also expanded beneath that directory taken as
- * the name it is (see path-entries.ts). A UNC glob is not: finding the
- * directory would probe the share.
+ * glob reads them as a character class. So a glob beneath a directory with
+ * brackets in its name is also expanded beneath that directory taken as the
+ * name it is (see path-entries.ts). A UNC glob is not: finding the directory
+ * would probe the share.
  *
  * An entry marked `{ path, literal: true }` is a literal whatever it holds.
- * One that holds `*` or `?` is skipped: no Win32 name has them, so it names
- * nothing that can exist, and `srt-win` refuses the characters outright.
+ * One that holds `*` or `?` is skipped: no Win32 name has them, and
+ * `srt-win` refuses the characters outright.
  */
 export function expandWindowsFsPaths(
   patterns: readonly FilesystemPathEntry[],

@@ -63,8 +63,7 @@ function collapseReadDenyLocations({
  * `**\/build/**` yields one mount per `build/` directory. A match reached
  * through a symlink is listed where it really lives, and a directory the walk
  * could not list is denied whole. Sorted, so an ancestor precedes its
- * descendants. With `anchor`, the pattern is walked beneath that directory,
- * which is taken as the name it is (see `ExpandGlobOptions.anchor`).
+ * descendants. `anchor` is as in `ExpandGlobOptions.anchor`.
  *
  * @param unlistableDirs - receives the returned locations that hide something
  * the walk could not enumerate, whether by being that directory or by

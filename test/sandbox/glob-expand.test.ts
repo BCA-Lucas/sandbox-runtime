@@ -842,13 +842,10 @@ describe('expandWindowsFsPaths literal branch', () => {
 // ============================================================================
 
 /**
- * `[` and `]` are characters of a name on Windows, and a path that holds
- * them and no `*` or `?` is a literal. A pattern beneath such a directory is
- * expanded by the walk every platform shares, which reads the brackets as a
- * character class: on its own it finds nothing, and the deny or grant is
- * lost. expandWindowsFsPaths is plain TypeScript, so what it does with such
- * entries is pinned here on every host; the spellings only Windows has are
- * in the suite below this one.
+ * `[` and `]` are characters of a name on Windows, but the walk that expands
+ * a pattern reads them as a character class: beneath such a directory it
+ * finds nothing on its own, and the deny or grant is lost. Pinned here on
+ * every host; the spellings only Windows has are in the suite below.
  */
 describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
   let root: string

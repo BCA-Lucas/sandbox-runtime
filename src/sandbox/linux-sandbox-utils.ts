@@ -1951,9 +1951,8 @@ async function generateFilesystemArgs(
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
       // Every path here is a name, and normalizePathForSandbox strips a
-      // trailing slash from a name, so the strip below has nothing left to
-      // do; it stays as the guard of what is recorded. Allow paths are
-      // recorded slash-free because every
+      // name's trailing slash; the strip below stays as a guard. Allow paths
+      // are recorded slash-free because every
       // downstream comparison — the deny loop's within-allowlist gate,
       // findSymlinkInPath's mask scoping, the emission filter's re-expose
       // check, the denyRead re-bind and its allowRead skip, and the stub-skip
@@ -2981,12 +2980,10 @@ export async function wrapCommandWithSandboxLinux(
     observeSocketPath,
     abortSignal,
   } = params
-  // bubblewrap takes no patterns, so every path that reaches this backend is
-  // a name: the manager has expanded or dropped what was a pattern. The
-  // literal lists are therefore more entries of the lists they belong to, and
-  // are folded into them here, once, so that nothing below can read a list
-  // and miss them. A caller of this function may still hand it a pattern:
-  // in `allowOnly` one that is no name is dropped by the fold.
+  // bubblewrap takes no patterns, so every path here is a name. The literal
+  // lists are folded into the lists they belong to, once, so that nothing
+  // below can read a list and miss them; a pattern in `allowOnly` that is no
+  // name is dropped by the fold (see writeNamesOf).
   const readConfig = readNamesOf(params.readConfig)
   const writeConfig = writeNamesOf(params.writeConfig)
 

@@ -712,10 +712,9 @@ async function initialize(
   if (enableLogMonitor && getPlatform() === 'linux') {
     // The monitor compares paths the kernel reported, so its lists are
     // expanded the way the wrapper expands them (getFsWriteConfig folds in
-    // the default write paths and drops the patterns bwrap cannot take, so
-    // what is left are names; normalizePathForSandbox resolves `~`, relative
-    // spellings and symlinks), plus the built-in write denies the wrapper
-    // always applies.
+    // the default write paths and drops the patterns, so only names are left;
+    // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
+    // plus the built-in write denies the wrapper always applies.
     // It does not reproduce the wrapper's existence and boundary-symlink
     // filters, nor the ripgrep scan for nested dangerous paths; and it still
     // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
@@ -1272,15 +1271,12 @@ function unionDenyReadPaths(
 }
 
 /**
- * Strip a trailing `/**` from each spelling of a read list and, on Linux,
- * replace one that still has glob characters with what it resolves to
- * (bubblewrap takes concrete paths only): what `expandGlob` returns for the
- * pattern, then the name the spelling also is when that exists, and what
- * the pattern matches beneath a directory that exists and has the
- * characters in its own name (see path-entries.ts). Other platforms match
- * globs natively, and their backends decide the other readings themselves.
- * Entries the caller marked literal are not among the result: they travel
- * in the `literal…` lists.
+ * Strip a trailing `/**` from each read-path entry and, on Linux, replace
+ * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
+ * concrete paths only). Other platforms match globs natively.
+ * On Linux the entry's other readings are added (see `withOtherReadings`);
+ * elsewhere the backend decides them. Entries the caller marked literal are
+ * not in the result: they travel in the `literal…` lists.
  *
  * `literalPaths` are the ones the library resolved itself (a masked
  * credential file that degraded to deny) — each names one file on disk, so
@@ -1305,13 +1301,11 @@ function resolveReadPathEntries(
 }
 
 /**
- * Strip a trailing `/**` from each spelling of a write list and, on Linux,
- * drop one that still has glob characters unless it is also the name of a
- * path that exists: bwrap needs real paths and nothing expands a write
- * pattern, so such an entry is applied as the name and its pattern reading
- * is not. macOS subpath matching is recursive, so the strip is harmless
- * there and the filter never fires. Entries the caller marked literal are
- * not among the result: they travel in the `literal…` lists.
+ * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
+ * real paths. macOS subpath matching is recursive, so the strip is harmless
+ * there and the filter never fires.
+ * A glob that is also the name of a path that exists is kept, as that name.
+ * Marked entries are not in the result, as in {@link resolveReadPathEntries}.
  */
 function stripWriteGlobs(
   kind: PathListKind,
@@ -1345,9 +1339,8 @@ function expandAllowReadGlob(pattern: string, anchor?: string): string[] {
  * On Linux, denyRead globs are collapsed to covering directory mounts against
  * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
- * to wrapCommandWithSandboxLinux with a different one. Entries the caller
- * marked literal are in `literalDenyOnly` and `literalAllowWithinDeny`, as
- * spelled, and the object is to be passed on whole.
+ * to wrapCommandWithSandboxLinux with a different one. Marked entries are
+ * in the `literal…` lists, as spelled: pass the object on whole.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1509,7 +1502,6 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   }
 }
 
-/** Compared by value: a marked entry is a new object after every clone. */
 function setEq(
   a: readonly FilesystemPathEntry[],
   b: readonly FilesystemPathEntry[],
@@ -2446,11 +2438,10 @@ function annotateStderrWithSandboxFailures(
  * fully supported on Linux. Returns empty array on macOS or when
  * sandboxing is disabled.
  *
- * Patterns ending with /** are excluded since they work as subpaths, and so
- * are entries marked literal, which are no patterns. An entry that is also
- * the name of a path that exists is applied as that name and is still
- * returned: its pattern reading is not applied, and what is returned must
- * not depend on what is on the disk, which a sandboxed command can change.
+ * Patterns ending with /** are excluded since they work as subpaths.
+ * So are entries marked literal. An entry that is also the name of a path
+ * that exists is still returned: what is returned must not depend on what
+ * is on the disk, which a sandboxed command can change.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)

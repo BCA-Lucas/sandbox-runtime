@@ -8,8 +8,7 @@ const ARGS_FILE_ARGV0 = 'srt-args'
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']
 
-/** Every mount flag this generator emits, and how many words each takes
- * after the flag itself. mountsOf reads whole mounts with this. */
+/** How many words follow each mount flag this generator emits. */
 const MOUNT_ARITY: Record<string, number> = {
   '--bind': 2,
   '--ro-bind': 2,
@@ -89,11 +88,9 @@ export function indexOfMount(command: string, ...words: MountWords): number {
 }
 
 /**
- * Every mount the command carries, in emission order, each as the whole run
- * of words bwrap is given for it. Meant to be compared as a MULTISET: two
- * profiles that mount the same things in a different order are the same
- * plan, and ripgrep hands the mandatory-deny scan its hits in thread order,
- * so the emission order of those varies run to run.
+ * Every mount the command carries, in emission order, each as the words
+ * bwrap is given for it. Compare as a MULTISET: the mandatory-deny scan
+ * takes ripgrep's hits in thread order, so that order varies run to run.
  */
 export function mountsOf(command: string): string[] {
   const argv = argvOf(command)

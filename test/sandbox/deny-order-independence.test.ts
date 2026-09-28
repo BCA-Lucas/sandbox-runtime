@@ -17,19 +17,11 @@ import {
 import { isLinux } from '../helpers/platform.js'
 import { mountsOf } from '../helpers/bwrap-argv.js'
 
-/**
- * The empty directory mounted over an absent deny path's first missing
- * component is made fresh for the wrap that needs one, so its name differs
- * between any two wraps of the same configuration and says nothing about
- * the plan.
- */
+/** The empty directory mounted over an absent deny path's first missing
+ * component is made fresh per wrap, so its name says nothing about the plan. */
 const EMPTY_MOUNT_SOURCE = /\S*claude-empty-[A-Za-z0-9]+/g
 
-/**
- * A profile's mounts as the multiset two passes are compared on: the
- * mandatory-deny scan takes ripgrep's hits in thread order, so emission
- * order varies from one wrap to the next on one revision too.
- */
+/** A profile's mounts as a multiset, for the reason mountsOf gives. */
 function mountMultiset(command: string): string[] {
   return mountsOf(command)
     .map(mount => mount.replace(EMPTY_MOUNT_SOURCE, '<empty mount source>'))
@@ -38,22 +30,16 @@ function mountMultiset(command: string): string[] {
 
 /**
  * A deny set protects the same paths whichever order the caller wrote it
- * down in. The mounts a profile carries must therefore be the same for a
- * denyWithinAllow list and for its reverse.
+ * down in, so a profile's mounts must be the same for a denyWithinAllow list
+ * and for its reverse.
  *
- * They were not. The deny loop deduplicates entries on the path they resolve
- * to, and skips an existing deny path that a denied directory above it
- * already re-binds read-only -- but it asked whether the entry IN HAND was
- * reached through a symlink, and only the first spelling of a destination
- * ever reaches that question. A deny set naming one destination twice, once
- * directly and once through a symlink, under a deny on a directory above it,
- * therefore bound that destination read-only or not according to which of
- * the two spellings the caller happened to list first.
- *
- * Neither answer left anything writable: the covering directory's own
- * read-only bind is emitted after every allow bind and holds the whole
- * subtree either way. What was wrong is that the plan was not a function of
- * the deny SET, which is what makes it testable at all.
+ * The deny loop deduplicates entries on the path they resolve to, and skips
+ * an existing deny path that a denied directory above it already re-binds
+ * read-only. Were that skip to ask whether the entry IN HAND is reached
+ * through a symlink, a destination named both directly and through a
+ * symlink would be bound or not according to which spelling came first.
+ * Nothing is writable either way: the covering directory's read-only bind
+ * holds the whole subtree.
  */
 describe.if(isLinux)('Deny order independence', () => {
   let BASE: string
@@ -71,12 +57,9 @@ describe.if(isLinux)('Deny order independence', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /**
-   * The mounts one configuration produces with its deny list as given and
+  /** The mounts one configuration produces with its deny list as given and
    * reversed. The tree is rebuilt before each pass: a wrap leaves mount
-   * points on the host for absent deny paths, and the second pass must not
-   * see the first pass's.
-   */
+   * points on the host for absent deny paths, which the next must not see. */
   async function bothOrders(
     tree: () => void,
     allowOnly: string[],
@@ -168,16 +151,12 @@ describe.if(isLinux)('Deny order independence', () => {
 })
 
 /**
- * The same property over random trees. The shapes are the ones the deny loop
- * branches on: symlinks to directories and to files, dangling links, a self
- * cycle, git directories whose hooks are reached through a link, worktree
- * pointer files, leftover read-only mount points, absent leaves under absent
- * parents; with a random allow list, a random deny list (entries sometimes
- * spelled with a trailing slash), a random read-deny list on top, and the
- * working directory inside the tree.
+ * The same property over random trees, whose shapes are the ones the deny
+ * loop branches on (see buildTree), with a random allow list, deny list and
+ * read-deny list, and the working directory inside the tree.
  *
- * Bounded and seeded, so a failing tree replays: this range is one the
- * unfixed loop disagreed with itself on.
+ * Bounded and seeded, so a failing tree replays: this range holds trees that
+ * tell the two orders apart when the skip asks the entry in hand.
  */
 describe.if(isLinux)('Deny order independence over random trees', () => {
   const FIRST_SEED = 800
@@ -245,11 +224,8 @@ describe.if(isLinux)('Deny order independence over random trees', () => {
     allowAllUnixSockets: boolean
   }
 
-  /**
-   * Rebuild ROOT from scratch for `seed`. Any one mkdir, write or symlink can
-   * lose the name to something the generator already put there, which is a
-   * shape worth having: such a failure just leaves that entry out.
-   */
+  /** Rebuild ROOT from scratch for `seed`. A mkdir, write or symlink that
+   * loses its name to something already there just leaves that entry out. */
   function buildTree(seed: number): Tree {
     const r = rng(seed)
     const pick = <T>(xs: T[]): T => xs[Math.floor(r() * xs.length)] as T
@@ -380,10 +356,8 @@ describe.if(isLinux)('Deny order independence over random trees', () => {
   }
 
   it('produces the same mounts for a deny list and its reverse', async () => {
-    /** The tree is rebuilt before each pass: a wrap leaves mount points on
-     * the host for absent deny paths, and the second pass must not see the
-     * first pass's. Undefined for a tree whose deny list has nothing to
-     * reorder. */
+    /** Rebuilds the tree before each pass, as bothOrders does. Undefined for
+     * a tree whose deny list has nothing to reorder. */
     const pass = async (
       seed: number,
       reverse: boolean,

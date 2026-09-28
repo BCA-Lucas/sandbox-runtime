@@ -1676,9 +1676,8 @@ async function generateFilesystemArgs(
   // directory in its canonical form AND every recorded spelling.
   const readOnlyDenyDirSpellings = new Map<string, Set<string>>()
   // Resolved dests that at least one deny entry reaches through a symlink.
-  // The deny loop deduplicates on the resolved dest, so which spelling of a
-  // dest it sees is the caller's ordering; the skip below asks this instead
-  // of asking whether the entry in hand was symlinked.
+  // Asked of the dest, not of the entry in hand: the deny loop deduplicates
+  // on the dest, so which spelling it sees is the caller's ordering.
   const symlinkedDenySpellingDests = new Set<string>()
   // dest → the pre-resolution deny path it came from. A bind at the resolved
   // dest also re-exposes whatever the symlinked spelling leads to, so the
@@ -2529,10 +2528,7 @@ async function generateFilesystemArgs(
         // existing-path twin of the stub skip above). Veto (ii) keeps the
         // covering bind through the emission filter; a dest ANY deny entry
         // reaches through a symlink keeps its own bind, because the
-        // re-application passes below key off emitted raw spellings. Asked
-        // of the dest, not of the entry in hand: the loop deduplicates on
-        // the dest, so a dest spelled both ways would otherwise be bound or
-        // not according to which spelling the caller listed first.
+        // re-application passes below key off emitted raw spellings.
         if (
           !symlinkedDenySpellingDests.has(normalizedPath) &&
           coveredBySafeReadOnlyDenyDir(normalizedPath)

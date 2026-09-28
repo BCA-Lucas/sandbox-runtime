@@ -55,7 +55,7 @@ import {
   loadConfigFromString,
 } from '../../src/utils/config-loader.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { isLinux, isWindows } from '../helpers/platform.js'
+import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
  * Entries inside a directory with `*`, `?`, `[` or `]` in its name, which
@@ -426,6 +426,19 @@ describe.if(!isWindows)('literalReadings', () => {
       ])
     } finally {
       rmSync(join(project, '[cd]'), { recursive: true, force: true })
+    }
+  })
+
+  it.if(isMacOS)('names the anchor in the form a profile goes by', () => {
+    // /tmp is a link to /private/tmp, and a profile's rules go by real paths.
+    const held = mkdtempSync('/tmp/literal-anchor-')
+    try {
+      mkdirSync(join(held, '[deep] p'))
+      expect(literalReadings(`${held}/[deep] p/**/.env`, 'deny')).toEqual([
+        beneath(`/private${held}/[deep] p`, '/**/.env'),
+      ])
+    } finally {
+      rmSync(held, { recursive: true, force: true })
     }
   })
 

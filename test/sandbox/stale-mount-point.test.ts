@@ -47,18 +47,14 @@ function run(
 
 /**
  * A denyWrite path that does not exist gets `--ro-bind /dev/null <path>`, and
- * bwrap creates the mount point for it on the host: an empty file, mode 0444.
- * A cleanup removes it once no sandbox relies on it. A process killed before
- * it can clean up leaves the file behind, and it used to stay for good: every
- * later wrap saw an existing file, bound it onto itself and never removed it.
- * For a path whose existence is its meaning that is a lasting fault on the
- * host: a leftover `.git/config.lock` makes every `git config` write outside
- * the sandbox fail with "could not lock config file".
+ * bwrap creates the mount point for it on the host: an empty file, mode 0444. A
+ * process killed before it can clean up leaves the file behind. For a path
+ * whose existence is its meaning that is a lasting fault: a leftover
+ * `.git/config.lock` makes every `git config` write outside the sandbox fail.
  *
  * The killed process leaves its manifest as well, and that is what says the
- * file is a leftover. The file alone does not: an empty read-only file is
- * also what somebody keeps at such a path on purpose, and one taken for a
- * leftover by its shape was removed after the first command.
+ * file is a leftover. The file alone does not: an empty read-only file is also
+ * what somebody keeps at such a path on purpose.
  */
 describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   const runtime = usePrivateManifestDirectory()
@@ -106,8 +102,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   }
 
   /**
-   * The manifest of a wrap that named `paths`, written by `pid`: a process
-   * that is gone, a minute ago, unless told otherwise. Where it is written.
+   * The manifest of a wrap that named `paths`, written a minute ago by `pid`,
+   * by default a process that is gone. Returns where it is written.
    */
   function manifestNaming(
     paths: string[],
@@ -188,11 +184,9 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     await wrap([LOCK])
     await wrap([LOCK])
 
-    // Two wraps handed out, one cleaned up after: the other command may not
-    // have started yet, and a command that starts after its mount point or
-    // its manifest has gone either refuses to start or runs without its deny.
-    // A call cannot tell which command it is for, so this process gives up
-    // nothing of its own until it has been called for both.
+    // Two wraps handed out, one cleaned up after. A call cannot tell which
+    // command it is for, so this process gives up nothing of its own until it
+    // has been called for both.
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(true)
 
@@ -255,10 +249,9 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     },
   )
 
-  // ---- an empty read-only file that no manifest names --------------------
+  // ---- an empty read-only file that no manifest names ----
   //
-  // It is the caller's own, whatever it looks like: an empty `.mcp.json` of
-  // mode 0444, a lockfile somebody keeps in place. It is denied like any
+  // It is the caller's own, whatever it looks like. It is denied like any
   // existing path, by a read-only bind onto itself, and nothing ever removes
   // it.
 
@@ -331,9 +324,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       }
       expect(namedBy(command)).not.toContain(mandatory)
       expect(namedBy(command)).not.toContain(LOCK)
-      // The wrap has mount points of its own, for the mandatory denies that
-      // are absent: the clean-up below has something to remove, and removes
-      // that and nothing else.
+      // The wrap has mount points of its own, for the mandatory denies that are
+      // absent: the clean-up below removes those and nothing else.
       expect(namedBy(command)).toContain(join(project, '.bashrc'))
 
       const session = run(command, project)
@@ -356,11 +348,9 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   )
 
   it('is asked after again, where the manifests were read before another sandbox named it and made it', async () => {
-    // A wrap reads the manifests once. What was read before the file was
-    // there cannot say whose it is: a sandbox that started in between
-    // published its manifest first and had bubblewrap make the file after.
-    // Taken for the caller's own it was bound onto itself and named by this
-    // wrap nowhere, and went from under its sandbox at the other's clean-up.
+    // A wrap reads the manifests once. What was read before the file was there
+    // cannot say whose it is: a sandbox that started in between published its
+    // manifest first and had bubblewrap make the file after.
     const earlier = join(GIT_DIR, 'earlier.lock')
     plantLeftover(earlier)
     const exists = fs.existsSync
@@ -387,9 +377,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
   it('is taken for absent where it has gone, with the manifest that named it, while the wrap was looking', async () => {
     // Seen with the shape of a mount point, and named by no manifest a moment
-    // later: the sandbox it was made for has ended and been cleaned up after
-    // in between. Bound onto itself it was a source that is not there, and
-    // the command did not start.
+    // later: the sandbox it was made for has ended and been cleaned up after in
+    // between.
     const left = plantLeftover(LOCK)
     const readdir = fs.readdirSync
     let collected = false
@@ -524,9 +513,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       expect(after.stdout).toContain(BOOTED)
       expect(after.stdout).toMatch(/rc=[1-9]/)
       // A manifest whose writer is gone and that no sandbox has locked counts
-      // as live for half a second, in case the sandbox it covers is starting:
-      // the killed process left one, so the cleanup that takes its mount
-      // point away is the first one after that.
+      // as live for half a second, so the cleanup that takes its mount point
+      // away is the first one after that.
       await new Promise(resolve => setTimeout(resolve, 600))
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)

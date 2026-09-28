@@ -14,9 +14,8 @@ import { isolatedProgram } from './helpers/private-manifest-directory.js'
 let cliPath: string | undefined
 
 /**
- * Get the path to the CLI entry point: the tool itself, started with
- * directories of the run's own in place of the ones it keeps its mount point
- * manifests in, which are every other srt process's of the user.
+ * Get the path to the CLI entry point, started with directories of the run's
+ * own in place of the ones the tool keeps its mount point manifests in.
  */
 function getCliPath(): string {
   return (cliPath ??= isolatedProgram(join(process.cwd(), 'src', 'cli.ts')))

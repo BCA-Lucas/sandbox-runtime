@@ -396,8 +396,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
 
   it('keeps a pending profile through the clean-up after another command, and gives it back with the last', () => {
     // A profile belongs to one wrap and nothing maps it back to a command, so
-    // none is closed while any wrap of this process is outstanding: the one
-    // that has not started yet reopens its profile through /proc when it does.
+    // none is closed while any wrap of this process is outstanding.
     const seen = isolated(`
       const openFds = () => fs.readdirSync('/proc/self/fd').length
       // The runtime opens event-loop fds of its own on the first wrap.

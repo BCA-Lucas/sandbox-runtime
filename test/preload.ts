@@ -4,9 +4,8 @@ import {
   removeManifestDirectoriesOfTheRun,
 } from './helpers/private-manifest-directory.js'
 
-// Before any test file is loaded, so that no wrap and no clean-up of the run
-// reaches the directories the user's own sandboxes keep their manifests in. A
-// hook here belongs to the run and not to a file: the stand-ins go after the
-// last test file.
+// Before any test file is loaded, so no wrap or clean-up of the run reaches the
+// user's real manifest directories. The stand-ins are removed after the last
+// test file.
 isolateManifestDirectoriesForTheRun()
 afterAll(removeManifestDirectoriesOfTheRun)

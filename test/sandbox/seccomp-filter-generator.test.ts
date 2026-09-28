@@ -6,15 +6,11 @@ import { dirname, isAbsolute, join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
 
 /**
- * The generator of the helper's two seccomp filters
- * (vendor/seccomp-src/seccomp-unix-block.c) is a build tool that
- * vendor/seccomp/build.ts compiles, runs and deletes, so it is compiled here
- * once more, where there is a compiler and a libseccomp to link against.
- * Elsewhere these tests skip.
- *
- * It must never write a `namespaces` filter with one of its calls left out:
- * for another architecture than the builder's it may have to refuse, and
- * then it says which call and leaves no file.
+ * vendor/seccomp/build.ts compiles the filter generator
+ * (vendor/seccomp-src/seccomp-unix-block.c), runs it and deletes it, so it is
+ * compiled here once more where there is a compiler and a libseccomp to link
+ * against (elsewhere these tests skip). It must never write a `namespaces`
+ * filter with one of its calls left out.
  */
 
 type Arch = 'x86_64' | 'aarch64'
@@ -59,10 +55,8 @@ const NATIVE: Arch | undefined = ({ x64: 'x86_64', arm64: 'aarch64' } as const)[
 ]
 const OTHER: Arch = NATIVE === 'x86_64' ? 'aarch64' : 'x86_64'
 
-// Whether the generator can be built here: a compiler that finds libseccomp's
-// header and its static library. Asked when the file is loaded, and leaves
-// nothing behind. The building itself waits for beforeAll: under a name
-// filter that matches no test here, no hook would run to remove it.
+// Asked when the file is loaded, and leaves nothing behind: under a name
+// filter that matches no test here, no hook would run to remove a build.
 function canBuildGenerator(): boolean {
   if (!isLinux || NATIVE === undefined) return false
   const header = spawnSync('gcc', ['-E', '-x', 'c', '-'], {
@@ -88,14 +82,7 @@ let GENERATOR: string | undefined
 function compileGenerator(): void {
   const work = mkdtempSync(join(tmpdir(), 'seccomp-generator-'))
   GENERATOR = join(work, 'seccomp-unix-block')
-  const source = join(
-    import.meta.dir,
-    '..',
-    '..',
-    'vendor',
-    'seccomp-src',
-    'seccomp-unix-block.c',
-  )
+  const source = join(import.meta.dir, '../../vendor/seccomp-src')
   const gcc = spawnSync(
     'gcc',
     [
@@ -105,7 +92,7 @@ function compileGenerator(): void {
       '-Wextra',
       '-o',
       GENERATOR,
-      source,
+      join(source, 'seccomp-unix-block.c'),
       '-lseccomp',
     ],
     { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: 60000 },

@@ -1,33 +1,22 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
-  chmodSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readlinkSync,
   realpathSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import {
-  bwrapCanDisableUserns,
-  checkLinuxDependencies,
   cleanupBwrapMountPoints,
-  HELPER_FEATURES_PROBE_ARGUMENT,
-  planUsernsLimit,
-  probeSeccompHelperFeatures,
-  resetProbeCachesForTesting,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
-import * as which from '../../src/utils/which.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
@@ -98,32 +87,6 @@ except OSError as e:
     print('unix-socket: refused', errno.errorcode.get(e.errno, e.errno))
 `
 
-// Stands in for a helper file that a sandboxed command got to replace. It
-// says where it found itself (namespaces, session, names of the variables in
-// its environment) and tries to leave a file beside itself, which it can do
-// only if run outside the confinement the library asks a helper in.
-const HELPER_NAMESPACES = ['user', 'mnt', 'pid', 'net', 'ipc', 'uts'] as const
-// What it may find in its environment: PATH, the question, and what a shell
-// sets for itself.
-const HELPER_ENVIRONMENT = [
-  'PATH',
-  'SRT_HELPER_FEATURES',
-  'PWD',
-  'OLDPWD',
-  'SHLVL',
-  '_',
-]
-const REPLACED_HELPER = String.raw`#!/bin/sh
-here=$(dirname "$0")
-for kind in ${HELPER_NAMESPACES.join(' ')}; do
-  echo "$kind=$(readlink /proc/self/ns/$kind)"
-done
-echo "session=$(sed 's/.*) //' /proc/self/stat | cut -d' ' -f4)"
-echo "env=$(env | cut -d= -f1 | sort | tr '\n' ,)"
-( echo ran > "$here/ran-outside" ) 2>/dev/null && echo wrote-beside-itself
-echo userns-limit
-`
-
 describe.if(isLinux)(
   'Linux sandbox — the command stays in the namespaces made for it',
   () => {
@@ -142,17 +105,6 @@ describe.if(isLinux)(
       BWRAP_CAN_NAMESPACE &&
       PYTHON !== null &&
       (process.arch === 'x64' || process.arch === 'arm64')
-    const BWRAP = which.whichSync('bwrap')
-    // Bubblewrap's own word, had by using the option, not that of the function
-    // under test: gated on that, a probe that wrongly said no would turn every
-    // arm below that needs the option into a skip.
-    const BWRAP_DISABLES_USERNS =
-      BWRAP !== null &&
-      spawnSync(
-        BWRAP,
-        ['--unshare-user', '--disable-userns', '--ro-bind', '/', '/', 'true'],
-        { stdio: 'ignore', timeout: 5000 },
-      ).status === 0
 
     beforeEach(() => {
       BASE = realpathSync(mkdtempSync(join(tmpdir(), 'nested-userns-')))
@@ -175,8 +127,6 @@ describe.if(isLinux)(
       options: {
         allowNestedUserNamespaces?: boolean
         allowAllUnixSockets?: boolean
-        bwrapPath?: string
-        seccompConfig?: { applyPath?: string; argv0?: string }
       } = {},
     ): Promise<string> {
       return wrapCommandWithSandboxLinux({
@@ -199,63 +149,6 @@ describe.if(isLinux)(
 
     const hostConfig = () =>
       readFileSync(join(PROJECT, '.git', 'config'), 'utf8')
-
-    // A stand-in for bubblewrap that prints `help` whatever it is asked.
-    function fakeBwrap(name: string, help: string, mode = 0o755): string {
-      const path = join(BASE, name)
-      writeFileSync(path, `#!/bin/sh\ncat <<'EOF'\n${help}\nEOF\n`)
-      // Not through writeFileSync's mode, which the umask would trim.
-      chmodSync(path, mode)
-      return path
-    }
-    function brokenBwrap(name: string, script: string): string {
-      const path = join(BASE, name)
-      writeFileSync(path, `#!/bin/sh\n${script}\n`)
-      chmodSync(path, 0o755)
-      return path
-    }
-    const HELP_WITHOUT = 'usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n'
-    const HELP_WITH =
-      HELP_WITHOUT +
-      '    --disable-userns             Disable further use of user namespaces inside sandbox'
-
-    // In a directory of its own, so that the file it leaves says which one ran.
-    function replacedHelper(name: string): string {
-      mkdirSync(join(BASE, name))
-      const path = join(BASE, name, 'apply-seccomp')
-      writeFileSync(path, REPLACED_HELPER)
-      chmodSync(path, 0o755)
-      return path
-    }
-    const ranOutside = (helper: string) =>
-      existsSync(join(dirname(helper), 'ran-outside'))
-    const said = (answer: Set<string> | null, heading: string) =>
-      [...(answer ?? [])].find(word => word.startsWith(`${heading}=`))
-    const ownNamespace = (kind: string) =>
-      `${kind}=${readlinkSync(`/proc/self/ns/${kind}`)}`
-    const ownSession = () =>
-      `session=${
-        readFileSync('/proc/self/stat', 'utf8')
-          .replace(/^.*\) /s, '')
-          .split(' ')[3]
-      }`
-    // Nothing of what it found is this process's: every namespace and the
-    // session are another, and of the environment only PATH is there.
-    function expectConfined(answer: Set<string> | null): void {
-      for (const kind of HELPER_NAMESPACES) {
-        expect(said(answer, kind)).toMatch(/=[a-z]+:\[\d+\]$/)
-        expect(said(answer, kind)).not.toBe(ownNamespace(kind))
-      }
-      expect(said(answer, 'session')).toMatch(/=\d+$/)
-      expect(said(answer, 'session')).not.toBe(ownSession())
-      const unexpected = (names: string[]) =>
-        names.filter(name => name !== '' && !HELPER_ENVIRONMENT.includes(name))
-      const found = (said(answer, 'env') ?? '').slice('env='.length).split(',')
-      expect(found).toContain('SRT_HELPER_FEATURES')
-      expect(unexpected(found)).toEqual([])
-      expect(unexpected(Object.keys(process.env))).not.toEqual([])
-      expect(answer?.has('wrote-beside-itself')).toBe(false)
-    }
 
     // The seccomp lines of a process's status file, which anyone may read.
     function seccompStatus(pid: number | 'self') {
@@ -312,375 +205,10 @@ describe.if(isLinux)(
 
     // ---- what the wrap emits -------------------------------------------
 
-    it('clears both of the helper variables on every wrap, whatever is asked for', async () => {
+    it('clears the helper variable on every wrap, whatever is asked for', async () => {
       for (const allowNestedUserNamespaces of [undefined, false, true]) {
         const command = await wrap('true', { allowNestedUserNamespaces })
         expect(command).toContain('--unsetenv SRT_ALLOW_NESTED_USERNS')
-        expect(command).toContain('--unsetenv SRT_HELPER_FEATURES')
-      }
-    })
-
-    it.if(APPLY_SECCOMP !== null)(
-      'starts the helper with both variables assigned on its own command line, from the configuration',
-      async () => {
-        // Holds against a shell start-up file the caller's environment names
-        // (see helperEnvironmentPrefix).
-        const helper = APPLY_SECCOMP!
-        expect(await wrap('true')).toContain(
-          `SRT_ALLOW_NESTED_USERNS=0 SRT_HELPER_FEATURES=0 ${helper}`,
-        )
-        expect(
-          await wrap('true', { allowNestedUserNamespaces: true }),
-        ).toContain(`SRT_ALLOW_NESTED_USERNS=1 SRT_HELPER_FEATURES=0 ${helper}`)
-      },
-    )
-
-    it.if(BWRAP_DISABLES_USERNS)(
-      'gives bubblewrap --disable-userns exactly when there is no helper and namespaces are not allowed',
-      async () => {
-        expect(await wrap('true', { allowAllUnixSockets: true })).toContain(
-          '--disable-userns',
-        )
-        expect(
-          await wrap('true', {
-            allowAllUnixSockets: true,
-            allowNestedUserNamespaces: true,
-          }),
-        ).not.toContain('--disable-userns')
-      },
-    )
-
-    it.if(APPLY_SECCOMP !== null)(
-      'never gives bubblewrap --disable-userns beside the helper, which makes a namespace of its own',
-      async () => {
-        expect(await wrap('true')).not.toContain('--disable-userns')
-      },
-    )
-
-    // ---- one decision, shared by the wrap and the dependency check ------
-
-    it('decides who imposes the limit in one place', () => {
-      const bwrap = BWRAP
-      const plan = (
-        usesSeccompHelper: boolean,
-        allowNestedUserNamespaces?: boolean,
-        enableWeakerNestedSandbox?: boolean,
-      ) =>
-        planUsernsLimit({
-          usesSeccompHelper,
-          allowNestedUserNamespaces,
-          enableWeakerNestedSandbox,
-          bwrap,
-        })
-      expect(plan(true)).toEqual({ by: 'helper' })
-      // The helper's filter does not depend on /proc/sys being writable.
-      expect(plan(true, false, true)).toEqual({ by: 'helper' })
-      expect(plan(true, true)).toEqual({ by: 'nobody', because: 'allowed' })
-      expect(plan(false, true)).toEqual({ by: 'nobody', because: 'allowed' })
-      expect(plan(false, false, true)).toEqual({
-        by: 'nobody',
-        because: 'weaker-nested-sandbox',
-      })
-      // Bubblewrap is looked up only where nothing above has decided.
-      let lookups = 0
-      const lookedUp = () => {
-        lookups++
-        return BWRAP
-      }
-      for (const [usesSeccompHelper, allowed, weaker] of [
-        [true, false, false],
-        [true, true, false],
-        [false, true, false],
-        [false, false, true],
-      ]) {
-        planUsernsLimit({
-          usesSeccompHelper,
-          allowNestedUserNamespaces: allowed,
-          enableWeakerNestedSandbox: weaker,
-          bwrap: lookedUp,
-        })
-      }
-      expect(lookups).toBe(0)
-      planUsernsLimit({
-        usesSeccompHelper: false,
-        allowNestedUserNamespaces: false,
-        enableWeakerNestedSandbox: false,
-        bwrap: lookedUp,
-      })
-      expect(lookups).toBe(1)
-      // Bubblewrap's where the one here honours the option, nobody's where
-      // none does. One that cannot make namespaces at all has not said which.
-      if (BWRAP_DISABLES_USERNS) {
-        expect(plan(false)).toEqual({ by: 'bwrap' })
-      } else if (bwrap === null || BWRAP_CAN_NAMESPACE) {
-        expect(plan(false)).toEqual({ by: 'nobody', because: 'bwrap-cannot' })
-      }
-    })
-
-    // ---- what bubblewrap is found to support ----------------------------
-
-    it('takes the option from the help of a bubblewrap that is not setuid, and from nowhere else', () => {
-      expect(bwrapCanDisableUserns(fakeBwrap('old', HELP_WITHOUT))).toBe(false)
-      expect(bwrapCanDisableUserns(fakeBwrap('new', HELP_WITH))).toBe(true)
-      // Such a binary lists the option and refuses it.
-      const setuid = fakeBwrap('setuid', HELP_WITH, 0o4755)
-      expect(statSync(setuid).mode & 0o4000).toBe(0o4000)
-      expect(bwrapCanDisableUserns(setuid)).toBe(false)
-      expect(bwrapCanDisableUserns(join(BASE, 'no-such-bwrap'))).toBe(false)
-    })
-
-    it('a bubblewrap that did not say is asked again, and one that did is not', () => {
-      const bwrap = fakeBwrap('silent-at-first', '')
-      expect(bwrapCanDisableUserns(bwrap)).toBe(false)
-      // Not having been able to ask is not an answer to keep.
-      fakeBwrap('silent-at-first', HELP_WITH)
-      expect(bwrapCanDisableUserns(bwrap)).toBe(true)
-      // What a binary supports is: one answer for the life of the process.
-      fakeBwrap('silent-at-first', HELP_WITHOUT)
-      expect(bwrapCanDisableUserns(bwrap)).toBe(true)
-    })
-
-    it('with no helper, a bubblewrap that cannot impose the limit is reported by code, and is not given the option', async () => {
-      const noHelper = (bwrapPath: string) =>
-        checkLinuxDependencies({ bwrapPath, allowAllUnixSockets: true })
-      for (const bwrapPath of [
-        fakeBwrap('old', HELP_WITHOUT),
-        fakeBwrap('setuid', HELP_WITH, 0o4755),
-      ]) {
-        const check = noHelper(bwrapPath)
-        expect(check.features?.usernsLimit).toBe(false)
-        const detail = (check.details ?? []).find(
-          d => d.code === 'bwrap_lacks_disable_userns',
-        )
-        expect(detail?.level).toBe('warning')
-        expect(check.warnings).toContain(detail?.message ?? 'no such warning')
-        expect(
-          await wrap('true', { allowAllUnixSockets: true, bwrapPath }),
-        ).not.toContain('--disable-userns')
-      }
-
-      const bwrapPath = fakeBwrap('new', HELP_WITH)
-      const check = noHelper(bwrapPath)
-      expect(check.features?.usernsLimit).toBe(true)
-      expect(check.details).toEqual([])
-      expect(
-        await wrap('true', { allowAllUnixSockets: true, bwrapPath }),
-      ).toContain('--disable-userns')
-    })
-
-    it('the dependency check never reports a limit the wrap would not impose', async () => {
-      // No helper and enableWeakerNestedSandbox: bubblewrap is not given the
-      // option there, so the check must not say the limit is in force.
-      const command = await wrapCommandWithSandboxLinux({
-        command: 'true',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [], allowWithinDeny: [] },
-        writeConfig: { allowOnly: [PROJECT], denyWithinAllow: [] },
-        allowAllUnixSockets: true,
-        enableWeakerNestedSandbox: true,
-      })
-      expect(command).not.toContain('--disable-userns')
-      const check = checkLinuxDependencies({
-        allowAllUnixSockets: true,
-        enableWeakerNestedSandbox: true,
-      })
-      expect(check.features?.usernsLimit).toBe(false)
-      const detail = (check.details ?? []).find(
-        d => d.code === 'no_userns_limit_in_weaker_nested_sandbox',
-      )
-      expect(detail?.level).toBe('warning')
-      expect(check.warnings).toContain(detail?.message ?? 'no such warning')
-
-      // Given up on purpose: not in force, and not worth a warning.
-      const allowed = checkLinuxDependencies({
-        allowNestedUserNamespaces: true,
-      })
-      expect(allowed.features?.usernsLimit).toBe(false)
-      expect(allowed.details).toEqual([])
-    })
-
-    it.if(BWRAP_DISABLES_USERNS)(
-      'with no helper, the check reports the limit exactly when the wrap passes bubblewrap the option',
-      async () => {
-        expect(await wrap('true', { allowAllUnixSockets: true })).toContain(
-          '--disable-userns',
-        )
-        expect(
-          checkLinuxDependencies({ allowAllUnixSockets: true }).features
-            ?.usernsLimit,
-        ).toBe(true)
-      },
-    )
-
-    // ---- what the helper says about itself -----------------------------
-
-    // The helper is asked inside bubblewrap, so there is an answer only where
-    // bubblewrap can make namespaces. The gate is the live arms' and not quite
-    // the question's own: it mounts a fresh /proc, which the question does
-    // without (where that is refused these skip, and the container suite asks
-    // instead), and it makes no network namespace, which the question does (a
-    // host that refuses only that one fails these).
-    it.if(APPLY_SECCOMP !== null && BWRAP_CAN_NAMESPACE)(
-      'the helper built from this tree reports the limit, and the dependency check passes it on as data',
-      () => {
-        // Asked here and now, whatever an earlier test was told.
-        resetProbeCachesForTesting()
-        expect(probeSeccompHelperFeatures()?.has('userns-limit') ?? false).toBe(
-          true,
-        )
-        const check = checkLinuxDependencies()
-        expect(check.features?.usernsLimit).toBe(true)
-        expect(
-          (check.details ?? []).some(
-            d => d.code === 'helper_lacks_userns_limit',
-          ),
-        ).toBe(false)
-      },
-    )
-
-    it("asks with a name no PATH is searched for, and asks nothing of a helper that is part of the caller's binary", () => {
-      // A helper that does not know the question tries to run this: with a
-      // slash no PATH is searched, and nothing can be created in /proc.
-      expect(HELPER_FEATURES_PROBE_ARGUMENT).toMatch(/^\/proc\/[^/]+$/)
-      // Its applyPath only has to mean something inside the sandbox, so it is
-      // not run from here at all: /bin/true would answer, and is not asked.
-      const embedded = { argv0: 'apply-seccomp', applyPath: '/bin/true' }
-      expect(probeSeccompHelperFeatures(embedded)).toBeNull()
-      expect(
-        checkLinuxDependencies({ seccompConfig: embedded }).features
-          ?.usernsLimit,
-      ).toBe('unknown')
-    })
-
-    it.if(BWRAP_CAN_NAMESPACE)(
-      'a helper that does not answer the question is reported by code, not only in words',
-      () => {
-        // Stands in for one built before the question existed: it ignores the
-        // variable and fails to run the name it was given.
-        const old = join(BASE, 'old-helper')
-        writeFileSync(old, '#!/bin/sh\nexec "$@"\n', { mode: 0o755 })
-        expect(probeSeccompHelperFeatures({ applyPath: old })?.size).toBe(0)
-        const check = checkLinuxDependencies({
-          seccompConfig: { applyPath: old },
-        })
-        expect(check.features?.usernsLimit).toBe(false)
-        const detail = (check.details ?? []).find(
-          d => d.code === 'helper_lacks_userns_limit',
-        )
-        expect(detail?.level).toBe('warning')
-        expect(check.warnings).toContain(detail?.message ?? 'no such warning')
-        // Not worth a warning to a caller who has given the limit up.
-        expect(
-          checkLinuxDependencies({
-            seccompConfig: { applyPath: old },
-            allowNestedUserNamespaces: true,
-          }).details,
-        ).toEqual([])
-      },
-    )
-
-    // ---- the helper file is run inside bubblewrap, never from here ------
-
-    it.if(BWRAP_CAN_NAMESPACE)(
-      "the dependency check asks a helper file inside bubblewrap, not in this process's namespaces",
-      () => {
-        const applyPath = replacedHelper('asked-by-the-check')
-        // Not an answer to keep: the check below still asks.
-        expect(probeSeccompHelperFeatures({ applyPath }, null)).toBeNull()
-        const check = checkLinuxDependencies({ seccompConfig: { applyPath } })
-        expect(check.features?.usernsLimit).toBe(true)
-        expect(ranOutside(applyPath)).toBe(false)
-        // It did run, and says where. The answer is the one the check was
-        // given: a helper is asked once.
-        expectConfined(probeSeccompHelperFeatures({ applyPath }))
-      },
-    )
-
-    it.if(BWRAP_CAN_NAMESPACE)(
-      'a wrap asks a helper file the same way',
-      async () => {
-        const applyPath = replacedHelper('asked-by-a-wrap')
-        const command = await wrap('true', { seccompConfig: { applyPath } })
-        expect(command).toContain(applyPath)
-        expect(ranOutside(applyPath)).toBe(false)
-        const answer = probeSeccompHelperFeatures({ applyPath })
-        expect(answer?.has('userns-limit')).toBe(true)
-        expectConfined(answer)
-        expect(ranOutside(applyPath)).toBe(false)
-      },
-    )
-
-    it.if(APPLY_SECCOMP !== null && BWRAP_CAN_NAMESPACE)(
-      'a wrap looks for bubblewrap only while its helper has not answered',
-      async () => {
-        const lookups = spyOn(which, 'whichSync')
-        const forBwrap = () =>
-          lookups.mock.calls.filter(call => call[0] === 'bwrap').length
-        try {
-          resetProbeCachesForTesting()
-          await wrap('true')
-          expect(forBwrap()).toBe(1)
-          await wrap('true')
-          await wrap('true', { allowNestedUserNamespaces: true })
-          expect(forBwrap()).toBe(1)
-        } finally {
-          lookups.mockRestore()
-        }
-      },
-    )
-
-    it('with no bubblewrap to ask it in, a helper file is not run at all and the limit is unknown', async () => {
-      const applyPath = replacedHelper('no-bubblewrap')
-      const noSuchBwrap = join(BASE, 'no-such-bwrap')
-      expect(probeSeccompHelperFeatures({ applyPath }, null)).toBeNull()
-      expect(probeSeccompHelperFeatures({ applyPath }, noSuchBwrap)).toBeNull()
-      const check = checkLinuxDependencies({
-        seccompConfig: { applyPath },
-        bwrapPath: noSuchBwrap,
-      })
-      expect(check.features?.usernsLimit).toBe('unknown')
-      expect(check.errors).toContain(
-        `bubblewrap (bwrap) not executable at ${noSuchBwrap}`,
-      )
-      await wrap('true', {
-        seccompConfig: { applyPath },
-        bwrapPath: noSuchBwrap,
-      })
-      // Nor is a path that cannot be one anything worse than that.
-      expect(probeSeccompHelperFeatures({ applyPath }, '')).toBeNull()
-      await wrap('true', { seccompConfig: { applyPath }, bwrapPath: '' })
-      expect(ranOutside(applyPath)).toBe(false)
-    })
-
-    it('a bubblewrap that fails has asked nothing: the limit is unknown, not missing, and the helper is asked again', () => {
-      const applyPath = replacedHelper('bubblewrap-fails')
-      // An old helper fails too, with the same exit status: what tells them
-      // apart is who is heard complaining, if anybody.
-      for (const bwrapPath of [
-        brokenBwrap(
-          'refused',
-          "echo 'bwrap: setting up uid map: Operation not permitted' >&2; exit 1",
-        ),
-        brokenBwrap('silent', 'exit 1'),
-        brokenBwrap(
-          'killed',
-          'echo in the middle of something >&2; kill -KILL $$',
-        ),
-      ]) {
-        expect(probeSeccompHelperFeatures({ applyPath }, bwrapPath)).toBeNull()
-        const check = checkLinuxDependencies({
-          seccompConfig: { applyPath },
-          bwrapPath,
-        })
-        expect(check.features?.usernsLimit).toBe('unknown')
-        expect(check.details).toEqual([])
-      }
-      expect(ranOutside(applyPath)).toBe(false)
-      // None of that was an answer to keep.
-      if (BWRAP_CAN_NAMESPACE) {
-        expect(
-          probeSeccompHelperFeatures({ applyPath })?.has('userns-limit'),
-        ).toBe(true)
       }
     })
 
@@ -709,6 +237,8 @@ describe.if(isLinux)(
 
     // ---- from the configuration to the wrap -----------------------------
 
+    // On the helper's own command line, which holds against a shell start-up
+    // file the caller's environment names (see helperEnvironmentPrefix).
     it.if(APPLY_SECCOMP !== null)(
       'SandboxManager hands the option from its configuration to the wrap',
       async () => {
@@ -723,11 +253,11 @@ describe.if(isLinux)(
         try {
           SandboxManager.updateConfig(configured(true))
           expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-            `SRT_ALLOW_NESTED_USERNS=1 SRT_HELPER_FEATURES=0 ${APPLY_SECCOMP}`,
+            `SRT_ALLOW_NESTED_USERNS=1 ${APPLY_SECCOMP}`,
           )
           SandboxManager.updateConfig(configured())
           expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-            `SRT_ALLOW_NESTED_USERNS=0 SRT_HELPER_FEATURES=0 ${APPLY_SECCOMP}`,
+            `SRT_ALLOW_NESTED_USERNS=0 ${APPLY_SECCOMP}`,
           )
         } finally {
           // The configuration outlives a reset, and the next file's tests.
@@ -749,7 +279,7 @@ describe.if(isLinux)(
         const said = `${result.stdout}${result.stderr}`
         expect(said).toContain('in-the-sandbox-namespaces: refused EBUSY')
         // EPERM, the filter's answer, which comes before the kernel looks at
-        // the limit (that one reads ENOSPC, as in the arm with no helper).
+        // the limit (that one reads ENOSPC).
         expect(said).toContain('new-namespaces: refused EPERM at unshare')
         expect(said).not.toContain('in-its-own-namespaces: replaced')
         expect(hostConfig()).toBe(ORIGINAL)
@@ -767,8 +297,7 @@ describe.if(isLinux)(
         // So EPERM is the filter, and a filter missing the rule for one of
         // these shows here. The other five (pivot_root, move_mount, fsopen,
         // fsmount, fspick) the kernel itself answers with EPERM for a caller
-        // without the capability; they are in the container suite, which
-        // runs as uid 0.
+        // without the capability, so only the generator's test pins them.
         const probe = [
           'import ctypes, errno, os, platform',
           'libc = ctypes.CDLL(None, use_errno=True)',
@@ -828,7 +357,7 @@ describe.if(isLinux)(
       "the same calls get the kernel's own answers where nothing refuses them, so EPERM above is the filter (live bwrap)",
       async () => {
         // The control for the test above: no helper, and namespaces allowed,
-        // so neither the filter nor bubblewrap's limit is there.
+        // so the filter is not there.
         const probe = [
           'import ctypes, errno, platform',
           'libc = ctypes.CDLL(None, use_errno=True)',
@@ -899,25 +428,6 @@ describe.if(isLinux)(
         expect(said).toContain('in-its-own-namespaces: replaced')
         // This is what the refusals above prevent.
         expect(hostConfig()).toContain('planted = true')
-      },
-      60000,
-    )
-
-    it.if(CAN_RUN_CHAIN && BWRAP_DISABLES_USERNS)(
-      'without the helper: bubblewrap refuses the new namespace and the file is not replaced (live bwrap)',
-      async () => {
-        const result = run(
-          await wrap(`${PYTHON} ${SCRIPT} ${PROJECT}`, {
-            allowAllUnixSockets: true,
-          }),
-        )
-        const said = `${result.stdout}${result.stderr}`
-        expect(said).not.toContain('bwrap:')
-        expect(said).toContain('in-the-sandbox-namespaces: refused EBUSY')
-        expect(said).toMatch(
-          /new-namespaces: refused (ENOSPC|EPERM) at unshare/,
-        )
-        expect(hostConfig()).toBe(ORIGINAL)
       },
       60000,
     )

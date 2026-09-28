@@ -1266,8 +1266,7 @@ interface GlobPositions {
     spelled: string,
   ) => boolean
   /** The same for the pattern without its trailing `/**`; never true for a
-   *  pattern that has none, nor for a caller that did not ask for the
-   *  directory form, whose automaton is not built at all. */
+   *  pattern that has none, nor when the directory form was not asked for. */
   matchesDirectoryForm: (
     positions: readonly number[],
     name: string,
@@ -1331,14 +1330,9 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
   )
 }
 
-/**
- * The most pieces a pattern may hand the automaton. It is built by recursion,
- * one call per path component, so a pattern with thousands of them would
- * overflow the stack before it matched anything; a path pattern that long is
- * not one anybody wrote. Such a pattern is matched against real paths
- * instead, which costs a listing of every directory beneath its base and
- * denies no less.
- */
+/** The most pieces a pattern may hand the automaton, which is built by
+ *  recursion, one call per path component: thousands would overflow the
+ *  stack. A longer pattern is matched against real paths instead. */
 const MAX_GLOB_PIECES = 1024
 
 function globPositions(
@@ -1358,10 +1352,8 @@ function globPositions(
         ? new RegExp(globToRegex(directoryForm), flags)
         : undefined
   } catch (err) {
-    // A pattern that is no regular expression matches nothing at all, so the
-    // entry it came from would deny nothing and say so nowhere. It is a
-    // configuration error and is raised as one, rather than read as a
-    // pattern that happens to match no path.
+    // A pattern that is no regular expression would match nothing and deny
+    // nothing, silently: it is raised as the configuration error it is.
     throw new Error(
       `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
     )
@@ -1445,9 +1437,8 @@ function globPositions(
     return componentAt(0, false)
   }
 
-  /** The weaker reading, taken only where it is said out loud: the walk lists
-   *  every directory beneath the base and matches whole paths, which on a
-   *  deny path also means it descends no symlinked directory. */
+  /** The weaker reading, said out loud where it is taken: the walk matches
+   *  whole paths, and on a deny path descends no symlinked directory. */
   const cannotBeSplit = (why: string): GlobPositions => {
     logForDebugging(
       `[Sandbox] Glob pattern ${normalizedPattern} cannot be read one path component at a time (${why}), so it is matched against real paths only`,
@@ -1463,8 +1454,7 @@ function globPositions(
     const directoryPieces = directoryRegex
       ? globPieces(directoryForm, flags)
       : []
-    // A shape globPieces is documented not to take: the pattern reads as
-    // written, and every directory beneath the base is listed.
+    // A shape globPieces is documented not to take.
     if (pieces === undefined || directoryPieces === undefined) return unsplit
     if (pieces.length + directoryPieces.length > MAX_GLOB_PIECES) {
       return cannotBeSplit(`it has more than ${MAX_GLOB_PIECES} pieces`)
@@ -1526,13 +1516,11 @@ function globPositions(
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
  * that component is not a directory of its own. Never carries a trailing
- * separator, except for the root itself: the walk splits this into path
- * components, and the empty one a trailing separator leaves at the end is a
- * name no position can consume, so the automaton would have nowhere to start
- * and the pattern would match nothing at all. A drive root comes back as
- * 'C:' and the root of a UNC share as '//server/share'. '/', and '' for a
- * pattern with a wildcard in its first path component, are what
- * {@link globBaseDirIsRoot} refuses.
+ * separator, except for the root itself: split into path components, it
+ * would end in an empty name no position can consume, and the pattern would
+ * match nothing. A drive root comes back as 'C:', the root of a UNC share as
+ * '//server/share'. '/', and '' for a pattern with a wildcard in its first
+ * path component, are what {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
  * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
@@ -1543,8 +1531,7 @@ export function globPatternBaseDir(normalizedPattern: string): string {
   const baseDir = staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
     : path.dirname(staticPrefix)
-  // path.dirname keeps the separator of a root it returns: 'C:/' for
-  // 'C:/Users', '//server/share/' for a path on a share.
+  // path.dirname keeps the separator of a root it returns ('C:/').
   return baseDir.length > 1 && baseDir.endsWith('/')
     ? baseDir.slice(0, -1)
     : baseDir
@@ -1552,15 +1539,11 @@ export function globPatternBaseDir(normalizedPattern: string): string {
 
 /**
  * Whether a base from {@link globPatternBaseDir} is one no walk starts from:
- * nothing at all, or the root, '/'. A pattern whose only literal directory
- * is the root (`/**\/*.pem`) would have the walk list every filesystem the
- * machine has mounted, which is not what the entry meant.
- *
- * A drive root ('C:') and the root of a UNC share ('//server/share') are
- * bases like any other. Each is one volume, which the entry names itself:
- * `\\server\share\*.pem` and `C:\Users*\id.pem` list one directory, and a
- * `**` right below one lists that volume, as the entry asks. Refused, every
- * such pattern would go unenforced with a debug line as the only notice.
+ * nothing at all, or the root, '/', from which a walk (`/**\/*.pem`) would
+ * list every filesystem the machine has mounted. A drive root ('C:') and the
+ * root of a UNC share ('//server/share') are bases like any other: each is
+ * one volume, which the entry names itself. Refused, every such pattern
+ * would go unenforced.
  */
 export function globBaseDirIsRoot(baseDir: string): boolean {
   return baseDir === '' || baseDir === '/'
@@ -1654,20 +1637,15 @@ export function walkGlobPattern(
   }
   /**
    * What the walk knows about one real directory, whatever the names that
-   * lead to it. A listing failure is not recorded against its positions: the
-   * failure can belong to the name the listing was tried under (a chain past
-   * the ELOOP bound, a real path too long to name) while the directory is
-   * there under another, and letting that name answer for the others would
-   * drop every match beneath it — the same fail-open as reading it as absent.
-   * What the retries cost is one listing per name that leads to the
-   * directory, and each of those names is an entry of a directory that is
-   * itself listed once per position.
+   * lead to it. A listing failure is not recorded against its positions: it
+   * can belong to the name the listing was tried under (a real path too long
+   * to name) while the directory is there under another, and letting that
+   * name answer for the others would drop every match beneath it.
    */
   type DirectoryRecord = {
     /** The positions it has been listed for, each of them successfully. */
     listedFor: Set<number>
-    /** The entries a successful listing found: a second position reads them
-     *  again rather than the directory. */
+    /** What a successful listing found, which a second position reads. */
     entries?: fs.Dirent[]
     /** Whether it is already in `walk.unlisted`, which names it once. */
     unlisted?: true
@@ -1683,11 +1661,9 @@ export function walkGlobPattern(
   const pending: Frame[] = []
   /** A filesystem call on a real path, and on a shorter name for it when the
    *  real path is too long to name. Nothing else is retried: every other
-   *  errno belongs to the object rather than to the name, and the second call
-   *  can answer for another object altogether, since the short name crosses
-   *  links a sandboxed command owns and can repoint between the two. An
-   *  unreadable directory read as absent is the fail-open this walk exists to
-   *  avoid. The real path crosses no link, so a long chain of them cannot
+   *  errno belongs to the object, and the short name crosses links a
+   *  sandboxed command can repoint, so an unreadable directory could read as
+   *  absent. The real path crosses no link, so a long chain of them cannot
    *  fail the call (ELOOP). */
   const onRealPath = <T>(
     real: string,
@@ -1735,11 +1711,9 @@ export function walkGlobPattern(
     return target
   }
 
-  // The base as the filesystem is asked about it. A drive root gets back the
-  // separator globPatternBaseDir took off it: 'C:' on its own names the
-  // drive's current directory, which is its root only while the process works
-  // on another drive. The positions are still reached from the base without
-  // one, which has no empty component at the end.
+  // The base as the filesystem is asked about it: a drive root gets back its
+  // separator, since 'C:' on its own names the drive's current directory.
+  // The positions are still reached from the base without one.
   const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
   let baseReal = baseSpelling
   try {
@@ -1862,15 +1836,12 @@ export function walkGlobPattern(
           !isAtOrUnder(target.real, baseReal) &&
           !isAtOrUnder(baseReal, target.real)
         ) {
-          // The pattern is matched against whole paths and this link is not
-          // listed through, so what it matches in there is found by no other
-          // name either: the directory it leads to is denied whole rather
-          // than dropped. A target inside the walk's own tree is listed
-          // under its own name, which loses nothing. One that leads up, to
-          // the walk's base or above it, is left alone as it is below for a
-          // pattern that splits: what it leads to holds the tree being
-          // walked, and denied whole it would hide the base, everything
-          // beside it and every path bound back beneath it, over a link
+          // This link is not listed through, so what the pattern matches in
+          // there is found by no other name: the directory it leads to is
+          // denied whole. A target inside the walk's own tree is listed under
+          // its own name. One that leads up, to the walk's base or above it,
+          // is left alone, as below for a pattern that splits: denied whole
+          // it would hide the base and everything beside it, over a link
           // anything able to write the tree can make.
           const targetRecord = recordFor(target.real)
           if (!targetRecord.unlisted) {
@@ -1897,8 +1868,7 @@ export function walkGlobPattern(
         )
         continue
       }
-      // Named here, because what is found beneath is reported where it
-      // really lives: this is the one line that says which link led there.
+      // The one line that names the link: matches are reported by real path.
       logForDebugging(
         `[Sandbox] Following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}`,
       )

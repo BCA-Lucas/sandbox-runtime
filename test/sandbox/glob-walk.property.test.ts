@@ -18,20 +18,16 @@ import { isWindows } from '../helpers/platform.js'
 
 /**
  * The walk reads a pattern one path component at a time; globToRegex reads
- * the same pattern as one regular expression over a whole path. They are the
- * two halves of one rule, they are edited by different hands, and nothing
- * else in the tree holds them together.
+ * the same pattern as one regular expression over a whole path, and nothing
+ * else in the tree holds the two together.
  *
  * Over trees with no symlinks, where every path below the base is reached by
  * exactly one name, the two must agree exactly: what the walk returns is what
  * the regular expression matches beneath the pattern's base. A pattern the
- * walk cannot split is in the sample too — it matches whole paths, so it has
- * to agree as well.
+ * walk cannot split is in the sample too.
  *
  * Seeded, so a failure is reproducible, and bounded, so the suite stays fast.
- * The rule is the same on every platform; the fixture is not, since a Windows
- * path is spelled with the other separator, so the tree is built and compared
- * where the two spellings are one.
+ * Not run on Windows, where a path is spelled with the other separator.
  */
 
 /** Names that put the interesting readings next to each other: a bracket set
@@ -80,8 +76,7 @@ const PATTERN_TAIL = fc
   .tuple(fc.array(SEGMENT, { maxLength: 3 }), LAST_SEGMENT)
   .map(([segments, last]) => [...segments, last].join('/'))
 
-/** A tree as the relative paths of its files, each a file with directories
- *  above it. */
+/** A tree as the relative paths of its files. */
 const TREE = fc.array(fc.array(NAME, { minLength: 1, maxLength: 4 }), {
   minLength: 8,
   maxLength: 24,
@@ -138,15 +133,13 @@ describe.if(!isWindows)('property: walkGlobPattern against globToRegex', () => {
       fc.property(fc.nat(trees.length - 1), PATTERN_TAIL, (index, tail) => {
         const { root, paths } = trees[index]!
         const pattern = join(root, tail)
-        // 's': a name can hold a line terminator, and the walk compiles its
-        // own regular expressions with the same flag.
+        // 's': the flag the walk compiles its own regular expressions with.
         const regex = new RegExp(globToRegex(pattern), 's')
         const expected = paths.filter(p => regex.test(p)).sort()
         if (expected.length > 0) withMatches++
-        // A pattern's base can be one of the generated files rather than a
-        // directory, which the walk reports as a place it could not list;
-        // what it matches is the same either way, and a directory it really
-        // could not list would show up as a path missing from `matches`.
+        // `unlisted` is not compared: a base can be one of the generated
+        // files, and a directory the walk really could not list would show
+        // up as a path missing from `matches`.
         const walked = walkGlobPattern(pattern, {
           followSymlinkedDirectories: true,
         })

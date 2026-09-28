@@ -320,10 +320,9 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
   it('denies whole what a pattern it cannot read a name at a time reaches', () => {
     // `?[*].pem` cannot be followed one path component at a time, so no
-    // directory is listed through a symlink: what the pattern matches beyond
-    // one that leads out of the tree is found under no name at all. The
-    // directory it leads to is denied whole, and nothing is bound back
-    // beneath that mount, since what is in there was never enumerated.
+    // directory is listed through a symlink. What one that leads out of the
+    // tree reaches is denied whole, and nothing is bound back beneath that
+    // mount, since what is in there was never enumerated.
     const unsplit = caseRoot('unsplit')
     mkdirSync(join(unsplit, 'proj', 'inner'), { recursive: true })
     mkdirSync(join(unsplit, 'outside'))
@@ -346,14 +345,12 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   })
 
   it('mounts nothing over what holds the tree for a link that leads up it', () => {
-    // The same pattern, and a link any command able to write the tree can
-    // make: proj/inner/up -> ../.. leads to the directory holding proj and
-    // everything beside it, proj/x -> ../.. to the one above that. Denied
-    // whole, either is a tmpfs over all of it, with nothing bound back
-    // beneath, for every later command. A pattern that can be followed does
-    // not descend such a link, and this one does not deny it; the link next
-    // to them, which leads out of the tree without leading up it, is still
-    // denied whole.
+    // The same pattern, and links any command able to write the tree can
+    // make: proj/inner/up -> ../.. leads to the directory holding proj,
+    // proj/x -> ../.. to the one above that. Denied whole, either is a tmpfs
+    // over all of it, with nothing bound back beneath, for every later
+    // command. The link that leads out of the tree without leading up it is
+    // still denied whole.
     const upward = caseRoot('unsplit-up')
     const proj = join(upward, 'home', 'proj')
     mkdirSync(join(proj, 'inner'), { recursive: true })

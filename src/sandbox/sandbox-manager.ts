@@ -2412,8 +2412,7 @@ function getLinuxGlobPatternWarnings(): string[] {
   // Read paths are expanded, so a glob there is supported — unless the
   // pattern has no literal directory below the root for the walk to start
   // from (a wildcard in its first path component, `/**/*.pem`), which
-  // expands to nothing and leaves the entry unenforced. The walk refuses the
-  // same bases, through the same predicate, so the two cannot drift.
+  // expands to nothing and leaves the entry unenforced.
   for (const path of [
     ...config.filesystem.denyRead,
     ...(config.filesystem.allowRead ?? []),

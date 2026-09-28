@@ -463,10 +463,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('starts no walk from the root, and starts one from a drive or a share', () => {
-    // '/' holds every filesystem the machine has mounted, and listing that is
-    // not what an entry meant. A drive root and the root of a UNC share are
-    // one volume each, which the entry names itself: `\\server\share\*.pem`
-    // is one directory listed.
+    // '/' holds every filesystem the machine has mounted. A drive root and
+    // the root of a UNC share are one volume each, which the entry names.
     for (const none of ['', '/']) {
       expect(globBaseDirIsRoot(none)).toBe(true)
     }
@@ -486,12 +484,10 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('leaves no separator on a base a Windows pattern starts from', () => {
-    // path.dirname keeps the separator of a root it returns: 'C:/' for
-    // 'C:/Users', '//server/share/' for a path on a share. Split into path
-    // components to seed the walk, either ends in an empty name no position
-    // can consume, and the pattern matches nothing at all. Driven through
-    // win32's own semantics, so the case is pinned on every runner and not
-    // only where the suite meets a drive.
+    // path.dirname keeps the separator of a root it returns ('C:/'), which
+    // split into path components ends in an empty name no position can
+    // consume: the pattern would match nothing. Driven through win32's own
+    // semantics, so the case is pinned on every runner.
     const dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
     try {
       const patterns = [
@@ -517,8 +513,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         '//server/share',
         'C:/Users/u',
       ])
-      // A root of either kind is a base like any other: every one of these
-      // is walked.
+      // A root of either kind is a base like any other.
       expect(bases.map(globBaseDirIsRoot)).toEqual(patterns.map(() => false))
     } finally {
       dirname.mockRestore()
@@ -528,11 +523,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   it.if(isLinux)(
     'walks a pattern whose only literal directory is a drive root',
     () => {
-      // A drive cannot be had on this runner, so one is stood up: a directory
-      // named `C:` in the working directory, which is what 'C:/…' then names,
-      // with path.dirname and path.isAbsolute answering as they do on
-      // Windows and 'C:/' resolving to itself. Everything else, the listing
-      // included, is the walk's own.
+      // A drive stood up on this runner: a directory named `C:` in the
+      // working directory, with path.dirname and path.isAbsolute answering as
+      // on Windows and 'C:/' resolving to itself. The listing is the walk's.
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-drive-')))
       const cwd = process.cwd()
       const realpathSync = fs.realpathSync
@@ -555,8 +548,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         writeFileSync(join(root, 'C:', 'Other', 'id.pem'), 'KEY')
         process.chdir(root)
 
-        // A wildcard in the middle of the component below the root, at its
-        // start, and a `**` there.
+        // A wildcard inside the first component, at its start, and a `**`.
         const middle = walkGlobPattern('C:/Users*/id.pem')
         expect(middle.matches).toEqual(['C:/Users1/id.pem'])
         expect(walkGlobPattern('C:/*.pem').matches).toEqual(['C:/top.pem'])
@@ -636,9 +628,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
       let deep = join(root, 'deep')
       while (deep.length < 4090) {
-        // At least one character, whatever the length of the temporary
-        // directory: a zero-length name would join to the same path and the
-        // loop would never end.
+        // At least one character: a zero-length name would join to the same
+        // path and the loop would never end.
         const room = 4090 - deep.length - 1
         deep = join(deep, 'd'.repeat(Math.max(1, Math.min(200, room))))
       }
@@ -810,8 +801,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         join(root, 'outside', 'cert', 'x.pem'),
         join(root, 'outside', 'certsx.pem'),
       ])
-      // A range holds the separator as readily as a set does: `+` is 0x2b,
-      // `/` 0x2f and `9` 0x39, so `[+-9]` is both readings too.
+      // A range holds the separator as a set does: `[+-9]` spans `/`.
       expect(found('*/cert[+-9]x.pem')).toEqual([
         join(root, 'outside', 'cert', 'x.pem'),
       ])
@@ -858,11 +848,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 
   it('denies whole what a pattern it cannot split reaches through a link', () => {
     // `?[*].pem` cannot be read one name at a time, so no directory is
-    // listed through a link. What the pattern matches beneath one that leads
-    // out of the tree is then found under no name at all: the directory it
-    // leads to is denied whole rather than dropped. A link within the tree
-    // loses nothing, since every directory there is listed under its own
-    // name, and denying it whole would hide a tree that was walked.
+    // listed through a link: what one that leads out of the tree reaches is
+    // denied whole rather than dropped. A link within the tree loses
+    // nothing, since every directory there is listed under its own name.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-')))
     try {
       mkdirSync(join(root, 'proj', 'inner'), { recursive: true })
@@ -887,10 +875,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('leaves alone a link that leads up the tree from a pattern it cannot split', () => {
-    // What such a link leads to holds the base being walked. Denied whole,
-    // it would hide the base itself and everything beside it, which is what
-    // a pattern that does split already declines to do by not descending it.
-    // A link to a directory beside the base is still denied whole.
+    // What such a link leads to holds the base being walked: denied whole,
+    // it would hide the base itself and everything beside it. A link to a
+    // directory beside the base is still denied whole.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-up-')))
     const proj = join(root, 'home', 'proj')
     try {
@@ -920,10 +907,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 
   it('does not let one name that fails to list answer for the others', () => {
     // A listing can fail for a reason that has nothing to do with the
-    // directory: too many open files at that moment, or a real path too long
-    // to name, which the next name for it may be short enough to reach.
-    // Letting that failure answer for every later name drops every match
-    // beneath the directory — the same fail-open as reading it as absent.
+    // directory (too many open files at that moment). Letting that failure
+    // answer for every later name drops every match beneath the directory.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-route-')))
     try {
       mkdirSync(join(root, 'pkg', 'certs'), { recursive: true })
@@ -961,8 +946,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         ])
         expect(retried.unlisted).toHaveLength(1)
 
-        // A directory that fails under every name is tried under each of them
-        // and named once, whatever the number of names.
+        // Failing under every name, it is tried under each and named once.
         attempts.length = 0
         failuresLeft = Number.POSITIVE_INFINITY
         const gone = walkGlobPattern(join(root, '**/*.pem'), {
@@ -980,10 +964,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('reports the error of the path it looked at, not of a second name', () => {
-    // The walk lists the real path and falls back on a shorter name only
-    // when the real one is too long to be a name at all. Every other errno
-    // belongs to the directory: answered from a second name, an unreadable
-    // directory reads as absent and the deny it holds vanishes.
+    // The walk falls back on a shorter name only when the real path is too
+    // long to name. Every other errno belongs to the directory: answered
+    // from a second name, an unreadable directory reads as absent.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-errno-')))
     try {
       const real = join(root, 'deep', 'a', 'b', 'certs')
@@ -1028,11 +1011,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('says so when a pattern is too long to read a component at a time', async () => {
-    // The automaton is built by recursion, once per path component, so a
-    // pattern with thousands of them would overflow the stack. Read as a
-    // pattern that simply does not split, it would quietly stop descending
-    // symlinked directories: a deny that covers less than it says. The
-    // reading is the same; that it was taken is now said out loud.
+    // A pattern with thousands of components is read as one that does not
+    // split, which descends no symlinked directory: a deny that covers less
+    // than it says, unless the reading is said out loud.
     const pattern = '/tmp/' + 'a/'.repeat(4000) + '*.pem'
     const { result, warnings } = await withCapturedWarnings(async () =>
       walkGlobPattern(pattern, { followSymlinkedDirectories: true }),

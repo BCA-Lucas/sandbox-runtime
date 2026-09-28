@@ -1135,6 +1135,13 @@ export interface ExpandGlobOptions {
    * don't need it).
    */
   caseInsensitive?: boolean
+  /**
+   * A directory the pattern is walked beneath, taken as the name it is: a
+   * leading run of `globPath` that exists on disk and may itself hold `[`,
+   * `*` or `?`. Only what follows it is pattern. The glob dialect has no
+   * escape, so this is the one way to say where such a name ends.
+   */
+  anchor?: string
 }
 
 /** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
@@ -1456,7 +1463,8 @@ function globPositions(
  * component), which {@link walkGlobPattern} refuses to expand.
  *
  * @param normalizedPattern - a pattern already through
- * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
+ * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes}),
+ * or the tail of one that is walked beneath an anchor
  */
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
@@ -1500,9 +1508,19 @@ export function walkGlobPattern(
     realOf: new Map(),
   }
 
-  const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
-  const baseDir = globPatternBaseDir(normalizedPattern)
-  if (baseDir === '' || baseDir === '/') {
+  // Beneath an anchor the pattern is the tail alone, so no character of the
+  // anchor is compiled; the walk starts at the anchor plus the tail's base.
+  const anchor =
+    opts.anchor === undefined ? undefined : toForwardSlashes(opts.anchor)
+  const normalizedPattern =
+    anchor === undefined
+      ? toForwardSlashes(normalizePathForSandbox(globPath))
+      : toForwardSlashes(globPath).slice(anchor.length)
+  const patternBaseDir = globPatternBaseDir(normalizedPattern)
+  const baseDirBelowAnchor = patternBaseDir === '/' ? '' : patternBaseDir
+  const baseDir =
+    anchor === undefined ? patternBaseDir : anchor + baseDirBelowAnchor
+  if (anchor === undefined && (baseDir === '' || baseDir === '/')) {
     logForDebugging(
       `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
       { level: 'warn' },
@@ -1606,7 +1624,9 @@ export function walkGlobPattern(
     dir: baseDir,
     real: baseReal,
     short: baseDir.length < baseReal.length ? baseDir : baseReal,
-    positions: baseDir.split('/').reduce(positions.next, positions.start),
+    positions: (anchor === undefined ? baseDir : baseDirBelowAnchor)
+      .split('/')
+      .reduce(positions.next, positions.start),
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
@@ -1638,7 +1658,14 @@ export function walkGlobPattern(
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
-      const candidate = toForwardSlashes(fullPath)
+      // A pattern that does not split is matched by its whole spelling, and
+      // beneath an anchor that is the spelling from the anchor on. It is never
+      // listed through a link, so every path it sees starts with the anchor.
+      const spelled = toForwardSlashes(fullPath)
+      const candidate =
+        anchor !== undefined && spelled.startsWith(anchor)
+          ? spelled.slice(anchor.length)
+          : spelled
       const isMatch = positions.matches(fresh, entry.name, candidate)
       if (isMatch) walk.matches.push(fullPath)
       if (entry.isDirectory()) {

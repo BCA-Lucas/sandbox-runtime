@@ -70,15 +70,18 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  opts: { anchor?: string } = {},
 ): string[] {
   const walk = walkGlobPattern(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    anchor: opts.anchor,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.

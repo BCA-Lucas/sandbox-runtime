@@ -240,21 +240,52 @@ describe('programs run on the host are found outside the allowed write paths', (
       ])
     })
 
-    it('compares against a write path in the form it resolves to as well', () => {
-      // The write path is given through a link; the copy is inside the
-      // directory that link leads to, and PATH names it there.
-      const real = dir('real-project')
-      plant(join(dir('real-project', 'bin'), HELPER))
+    it('is not switched off by an allowed write path that links to the root', () => {
+      // The command can make such a link wherever one allowed write path lies
+      // inside another. The wrap binds nothing for it.
+      plant(join(projectBin, HELPER))
       plant(join(safe, HELPER))
-      symlinkSync(real, join(base, 'project-link'))
-      process.env.PATH = `${join(real, 'bin')}:${safe}`
+      const dist = join(project, 'dist')
+      symlinkSync('/', dist)
+      process.env.PATH = `${projectBin}:${safe}`
 
-      const search = findHostHelper(HELPER, [join(base, 'project-link')])
+      expect(findHostHelper(HELPER, [project, dist])).toEqual({
+        path: join(safe, HELPER),
+        skipped: [
+          {
+            candidate: join(projectBin, HELPER),
+            reason: `inside the allowed write path ${project}`,
+          },
+        ],
+      })
+      expect(hostSearchPath([project, dist])).toBe(safe)
+      expect(existsSync(marker)).toBe(false)
+    })
 
-      expect(search.path).toBe(join(safe, HELPER))
-      expect(search.skipped.map(s => s.candidate)).toEqual([
-        join(real, 'bin', HELPER),
-      ])
+    it('does not count where an allowed write path that is a link leads', () => {
+      // Nothing is bound for it there either; counting it would let the
+      // command rule out every copy by linking to where they are kept.
+      plant(join(projectBin, HELPER))
+      plant(join(safe, HELPER))
+      const dist = join(project, 'dist')
+      symlinkSync(safe, dist)
+      process.env.PATH = `${projectBin}:${safe}`
+
+      expect(findHostHelper(HELPER, [project, dist]).path).toBe(
+        join(safe, HELPER),
+      )
+      expect(hostSearchPath([project, dist])).toBe(safe)
+    })
+
+    it('compares against a directory named with glob characters and a trailing slash', () => {
+      const named = dir('w[1]')
+      plant(join(named, HELPER))
+      plant(join(safe, HELPER))
+      process.env.PATH = `${named}:${safe}`
+
+      expect(findHostHelper(HELPER, [`${named}/`]).path).toBe(
+        join(safe, HELPER),
+      )
     })
 
     it('passes over nothing when no writes are restricted', () => {
@@ -372,6 +403,24 @@ describe('programs run on the host are found outside the allowed write paths', (
         expect(run.status).toBe(0)
         expect(existsSync(marker)).toBe(false)
       }
+    })
+
+    it('agrees with its own binds about an allowed write path that links to the root', async () => {
+      process.env.PATH = `${projectBin}:${savedPath}`
+      const dist = join(project, 'dist')
+      symlinkSync('/', dist)
+
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo wrapped-ok',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: { allowOnly: [project, dist], denyWithinAllow: [] },
+      })
+
+      expect(wrapped).toContain(`--bind ${project} ${project}`)
+      expect(wrapped).not.toContain(`--bind ${dist}`)
+      expect(firstWord(wrapped)).toBe(realBwrap)
+      expect(existsSync(marker)).toBe(false)
     })
 
     it('starts the listeners inside the sandbox with the real socat', async () => {
@@ -553,6 +602,8 @@ describe('programs run on the host are found outside the allowed write paths', (
         symlinkSync(whichSync(needed)!, join(tools, needed))
       }
       plant(join(projectBin, 'rg'))
+      // initialize() starts the socat bridges on the host: not with this one.
+      plant(join(projectBin, 'socat'))
       process.env.PATH = `${projectBin}:${tools}`
 
       const config = {
@@ -628,6 +679,10 @@ describe('programs run on the host are found outside the allowed write paths', (
         symlinkSync(elsewhere, join(safe, 'jump'))
         process.env.PATH = [`${safe}/jump/..`, safe].join(':')
         expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
+
+        // An empty PATH would mean the current directory to a shell.
+        process.env.PATH = `${projectBin}::.`
+        expect(hostSearchPath([project])).toBe('/dev/null')
 
         // Nothing restricted: the program inherits the PATH as it is.
         expect(hostSearchPath(undefined)).toBeUndefined()

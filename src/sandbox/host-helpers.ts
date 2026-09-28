@@ -8,8 +8,8 @@ import {
 } from '../utils/which.js'
 import {
   isAtOrUnder,
+  isSymlinkOutsideBoundary,
   normalizePathForSandbox,
-  pathSpellings,
 } from './sandbox-utils.js'
 
 /** A file the search found and would not use, and why. */
@@ -26,12 +26,17 @@ export type HostHelperSearch = {
 const MAX_LINKS_FOLLOWED = 40
 
 /**
- * The allowed write paths in the forms a location is compared against: as
- * `normalizePathForSandbox` spells each, and with every symlink resolved.
+ * The allowed write paths in the forms a location is compared against: what
+ * the Linux wrap binds writable for each, as `normalizePathForSandbox` spells
+ * it and with every symlink resolved. An entry the wrap binds nothing for
+ * counts for nothing: an absent one, and a link leading out of its own place
+ * (`isSymlinkOutsideBoundary`). The command can make such a link wherever one
+ * entry lies inside another (`<project>/dist -> /`), so where it leads must
+ * neither switch the comparison off nor widen it.
  * `denyWithinAllow` is not subtracted: passing over more is the safe side.
  *
  * `undefined` when there is nothing to compare against: no list at all, or
- * one that holds `/` and so leaves no place to prefer. A file's own
+ * one that names `/` itself and so leaves no place to prefer. A file's own
  * permissions are not judged here.
  */
 function writableForms(
@@ -40,12 +45,23 @@ function writableForms(
   if (allowedWritePaths === undefined) return undefined
   const forms = new Set<string>()
   for (const allowed of allowedWritePaths) {
-    for (const form of pathSpellings(normalizePathForSandbox(allowed))) {
-      // The empty spelling (an empty $HOME) would cover every path as a prefix.
-      if (path.isAbsolute(form)) forms.add(form)
+    const normalized = normalizePathForSandbox(allowed)
+    // The empty spelling (an empty $HOME) would cover every path as a prefix.
+    if (!path.isAbsolute(normalized)) continue
+    // Slash-free, as the wrap records it: a directory named with glob
+    // characters ('<dir>/[id]/') comes back with the slash it was given.
+    const spelled = normalized.replace(/\/+$/, '') || '/'
+    if (spelled === '/') return undefined
+    let resolved: string
+    try {
+      resolved = fs.realpathSync(spelled)
+    } catch {
+      continue
     }
+    if (isSymlinkOutsideBoundary(spelled, resolved)) continue
+    forms.add(spelled).add(resolved)
   }
-  return forms.has('/') ? undefined : [...forms]
+  return [...forms]
 }
 
 const components = (p: string): string[] =>
@@ -185,7 +201,9 @@ export function findHostHelper(
  * less every entry a host helper would not be taken from. An entry is judged
  * as a directory and by its copy of each of `programs`, the names the child
  * looks up: a link in a directory nobody can write may lead to a file
- * somebody can. `undefined` where nothing is filtered.
+ * somebody can. `undefined` where nothing is filtered. Never empty: a shell
+ * reads an empty PATH as the current directory, which the command may write,
+ * so with no entry left the answer is `/dev/null`, which holds nothing.
  */
 export function hostSearchPath(
   allowedWritePaths: readonly string[] | undefined,
@@ -209,10 +227,12 @@ export function hostSearchPath(
       }
       return refusalFor(file, writable) === null
     })
-  return (process.env.PATH ?? '')
-    .split(path.delimiter)
-    .filter(acceptable)
-    .join(path.delimiter)
+  return (
+    (process.env.PATH ?? '')
+      .split(path.delimiter)
+      .filter(acceptable)
+      .join(path.delimiter) || '/dev/null'
+  )
 }
 
 /** The option that names `helper` outright, for the message below. */

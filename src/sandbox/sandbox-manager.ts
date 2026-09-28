@@ -1392,8 +1392,10 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
  *
  * `denyWrite` also carries the mandatory set
- * ({@link windowsGetCwdMandatoryDenyPaths}), which no grant lifts:
- * srt-win writes a path's deny ahead of its allow, so the deny wins.
+ * ({@link windowsGetCwdMandatoryDenyPaths}), which a grant of the same
+ * path or of one above it does not lift: srt-win writes a path's deny
+ * ahead of its allow. A grant BENEATH a denied directory does lift it
+ * there: the explicit allow is read before the inherited deny.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]

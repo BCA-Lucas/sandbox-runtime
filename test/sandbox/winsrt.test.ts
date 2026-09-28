@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -1863,9 +1864,14 @@ describe.if(isWindows)(
       return { ...base, filesystem: { ...base.filesystem, ...fs } }
     }
 
-    async function rexecSandboxed(cmd: string, fs: FsOverrides) {
+    async function rexecSandboxed(
+      cmd: string,
+      fs: FsOverrides,
+      afterInit?: () => void,
+    ) {
       await SandboxManager.initialize(createFsTestConfig(fs))
       try {
+        afterInit?.()
         const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
         return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
           env: wrapped.env,
@@ -1937,7 +1943,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M1-M3: the mandatory write denies ──
+    // ── M1-M6: the mandatory write denies ──
     // Resolved from the working directory `initialize()` runs in, so
     // each row chdirs into its own tree first. Which paths are picked
     // is in test/sandbox/windows-mandatory-denies.test.ts; these rows
@@ -1954,11 +1960,16 @@ describe.if(isWindows)(
       return dir
     }
 
-    async function rexecIn(dir: string, cmd: string, fs: FsOverrides) {
+    async function rexecIn(
+      dir: string,
+      cmd: string,
+      fs: FsOverrides,
+      afterInit?: () => void,
+    ) {
       const saved = process.cwd()
       process.chdir(dir)
       try {
-        return await rexecSandboxed(cmd, fs)
+        return await rexecSandboxed(cmd, fs, afterInit)
       } finally {
         process.chdir(saved)
       }
@@ -2060,6 +2071,100 @@ describe.if(isWindows)(
       },
       90_000,
     )
+
+    it('M4: renaming .git aside and recreating it does not get a hook written', async () => {
+      const dir = mandatoryTree()
+      const git = join(dir, '.git')
+      const aside = join(dir, '.git-aside')
+      const hook = join(git, 'hooks', 'pre-commit')
+      try {
+        // `&`, not `&&`: robocopy exits 1 when it copied something.
+        const r = await rexecIn(
+          dir,
+          `ren "${git}" .git-aside & ` +
+            `robocopy "${aside}" "${git}" /E /R:0 /W:0 /NFL /NDL /NJH /NJS & ` +
+            `echo POISON>"${hook}"`,
+          { allowWrite: ['.'] },
+        )
+        const got = {
+          hook: existsSync(hook) ? readFileSync(hook, 'utf8') : null,
+          renamedAside: existsSync(aside),
+        }
+        if (got.hook !== 'HOOK-V1') {
+          throw new Error(
+            `M4: the hooks deny did not survive a rename of .git — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stdout=${JSON.stringify(r.stdout)} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M5: .git/config stays denied after the host replaces it by rename', async () => {
+      const dir = mandatoryTree()
+      const cfg = join(dir, '.git', 'config')
+      try {
+        // What git's own rewrite does: config.lock renamed over config.
+        const r = await rexecIn(
+          dir,
+          `echo POISON>"${cfg}"`,
+          { allowWrite: [dir] },
+          () => {
+            writeFileSync(`${cfg}.lock`, 'CONFIG-V2')
+            renameSync(`${cfg}.lock`, cfg)
+          },
+        )
+        const got = readFileSync(cfg, 'utf8')
+        if (got !== 'CONFIG-V2') {
+          throw new Error(
+            `M5: .git\\config was written after a host rename replaced it — ` +
+              `content=${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M6: initialize() and reset() take under 30 s each in a 20,000-file working directory', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-mandbig-'))
+      const saved = process.cwd()
+      try {
+        mkdirSync(join(dir, '.vscode'))
+        writeFileSync(join(dir, '.gitconfig'), 'x')
+        for (let d = 0; d < 200; d++) {
+          mkdirSync(join(dir, `d${d}`))
+          for (let f = 0; f < 100; f++) {
+            writeFileSync(join(dir, `d${d}`, `f${f}`), 'x')
+          }
+        }
+        process.chdir(dir)
+        // No allowWrite: the time is the two mandatory stamps' alone.
+        let initError: unknown
+        const t0 = Date.now()
+        try {
+          await SandboxManager.initialize(createFsTestConfig({}))
+        } catch (e) {
+          initError = e
+        }
+        const t1 = Date.now()
+        await SandboxManager.reset()
+        const t2 = Date.now()
+        const took = `initialize() ${t1 - t0} ms, reset() ${t2 - t1} ms`
+        console.log(`M6: ${took}`)
+        if (initError !== undefined) throw initError
+        if (t1 - t0 >= 30_000 || t2 - t1 >= 30_000) {
+          throw new Error(`M6: ${took}, over the 30000 ms allowed each`)
+        }
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 600_000)
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

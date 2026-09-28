@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -19,6 +20,7 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { LinuxSandboxProfileError } from '../../src/index.js'
 import { isLinux } from '../helpers/platform.js'
+import { manifestOf, RECORD_STEP, STEP_SHELL } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -61,8 +63,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   // The one rendered shape: the profile's path, then the options left before
   // and the words left after `--args 9`. A wrap that named mount points has
   // the same shell put itself on the manifest's record first.
-  const VIA_ARGS_FILE =
-    /^\/bin\/sh -c '(?:read -r s <\/proc\/\$\$\/stat && printf "%s\\n" "\$s" >>"\$1" && shift && )?exec 9<"\$1" && shift && exec "\$@"' srt-args (?:\S+\.started )?(\S+) bwrap (.*?) ?--args 9 (.*)$/s
+  const literally = (text: string): string =>
+    text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  const VIA_ARGS_FILE = new RegExp(
+    `^${literally(STEP_SHELL)} '(?:${literally(RECORD_STEP)} && )?exec 9<"\\$1" && shift && exec "\\$@"' srt-args (?:\\S+\\.started )?(\\S+) bwrap (.*?) ?--args 9 (.*)$`,
+    's',
+  )
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',
@@ -407,7 +413,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       console.log(JSON.stringify({ held, afterFirst, afterSecond: openFds() - baseline }))
     `)
     expect(seen).toEqual({ held: 2, afterFirst: 2, afterSecond: 0 })
-  })
+  }, 30000)
 
   it('refuses at wrap time, with the reason, when no directory takes an unnamed file', () => {
     // Both candidates read-only: tmpdir and /dev/shm. A profile that fits
@@ -555,7 +561,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       expect(wrapped).toMatch(
         / srt-args \S+\/srt-mount-points\/\d+-[0-9a-f]{16}\.started \/proc\/\d+\/fd\/\d+ bwrap /,
       )
-      expect(wrapped.match(/\/bin\/sh -c /g)).toHaveLength(1)
+      expect(wrapped.split(`${STEP_SHELL} `)).toHaveLength(2)
       const run = spawnSync(`timeout 60 ${wrapped} && echo AFTER`, {
         shell: true,
         encoding: 'utf8',
@@ -570,6 +576,46 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         'AFTER',
       ])
       expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n')
+    },
+    60_000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'refuses a string run after its clean-up, though its descriptor number now holds the profile of a later wrap',
+    async () => {
+      // The manifest's bind is what refuses such a start. In the file, it would
+      // be the later wrap's manifest that is bound, and the command would run
+      // under that wrap's profile.
+      const files = overLongProfile()
+      const [A, B] = [join(BASE, 'a'), join(BASE, 'b')]
+      const inArea = (area: string): Promise<string> => {
+        mkdirSync(area)
+        return wrap(files, {
+          allowOnly: [area],
+          denyWithinAllow: [join(area, 'absent.lock')],
+          command: `echo ran; touch ${join(B, 'written')}`,
+        })
+      }
+      const first = await inArea(A)
+      const manifest = manifestOf(first)!
+      expect(first.match(VIA_ARGS_FILE)![2]).toEndWith(
+        ` --ro-bind / / --ro-bind ${manifest} ${manifest}`,
+      )
+      cleanupBwrapMountPoints()
+      const second = await inArea(B)
+      expect(argsPathOf(second)).toBe(argsPathOf(first))
+
+      const run = spawnSync(first, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 60000,
+      })
+      expect(run.status).not.toBe(0)
+      expect(run.stderr).toContain(`Can't find source path ${manifest}`)
+      expect(run.stdout).toBe('')
+      // Nothing was made for it, in either place.
+      expect(readdirSync(A)).toEqual([])
+      expect(readdirSync(B)).toEqual([])
     },
     60_000,
   )

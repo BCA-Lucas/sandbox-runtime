@@ -160,6 +160,21 @@ describe.if(isLinux)('The mount point manifests', () => {
     return manifest
   }
 
+  /** The manifest this process publishes for a wrap that names `paths`. */
+  function publish(paths: string[], sources: string[] = []): string {
+    const manifest = publishMountPointManifest(paths, sources)
+    if (manifest === undefined || manifest === 'too-large') {
+      throw new Error(`not published: ${manifest}`)
+    }
+    return manifest.file
+  }
+
+  /** What a wrap is told the manifests name, sorted; `undefined` in doubt. */
+  function named(): string[] | undefined {
+    const reading = namedMountPoints()
+    return reading && [...reading.paths].sort()
+  }
+
   /** The claims in the manifest directory, by name. */
   function claims(): string[] {
     return readdirSync(DIR).filter(name => name.endsWith('.claimed'))
@@ -314,7 +329,7 @@ describe.if(isLinux)('The mount point manifests', () => {
         expect(existsSync(inside)).toBe(true)
         // Under its claim, which any later pass takes up.
         expect(claims()).toEqual([claimOf(manifest)])
-        expect([...namedMountPoints().named]).toEqual([inside])
+        expect(named()).toEqual([inside])
       } finally {
         chmodSync(readOnly, 0o755)
       }
@@ -336,7 +351,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       mkdirSync(readOnly)
       const inside = join(readOnly, 'config.lock')
       leftover(inside)
-      const manifest = publishMountPointManifest([inside], [])!.file
+      const manifest = publish([inside])
       chmodSync(readOnly, 0o555)
       try {
         expect(collectMountPoints('all')).toEqual([])
@@ -353,7 +368,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('keeps the manifest of a wrap of its own when the pass turns back half way, for the next', () => {
     leftover(X)
-    const manifest = publishMountPointManifest([X], [])!.file
+    const manifest = publish([X])
     // Another version of this library publishes, in a layout this one cannot
     // read, after the pass has claimed: the pass stops short of removing
     // anything.
@@ -386,9 +401,9 @@ describe.if(isLinux)('The mount point manifests', () => {
     let arrived: string | undefined
     const spy = spyOn(fs, 'unlinkSync').mockImplementation(((file: string) => {
       unlink(file)
-      if (file === X && arrived === undefined) {
+      if (file === Y && arrived === undefined) {
         // Published the moment the first mount point has gone.
-        arrived = manifestOfADeadProcess([Y], {
+        arrived = manifestOfADeadProcess([X], {
           pid: process.pid,
           created: Date.now(),
         })
@@ -401,8 +416,8 @@ describe.if(isLinux)('The mount point manifests', () => {
       spy.mockRestore()
     }
     expect(arrived).toBeDefined()
-    expect(removed).toEqual([X])
-    expect(existsSync(Y)).toBe(true)
+    expect(removed).toEqual([Y])
+    expect(existsSync(X)).toBe(true)
   })
 
   it('lists by the clock, not before every removal, in a pass of many mount points', () => {
@@ -429,14 +444,68 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(listings).toBeLessThan(many.length)
   })
 
-  it('is live for half a second from when it was written, though its writer is gone', () => {
+  it('takes a manifest of a later version by the fields it knows', () => {
+    // Taken for unreadable, it would put everything in doubt, and every wrap of
+    // an older process would be refused while a newer one is at work beside it.
+    const Y = join(BASE, 'second.lock')
+    leftover(X)
+    leftover(Y)
+    const later = { version: 2, added: { by: 'a later version' } }
+    manifestOfADeadProcess([X], { ...later, ...thisProcess() })
+    const finished = manifestOfADeadProcess([Y], later)
+
+    expect(liveMountPoints()).toEqual(new Set([X]))
+    expect(collectMountPoints('none')).toEqual([Y])
+    expect(existsSync(X)).toBe(true)
+    expect(existsSync(finished)).toBe(false)
+  })
+
+  it('is live for half a second from when it was written, though its writer is gone, and no longer', () => {
     // A command whose wrapping process was killed a moment ago is not refused
     // its start for that.
     leftover(X)
-    const manifest = manifestOfADeadProcess([X], { created: Date.now() })
-    expect(collectMountPoints()).toEqual([])
-    expect(existsSync(X)).toBe(true)
-    expect(existsSync(manifest)).toBe(true)
+    const now = Date.now()
+    const manifest = manifestOfADeadProcess([X], { created: now - 499 })
+    const clock = spyOn(Date, 'now').mockReturnValue(now)
+    try {
+      expect(collectMountPoints()).toEqual([])
+      expect(existsSync(manifest)).toBe(true)
+      clock.mockReturnValue(now + 1)
+      expect(collectMountPoints()).toEqual([X])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('says when it was written, and by which process as /proc numbers it', () => {
+    // Where the process has a PID namespace of its own under an outer /proc,
+    // its own number for itself is nobody's there, or somebody else's.
+    const stat = readFileSync('/proc/self/stat', 'utf8')
+    const outer = deadPid()
+    const read = fs.readFileSync
+    const spy = spyOn(fs, 'readFileSync').mockImplementation(((
+      file: unknown,
+      options: unknown,
+    ) =>
+      file === '/proc/self/stat'
+        ? stat.replace(/^\d+/, String(outer))
+        : (read as (f: unknown, o: unknown) => unknown)(
+            file,
+            options,
+          )) as never)
+    const before = Date.now()
+    let manifest: string
+    try {
+      manifest = publish([X])
+    } finally {
+      spy.mockRestore()
+    }
+    const written = JSON.parse(readFileSync(manifest, 'utf8')) as {
+      created: number
+    }
+    expect(written).toMatchObject({ pid: outer, start: startOf(stat) })
+    expect(written.created).toBeGreaterThanOrEqual(before)
+    expect(written.created).toBeLessThanOrEqual(Date.now())
   })
 
   // ---- a sandbox vouches for itself ----
@@ -449,14 +518,14 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     leftover(Y)
     const theirs = started(manifestOfADeadProcess([X]), thisProcess())
-    const own = started(publishMountPointManifest([Y], [])!.file, thisProcess())
+    const own = started(publish([Y]), thisProcess())
 
     expect(collectMountPoints('all')).toEqual([])
     expect(collectMountPoints('all')).toEqual([])
     for (const kept of [X, Y, theirs, own, recordOf(theirs), recordOf(own)]) {
       expect(existsSync(kept)).toBe(true)
     }
-    expect([...namedMountPoints().live].sort()).toEqual([X, Y].sort())
+    expect(live()).toEqual([X, Y].sort())
   })
 
   it('is finished once no process on its record runs, though the process that wrote it does', () => {
@@ -465,7 +534,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       pid: deadPid(),
       start: '1',
     })
-    expect([...namedMountPoints().live]).toEqual([])
+    expect(live()).toEqual([])
     expect(collectMountPoints('none')).toEqual([X])
     expect(existsSync(manifest)).toBe(false)
     expect(existsSync(recordOf(manifest))).toBe(false)
@@ -631,7 +700,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     // Though its writer runs: whoever claimed it knew its command to be over.
     const claim = claimed(manifestOfADeadProcess([X], thisProcess()))
     manifestOfADeadProcess([X, Y])
-    expect([...namedMountPoints().named].sort()).toEqual([X, Y].sort())
+    expect(named()).toEqual([X, Y].sort())
     expect(live()).toEqual([])
     expect(collectMountPoints().sort()).toEqual([X, Y].sort())
     expect(existsSync(claim)).toBe(false)
@@ -655,17 +724,17 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(Y)
     const manifest = manifestOfADeadProcess([X, Y])
     const claim = claimed(manifest)
-    const removal = atTheRemovalOf(X, () => {
+    const removal = atTheRemovalOf(Y, () => {
       fs.renameSync(claim, manifest)
       started(manifest, thisProcess())
     })
     try {
-      // Y stays: the manifest is at its own name by the time Y's turn comes.
-      expect(collectMountPoints()).toEqual([X])
+      // X stays: the manifest is at its own name by the time X's turn comes.
+      expect(collectMountPoints()).toEqual([Y])
     } finally {
       removal.restore()
     }
-    expect(existsSync(Y)).toBe(true)
+    expect(existsSync(X)).toBe(true)
     expect(readdirSync(DIR).sort()).toEqual(
       [basename(manifest), basename(recordOf(manifest))].sort(),
     )
@@ -690,7 +759,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       return (open as (...args: unknown[]) => number)(file, ...rest)
     }) as never)
     try {
-      expect([...namedMountPoints().named]).toEqual([X])
+      expect(named()).toEqual([X])
       expect(claim).toBeDefined()
       expect(live()).toEqual([X])
       expect(collectMountPoints()).toEqual([])
@@ -717,8 +786,9 @@ describe.if(isLinux)('The mount point manifests', () => {
       return (open as (...args: unknown[]) => number)(file, ...rest)
     }) as never)
     try {
-      // What it names cannot be listed, so what any other names is held.
-      expect(live()).toEqual([Y])
+      // What it names cannot be listed.
+      expect(live()).toBeUndefined()
+      expect(named()).toBeUndefined()
       expect(collectMountPoints()).toEqual([])
     } finally {
       spy.mockRestore()
@@ -793,7 +863,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   /** What a pass removes, and the set a caller is given, with that in place. */
   function withThat(injected: { restore(): void }): {
     removed: string[]
-    held: string[]
+    held: string[] | undefined
   } {
     try {
       return { held: live(), removed: collectMountPoints() }
@@ -836,10 +906,10 @@ describe.if(isLinux)('The mount point manifests', () => {
         // file to drop for being unreadable.
         const hoursAgo = new Date(Date.now() - 2 * 3600 * 1000)
         utimesSync(manifest, hoursAgo, hoursAgo)
-        // What it names cannot be listed, so what any other names is held.
+        // What it names cannot be listed, so nobody can say what is held.
         expect(withThat(failing(manifest, code, at))).toEqual({
           removed: [],
-          held: [Y],
+          held: undefined,
         })
         expect(existsSync(X)).toBe(true)
         expect(existsSync(manifest)).toBe(true)
@@ -879,8 +949,6 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   const gone = (): string => statLine({ pid: deadPid(), start: '1' })
   const notARecord: [string, (record: string) => void][] = [
-    ['empty, as between the shell making it and writing to it', r => write(r)],
-    ['cut short of its end of line', r => write(r, gone().slice(0, -1))],
     ['cut short of the start time', r => write(r, `${gone().slice(0, 30)}\n`)],
     ['not the line of a process', r => write(r, 'ended\n')],
     [
@@ -924,6 +992,137 @@ describe.if(isLinux)('The mount point manifests', () => {
     }, 15000)
   }
 
+  // ---- a record with no whole line on it is no record ----
+  //
+  // The command line execs bubblewrap only once its whole line is written. What
+  // a shell that was killed before that leaves must not vouch for ever, and
+  // nothing may become removable by its age alone.
+
+  const MONTH_MS = 30 * 24 * 3600 * 1000
+  const unwritten: [string, () => string][] = [
+    ['empty, as its shell makes it', () => ''],
+    ['cut short of its end of line', () => gone().slice(0, -1)],
+  ]
+  for (const [what, text] of unwritten) {
+    it(`collects a manifest whose writer is gone and whose record is ${what}`, () => {
+      leftover(X)
+      write(recordOf(manifestOfADeadProcess([X])), text())
+      expect(live()).toEqual([])
+      expect(collectMountPoints('none')).toEqual([X])
+      expect(readdirSync(DIR)).toEqual([])
+    })
+  }
+
+  for (const [what, text] of [
+    ['not there yet', undefined],
+    ...unwritten,
+  ] as const) {
+    it(`keeps, however old, the manifest of a running process that has not released it, its record ${what}`, () => {
+      // A wrap held up between publishing and its command putting itself on
+      // record, for longer than every threshold there is.
+      leftover(X)
+      const own = publish([X])
+      const theirs = manifestOfADeadProcess([X], thisProcess())
+      const longAgo = new Date(Date.now() - MONTH_MS)
+      for (const manifest of [own, theirs]) {
+        const body = JSON.parse(readFileSync(manifest, 'utf8')) as object
+        write(manifest, JSON.stringify({ ...body, created: longAgo.getTime() }))
+        if (text !== undefined) write(recordOf(manifest), text())
+        for (const file of [manifest, recordOf(manifest)]) {
+          if (existsSync(file)) utimesSync(file, longAgo, longAgo)
+        }
+      }
+      expect(collectMountPoints('none')).toEqual([])
+      expect(live()).toEqual([X])
+      expect(claims()).toEqual([])
+
+      // Its own goes when the caller says the command is over; the other
+      // process's is not this one's to release.
+      expect(collectMountPoints('all')).toEqual([])
+      expect(existsSync(own)).toBe(false)
+      expect(existsSync(theirs)).toBe(true)
+      expect(existsSync(X)).toBe(true)
+    })
+  }
+
+  it('goes by the whole lines of a record whose last line is cut short', () => {
+    // The same command line run again, its shell not yet done writing.
+    leftover(X)
+    const manifest = manifestOfADeadProcess([X], thisProcess())
+    write(recordOf(manifest), statLine(thisProcess()) + gone().slice(0, -1))
+    expect(collectMountPoints('none')).toEqual([])
+    write(recordOf(manifest), gone() + gone().slice(0, -1))
+    expect(collectMountPoints('none')).toEqual([X])
+  })
+
+  it('is not held up by a record with no whole line and no manifest, and drops it past the grace', () => {
+    // Nothing names a path, so it protects none.
+    leftover(X)
+    started(manifestOfADeadProcess([X]), { pid: deadPid(), start: '1' })
+    const [young, old, older] = ['4242', '4243', '4244'].map(pid =>
+      join(DIR, `${pid}-0123456789abcdef.started`),
+    ) as [string, string, string]
+    write(young)
+    write(old)
+    write(older, gone().slice(0, -1))
+    // Its shell may be about to write to it: not by the clock of a slow run.
+    const soon = new Date(Date.now() + 60_000)
+    utimesSync(young, soon, soon)
+    const aSecondAgo = new Date(Date.now() - 1000)
+    utimesSync(old, aSecondAgo, aSecondAgo)
+    utimesSync(older, new Date(Date.now() - MONTH_MS), aSecondAgo)
+
+    expect(live()).toEqual([])
+    expect(named()).toEqual([X])
+    expect(collectMountPoints()).toEqual([X])
+    expect(readdirSync(DIR)).toEqual([basename(young)])
+  })
+
+  /** Hides `name` from the next listing of the manifest directory. */
+  function missedByTheNextListing(name: string): { restore(): void } {
+    const readdir = fs.readdirSync
+    let hidden = false
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      dir: unknown,
+      options: unknown,
+    ) => {
+      const names = (readdir as (d: unknown, o: unknown) => string[])(
+        dir,
+        options,
+      )
+      if (dir !== DIR || hidden) return names
+      hidden = true
+      return names.filter(listed => listed !== name)
+    }) as never)
+    return { restore: () => spy.mockRestore() }
+  }
+
+  for (const [what, text] of [
+    ...unwritten,
+    ['that of a process that runs', () => statLine(thisProcess())],
+  ] as const) {
+    it(`finds by name a manifest the listing missed, its record ${what}, and leaves that record`, () => {
+      // Published, or renamed, while the directory was being listed: the record
+      // shows and the manifest does not. Taken for a record without a manifest
+      // it would be dropped, from under the shell about to write to it.
+      leftover(X)
+      const manifest = manifestOfADeadProcess([X], thisProcess())
+      write(recordOf(manifest), text())
+      const longAgo = new Date(Date.now() - MONTH_MS)
+      utimesSync(recordOf(manifest), longAgo, longAgo)
+      for (const look of [named, live, () => collectMountPoints('none')]) {
+        const listing = missedByTheNextListing(basename(manifest))
+        try {
+          expect(look()).toEqual(look === named || look === live ? [X] : [])
+        } finally {
+          listing.restore()
+        }
+      }
+      expect(existsSync(recordOf(manifest))).toBe(true)
+      expect(existsSync(X)).toBe(true)
+    })
+  }
+
   it("keeps what a manifest names while its record is somebody else's", () => {
     leftover(X)
     const manifest = started(manifestOfADeadProcess([X]), {
@@ -950,36 +1149,200 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(existsSync(record)).toBe(true)
   })
 
-  it('removes nothing when the manifests cannot be listed', () => {
-    leftover(X)
-    manifestOfADeadProcess([X])
-    const readdir = fs.readdirSync
-    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
-      dir: unknown,
-      options: unknown,
+  /** Has this process fail to write its next manifest, as on a full disk. */
+  function unrecorded(paths: string[]): void {
+    const write = fs.writeFileSync
+    const spy = spyOn(fs, 'writeFileSync').mockImplementation(((
+      file: unknown,
+      ...rest: unknown[]
     ) => {
-      if (dir === DIR) {
-        throw Object.assign(new Error(`EMFILE: ${DIR}`), { code: 'EMFILE' })
+      if (String(file).endsWith('.json.tmp')) {
+        throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
       }
-      return (readdir as (d: unknown, o: unknown) => unknown)(dir, options)
+      return (write as (...args: unknown[]) => void)(file, ...rest)
     }) as never)
     try {
-      expect(collectMountPoints()).toEqual([])
+      expect(publishMountPointManifest(paths, [])).toBeUndefined()
     } finally {
       spy.mockRestore()
     }
+  }
+
+  it('removes nothing when the manifests cannot be listed', () => {
+    // Not even what this process could not record and would remove on its own
+    // word: a manifest that cannot be listed may name it too.
+    leftover(X)
+    unrecorded([X])
+    const listing = failingCall('readdirSync', DIR, 'EMFILE')
+    try {
+      expect(collectMountPoints('all')).toEqual([])
+    } finally {
+      listing.restore()
+    }
     expect(existsSync(X)).toBe(true)
+    expect(collectMountPoints('all')).toEqual([X])
   })
 
+  it('takes every manifest for live when it cannot tell which PID namespace it is in', () => {
+    // With no /proc every process asked after reads as gone.
+    leftover(X)
+    started(manifestOfADeadProcess([X]), { pid: deadPid(), start: '1' })
+    forgetMountPointManifestDirectory()
+    const spy = spyOn(fs, 'readlinkSync').mockImplementation((() => {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+    }) as never)
+    try {
+      expect(live()).toEqual([X])
+      expect(collectMountPoints()).toEqual([])
+    } finally {
+      spy.mockRestore()
+      forgetMountPointManifestDirectory()
+    }
+    expect(collectMountPoints()).toEqual([X])
+  })
+
+  for (const [what, then] of [
+    [
+      'the directory cannot be listed again',
+      () => failingCall('readdirSync', DIR, 'EMFILE'),
+    ],
+    [
+      'a manifest that has arrived cannot be read',
+      () => planted('1-garbage.json', '{ not json'),
+    ],
+  ] as const) {
+    it(`stops removing, and keeps its claim, once ${what}`, () => {
+      const Y = join(BASE, 'second.lock')
+      leftover(X)
+      leftover(Y)
+      const manifest = manifestOfADeadProcess([X, Y])
+      let injected: { restore(): void } | undefined
+      const unlink = fs.unlinkSync
+      const spy = spyOn(fs, 'unlinkSync').mockImplementation(((
+        file: string,
+      ) => {
+        unlink(file)
+        // The moment the first mount point has gone.
+        injected ??= then()
+      }) as never)
+      try {
+        expect(collectMountPoints()).toEqual([Y])
+      } finally {
+        spy.mockRestore()
+        injected?.restore()
+      }
+      expect(existsSync(X)).toBe(true)
+      expect(claims()).toEqual([claimOf(manifest)])
+      expect(collectMountPoints()).toEqual([X])
+    })
+  }
+
   // ---- a manifest is only a claim about a path ---------------------------
+
+  // bubblewrap makes a file mount point 0444 from 0.5.0, and 0666 less the
+  // umask before.
+  for (const mode of [0o444, 0o644, 0o666, 0o600]) {
+    it(`takes an empty file of mode 0${mode.toString(8)} that a manifest names for a mount point`, () => {
+      writeFileSync(X, '')
+      chmodSync(X, mode)
+      const manifest = started(manifestOfADeadProcess([X]), thisProcess())
+      expect(live()).toEqual([X])
+      expect(collectMountPoints()).toEqual([])
+
+      started(manifest, { pid: deadPid(), start: '1' })
+      expect(live()).toEqual([])
+      expect(collectMountPoints()).toEqual([X])
+      expect(existsSync(X)).toBe(false)
+      expect(readdirSync(DIR)).toEqual([])
+    })
+  }
+
+  // ---- a directory mount point, and what lies in it ----
+
+  /** `.claude`, as one sandbox made it, and what others nested in it. */
+  function nested(): { Q: string; inside: string[] } {
+    const Q = join(BASE, '.claude')
+    const inside = [join(Q, 'agents'), join(Q, 'commands')]
+    mkdirSync(Q)
+    inside.forEach(leftover)
+    return { Q, inside }
+  }
+
+  for (const order of ['as listed', 'the other way round']) {
+    it(`removes what lies in a directory before the directory, the manifests read ${order}`, () => {
+      const { Q, inside } = nested()
+      manifestOfADeadProcess([Q, ...inside])
+      manifestOfADeadProcess([Q])
+      manifestOfADeadProcess(inside)
+      const readdir = fs.readdirSync
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        dir: unknown,
+        options: unknown,
+      ) => {
+        const names = (readdir as (d: unknown, o: unknown) => string[])(
+          dir,
+          options,
+        )
+        return order === 'as listed' ? names : names.reverse()
+      }) as never)
+      try {
+        expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+      } finally {
+        spy.mockRestore()
+      }
+      expect(existsSync(Q)).toBe(false)
+      expect(readdirSync(DIR)).toEqual([])
+    })
+  }
+
+  it('keeps its claim on a directory for as long as what lies in it is named by a manifest that is kept', () => {
+    // Dropped, nothing would name the directory once it is empty.
+    const { Q, inside } = nested()
+    const outer = manifestOfADeadProcess([Q])
+    const inner = started(manifestOfADeadProcess(inside), thisProcess())
+    expect(collectMountPoints()).toEqual([])
+    expect(claims()).toEqual([claimOf(outer)])
+
+    started(inner, { pid: deadPid(), start: '1' })
+    expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+    expect(readdirSync(DIR)).toEqual([])
+  })
+
+  it.if(NOT_ROOT)(
+    'keeps its claim on a directory when what lies in it could not be removed',
+    () => {
+      const { Q, inside } = nested()
+      const outer = manifestOfADeadProcess([Q])
+      manifestOfADeadProcess(inside)
+      chmodSync(Q, 0o555)
+      try {
+        expect(collectMountPoints()).toEqual([])
+        expect(claims()).toContain(claimOf(outer))
+      } finally {
+        chmodSync(Q, 0o755)
+      }
+      expect(collectMountPoints()).toEqual([...inside].reverse().concat(Q))
+      expect(readdirSync(DIR)).toEqual([])
+    },
+  )
+
+  it('keeps the directory a live manifest binds its mount points from', () => {
+    const source = join(BASE, 'source')
+    mkdirSync(source, { mode: 0o700 })
+    manifestOfADeadProcess([], { sources: [source] })
+    const live = started(
+      manifestOfADeadProcess([], { sources: [source] }),
+      thisProcess(),
+    )
+    expect(collectMountPoints()).toEqual([])
+    started(live, { pid: deadPid(), start: '1' })
+    expect(collectMountPoints()).toEqual([source])
+  })
 
   it('leaves what a finished manifest names when it no longer looks like a mount point', () => {
     const written = join(BASE, 'written-to')
     writeFileSync(written, 'mine')
     chmodSync(written, 0o444)
-    const writable = join(BASE, 'writable')
-    writeFileSync(writable, '')
-    chmodSync(writable, 0o644)
     const linked = join(BASE, 'linked')
     leftover(linked)
     linkSync(linked, join(BASE, 'linked-again'))
@@ -989,15 +1352,9 @@ describe.if(isLinux)('The mount point manifests', () => {
     const inUse = join(BASE, 'directory-in-use')
     mkdirSync(inUse)
     writeFileSync(join(inUse, 'file'), '')
-    const manifest = manifestOfADeadProcess([
-      written,
-      writable,
-      linked,
-      pointer,
-      inUse,
-    ])
+    const manifest = manifestOfADeadProcess([written, linked, pointer, inUse])
     expect(collectMountPoints()).toEqual([])
-    for (const kept of [written, writable, linked, pointer, inUse]) {
+    for (const kept of [written, linked, pointer, inUse]) {
       expect(existsSync(kept)).toBe(true)
     }
     expect(existsSync(join(BASE, 'pointed-at'))).toBe(true)
@@ -1198,7 +1555,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   /** Where this process, having settled on nothing yet, records X. */
   function recordedIn(): string {
     forgetMountPointManifestDirectory()
-    return dirname(publishMountPointManifest([X], [])!.file)
+    return dirname(publish([X]))
   }
 
   it("are not kept in a directory that is somebody else's", () => {
@@ -1241,7 +1598,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     // Opened up since: made the user's alone again before it is used.
     mkdirSync(DIR, { mode: 0o777 })
     chmodSync(DIR, 0o777)
-    expect(dirname(publishMountPointManifest([X], [])!.file)).toBe(DIR)
+    expect(dirname(publish([X]))).toBe(DIR)
     expect(statSync(DIR).mode & 0o777).toBe(0o700)
     rmSync(DIR, { recursive: true })
 
@@ -1250,7 +1607,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(target, { mode: 0o700 })
     symlinkSync(target, DIR)
     try {
-      expect(dirname(publishMountPointManifest([X], [])!.file)).not.toBe(DIR)
+      expect(dirname(publish([X]))).not.toBe(DIR)
       expect(readdirSync(target)).toEqual([])
     } finally {
       rmSync(DIR)
@@ -1280,11 +1637,11 @@ describe.if(isLinux)('The mount point manifests', () => {
           `const { existsSync } = await import('node:fs')`,
           `const there = () => [at.X, at.directory, at.source].map(p => existsSync(p))`,
           `const published = m.publishMountPointManifest([at.X, at.directory], [at.source]) ?? null`,
-          `const named = m.namedMountPoints()`,
+          `const named = [...m.namedMountPoints().paths].sort()`,
           `const held = [...m.liveMountPoints()].sort()`,
           `const some = { removed: m.collectMountPoints('none'), there: there() }`,
           `const all = { removed: m.collectMountPoints('all').sort(), there: there() }`,
-          `console.log(JSON.stringify({ published, named: [...named.named].sort(), live: [...named.live].sort(), held, some, all, again: m.collectMountPoints('all') }))`,
+          `console.log(JSON.stringify({ published, named, held, some, all, again: m.collectMountPoints('all') }))`,
         ].join('\n'),
         // No runtime directory, and nothing can be made under the temp dir.
         { env: { XDG_RUNTIME_DIR: undefined, TMPDIR: readOnly } },
@@ -1293,7 +1650,6 @@ describe.if(isLinux)('The mount point manifests', () => {
       expect(JSON.parse(nowhere.stdout)).toEqual({
         published: null,
         named: [X, directory].sort(),
-        live: [X, directory].sort(),
         held: [X, directory].sort(),
         some: { removed: [], there: [true, true, true] },
         all: {
@@ -1313,25 +1669,30 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     leftover(Y)
     started(manifestOfADeadProcess([X]), thisProcess())
-    const write = fs.writeFileSync
-    const spy = spyOn(fs, 'writeFileSync').mockImplementation(((
-      file: unknown,
-      ...rest: unknown[]
-    ) => {
-      if (String(file).endsWith('.json.tmp')) {
-        throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' })
-      }
-      return (write as (...args: unknown[]) => void)(file, ...rest)
-    }) as never)
-    try {
-      expect(publishMountPointManifest([X, Y], [])).toBeUndefined()
-    } finally {
-      spy.mockRestore()
-    }
-    expect([...namedMountPoints().named].sort()).toEqual([X, Y].sort())
+    unrecorded([X, Y])
+    expect(named()).toEqual([X, Y].sort())
     expect(collectMountPoints('none')).toEqual([])
     expect(collectMountPoints('all')).toEqual([Y])
     expect(existsSync(X)).toBe(true)
+  })
+
+  it('publishes no manifest that it would not read', () => {
+    const paths = (count: number): string[] =>
+      Array.from({ length: count }, (_, i) =>
+        join(BASE, 'x'.repeat(80), String(i).padStart(6, '0')),
+      )
+    // Each with its quotes and a comma, in a mebibyte less the other fields.
+    const fit = Math.floor((1024 * 1024 - 400) / (paths(1)[0]!.length + 3))
+    expect(publishMountPointManifest(paths(fit + 10), [])).toBe('too-large')
+    // Nothing is written, or kept in memory: no command comes of that wrap.
+    expect(readdirSync(DIR)).toEqual([])
+    expect(named()).toEqual([])
+    // What it does publish, it reads.
+    expect(statSync(publish(paths(fit))).size).toBeGreaterThan(1_000_000)
+    expect(named()?.length).toBe(fit)
+    leftover(X)
+    manifestOfADeadProcess([X])
+    expect(collectMountPoints('none')).toEqual([X])
   })
 
   // ---- what is read as a manifest ----
@@ -1380,11 +1741,13 @@ describe.if(isLinux)('The mount point manifests', () => {
         writeFileSync(name, finishedManifestText(paths).slice(0, -1)),
     ],
     [
-      'a manifest of another version',
+      'a manifest of a later version without a field this one goes by',
       (name, paths) =>
         writeFileSync(
           name,
-          finishedManifestText(paths).replace('"version":1', '"version":2'),
+          finishedManifestText(paths)
+            .replace('"version":1', '"version":2')
+            .replace('"sources":[]', '"origins":[]'),
         ),
     ],
     ['a directory', name => mkdirSync(name)],
@@ -1405,19 +1768,23 @@ describe.if(isLinux)('The mount point manifests', () => {
       // the one thread there is.
       const look = (): unknown => {
         const looked = inAChild(
-          `console.log(JSON.stringify({ named: [...m.namedMountPoints().named], held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
+          [
+            `const list = set => (set === undefined ? 'cannot tell' : [...set])`,
+            `console.log(JSON.stringify({ named: list(m.namedMountPoints()?.paths), held: list(m.liveMountPoints()), removed: m.collectMountPoints() }))`,
+          ].join('\n'),
         )
         expect(looked.status).toBe(0)
         expect(looked.ms).toBeLessThan(AT_ONCE_MS)
         return JSON.parse(looked.stdout)
       }
       // It names nothing that can be read, and may name anything.
-      expect(look()).toEqual({ named: [Y], held: [Y], removed: [] })
+      const inDoubt = { named: 'cannot tell', held: 'cannot tell', removed: [] }
+      expect(look()).toEqual(inDoubt)
 
       // Nor while a process is on its record, however old it is.
       aged(junk)
       writeFileSync(recordOf(junk), statLine(thisProcess()))
-      expect(look()).toEqual({ named: [Y], held: [Y], removed: [] })
+      expect(look()).toEqual(inDoubt)
 
       rmSync(recordOf(junk))
       expect(look()).toEqual({ named: [Y], held: [], removed: [Y] })
@@ -1435,7 +1802,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     manifestOfADeadProcess([Y])
     const theirs = asSomebodyElses(junk)
     try {
-      expect([...namedMountPoints().named]).toEqual([Y])
+      expect(named()).toBeUndefined()
       expect(collectMountPoints()).toEqual([])
       aged(junk)
       expect(collectMountPoints()).toEqual([Y])
@@ -1451,9 +1818,10 @@ describe.if(isLinux)('The mount point manifests', () => {
   // leave out. What it is told to leave out is never more than an empty
   // placeholder.
 
-  /** The set, as a sorted list. */
-  function live(): string[] {
-    return [...liveMountPoints()].sort()
+  /** The set, as a sorted list; `undefined` where it cannot tell. */
+  function live(): string[] | undefined {
+    const set = liveMountPoints()
+    return set && [...set].sort()
   }
 
   it('holds a mount point while a live manifest names it, file or directory, and no other path', () => {
@@ -1463,10 +1831,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     mkdirSync(directory)
     leftover(other)
     // Of this process, and not released: live.
-    const manifest = publishMountPointManifest(
-      [X, directory, join(BASE, 'never-there')],
-      [],
-    )!.file
+    const manifest = publish([X, directory, join(BASE, 'never-there')])
 
     expect(live()).toEqual([X, directory].sort())
     // Asking takes nothing away.
@@ -1489,9 +1854,6 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it('holds nothing a live manifest names that does not look like a mount point any more', () => {
-    const writable = join(BASE, 'writable')
-    writeFileSync(writable, '')
-    chmodSync(writable, 0o644)
     const linked = join(BASE, 'linked')
     leftover(linked)
     linkSync(linked, join(BASE, 'linked-again'))
@@ -1506,10 +1868,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const theirDirectory = join(BASE, 'somebody-elses-directory')
     mkdirSync(theirDirectory)
     leftover(X)
-    publishMountPointManifest(
-      [writable, linked, pointer, inUse, theirs, theirDirectory, X],
-      [],
-    )
+    publish([linked, pointer, inUse, theirs, theirDirectory, X])
     // As another user's would look: nothing here can make one.
     const lstat = fs.lstatSync
     const spy = spyOn(fs, 'lstatSync').mockImplementation(((
@@ -1545,21 +1904,99 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(live()).toEqual([X])
   })
 
-  it('holds what any manifest names while something in the directory cannot be read, and of that only what looks like a mount point', () => {
-    // What another version of this library wrote, say. What it names cannot be
-    // listed, so while the clean-up takes it to be live every named path
-    // counts.
-    const written = join(BASE, 'written-to')
-    writeFileSync(written, 'mine')
-    chmodSync(written, 0o444)
-    leftover(X)
-    manifestOfADeadProcess([X, written])
-    const stranger = join(DIR, '1-garbage.json')
-    writeFileSync(stranger, '{ not json')
-    expect(live()).toEqual([X])
+  /** Has `call` on `target` fail with `code`. */
+  function failingCall(
+    call: 'readdirSync' | 'lstatSync',
+    target: string,
+    code: string,
+  ): { restore(): void } {
+    const real = fs[call] as (f: unknown, o: unknown) => unknown
+    const spy = spyOn(fs, call).mockImplementation(((
+      file: unknown,
+      options: unknown,
+    ) => {
+      if (file === target) {
+        throw Object.assign(new Error(`${code}: ${target}`), { code })
+      }
+      return real(file, options)
+    }) as never)
+    return { restore: () => spy.mockRestore() }
+  }
 
-    aged(stranger)
-    expect(live()).toEqual([])
+  const planted = (name: string, text: string): { restore(): void } => {
+    writeFileSync(join(DIR, name), text)
+    return { restore: () => rmSync(join(DIR, name)) }
+  }
+  const cannotTell: [string, (manifest: string) => { restore(): void }][] = [
+    [
+      'the directory cannot be looked at',
+      () => failingCall('lstatSync', DIR, 'EIO'),
+    ],
+    [
+      'the directory cannot be listed',
+      () => failingCall('readdirSync', DIR, 'EMFILE'),
+    ],
+    ['a manifest cannot be opened', manifest => failing(manifest, 'EMFILE')],
+    ['a manifest cannot be read', manifest => failing(manifest, 'EIO', 'read')],
+    ['something is no manifest', () => planted('1-garbage.json', '{ not json')],
+    [
+      'a process runs on a record without a manifest',
+      () => planted('1-0123456789abcdef.started', statLine(thisProcess())),
+    ],
+  ]
+  for (const [what, inject] of cannotTell) {
+    it(`says that it cannot tell, to a caller and to a wrap, when ${what}`, () => {
+      // An empty set would read as "nothing is live", and the caller would
+      // remove a mount point from under a sandbox that is running.
+      leftover(X)
+      const manifest = started(manifestOfADeadProcess([X]), thisProcess())
+      expect(live()).toEqual([X])
+      const earlier = namedMountPoints()
+      const injected = inject(manifest)
+      try {
+        expect(liveMountPoints()).toBeUndefined()
+        expect(namedMountPoints()).toBeUndefined()
+        // A manifest already read is not read again, so that is no doubt.
+        if (!what.startsWith('a manifest')) {
+          expect(namedMountPoints(earlier)).toBeUndefined()
+        }
+      } finally {
+        injected.restore()
+      }
+      expect(live()).toEqual([X])
+    })
+  }
+
+  it('holds a path a live manifest names that cannot be looked at', () => {
+    leftover(X)
+    started(manifestOfADeadProcess([X]), thisProcess())
+    const look = failingCall('lstatSync', X, 'EACCES')
+    try {
+      expect(live()).toEqual([X])
+    } finally {
+      look.restore()
+    }
+  })
+
+  it('answers a wrap with an earlier reading while the directory lists nothing new, and reads again when it does', () => {
+    const [Y, Z] = [join(BASE, 'second.lock'), join(BASE, 'third.lock')]
+    manifestOfADeadProcess([X])
+    const first = namedMountPoints()!
+    const open = spyOn(fs, 'openSync')
+    try {
+      expect(namedMountPoints(first)).toBe(first)
+      expect(open).not.toHaveBeenCalled()
+    } finally {
+      open.mockRestore()
+    }
+    // The caller knows what it has published itself.
+    const own = publish([Y])
+    expect(namedMountPoints(first, own)).toBe(first)
+    expect([...namedMountPoints(first)!.paths].sort()).toEqual([X, Y].sort())
+    manifestOfADeadProcess([Z])
+    expect([...namedMountPoints(first, own)!.paths].sort()).toEqual(
+      [X, Y, Z].sort(),
+    )
   })
 
   it('is one listing of the directory, and changes nothing in it', () => {
@@ -1578,7 +2015,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
     const readdir = spyOn(fs, 'readdirSync')
     const rename = spyOn(fs, 'renameSync')
-    let listed: string[]
+    let listed: string[] | undefined
     let listings: number
     try {
       listed = live()

@@ -1,9 +1,23 @@
+import { existsSync } from 'node:fs'
 import { quote } from '../../src/utils/shell-quote.js'
 
 /** The $0 renderBwrapInvocation gives the shell that opens an over-long
  * profile's argument file. Its presence means the mount words are in that
  * file and not in the command. */
 const ARGS_FILE_ARGV0 = 'srt-args'
+
+/**
+ * How a wrapped command that takes steps of its own before bubblewrap begins, on
+ * this host: bash where it is at one of its two usual places, else /bin/sh.
+ */
+export const STEP_SHELL = ((): string => {
+  const bash = ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell))
+  return bash === undefined ? '/bin/sh -c' : `${bash} -p -c`
+})()
+
+/** The step that puts the command on its manifest's started record. */
+export const RECORD_STEP =
+  'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1" && shift'
 
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']

@@ -164,19 +164,24 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       : (JSON.parse(readFileSync(file, 'utf8')) as { paths: string[] }).paths
   }
 
-  it('is covered with /dev/null like an absent path, named, and removed after the command', async () => {
-    const left = plantLeftover(LOCK)
+  // 0444 is what bubblewrap makes from 0.5.0, 0666 less the umask before.
+  it.each([0o444, 0o644, 0o666, 0o600])(
+    'is covered with /dev/null like an absent path, named, and removed after the command, whatever its mode: %o',
+    async mode => {
+      const left = plantLeftover(LOCK)
+      chmodSync(LOCK, mode)
 
-    const command = await wrap([LOCK])
+      const command = await wrap([LOCK])
 
-    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
-    expect(countMounts(command, '--ro-bind', LOCK, LOCK)).toBe(0)
-    expect(namedBy(command)).toEqual([LOCK])
+      expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+      expect(countMounts(command, '--ro-bind', LOCK, LOCK)).toBe(0)
+      expect(namedBy(command)).toEqual([LOCK])
 
-    cleanupBwrapMountPoints()
-    expect(existsSync(LOCK)).toBe(false)
-    expect(existsSync(left)).toBe(false)
-  })
+      cleanupBwrapMountPoints()
+      expect(existsSync(LOCK)).toBe(false)
+      expect(existsSync(left)).toBe(false)
+    },
+  )
 
   it('stays while a wrap of this process is outstanding, and goes with the last of them', async () => {
     plantLeftover(LOCK)
@@ -198,13 +203,6 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   // somebody's file: bound onto itself as an existing deny path, and still
   // there afterwards.
   const somebodysFiles: [string, (p: string) => void][] = [
-    [
-      'an empty file with write bits (a lockfile, a file made empty on purpose)',
-      (p: string) => {
-        writeFileSync(p, '')
-        chmodSync(p, 0o644)
-      },
-    ],
     [
       'a read-only file with content',
       (p: string) => {
@@ -249,29 +247,33 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     },
   )
 
-  // ---- an empty read-only file that no manifest names ----
+  // ---- an empty file that no manifest names ----
   //
   // It is the caller's own, whatever it looks like. It is denied like any
   // existing path, by a read-only bind onto itself, and nothing ever removes
   // it.
 
-  it("is the caller's own where no manifest names it: bound onto itself, named by the wrap nowhere, and never removed", async () => {
-    plantEmptyReadOnlyFile(LOCK)
-    // A manifest that names something else changes nothing about it.
-    manifestNaming([join(GIT_DIR, 'other.lock')])
+  it.each([0o444, 0o644])(
+    "is the caller's own where no manifest names it: bound onto itself, named by the wrap nowhere, and never removed (mode %o)",
+    async mode => {
+      plantEmptyReadOnlyFile(LOCK)
+      chmodSync(LOCK, mode)
+      // A manifest that names something else changes nothing about it.
+      manifestNaming([join(GIT_DIR, 'other.lock')])
 
-    const command = await wrap([LOCK])
+      const command = await wrap([LOCK])
 
-    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind ${LOCK} ${LOCK}`)
-    expect(countMounts(command, '--ro-bind', '/dev/null', LOCK)).toBe(0)
-    expect(namedBy(command)).toEqual([])
+      expect(lastMountAt(command, LOCK)).toBe(`--ro-bind ${LOCK} ${LOCK}`)
+      expect(countMounts(command, '--ro-bind', '/dev/null', LOCK)).toBe(0)
+      expect(namedBy(command)).toEqual([])
 
-    cleanupBwrapMountPoints()
-    cleanupBwrapMountPoints({ force: true })
-    const kept = lstatSync(LOCK)
-    expect(kept.size).toBe(0)
-    expect(kept.mode & 0o777).toBe(0o444)
-  })
+      cleanupBwrapMountPoints()
+      cleanupBwrapMountPoints({ force: true })
+      const kept = lstatSync(LOCK)
+      expect(kept.size).toBe(0)
+      expect(kept.mode & 0o777).toBe(mode)
+    },
+  )
 
   it("is the caller's own at a mandatory deny path as well, beside the mount points the wrap makes for the others", async () => {
     const project = join(AREA, 'repo')
@@ -445,7 +447,9 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     async () => {
       plantLeftover(LOCK)
 
-      const write = `echo ${BOOTED}; echo x > ${LOCK}; echo rc=$?`
+      // Removed first: a file without a write bit refuses a plain write by its
+      // mode alone, and only a bind refuses the removal.
+      const write = `echo ${BOOTED}; rm -f ${LOCK}; echo x > ${LOCK}; echo rc=$?`
       const overLeftover = run(await wrap([LOCK], write))
       expect(overLeftover.stdout).toContain(BOOTED)
       expect(overLeftover.stdout).toMatch(/rc=[1-9]/)
@@ -491,6 +495,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
         ].join('\n'),
       )
       const killed = spawnSync(process.execPath, [script], {
+        env: { ...process.env },
         encoding: 'utf8',
         timeout: 30000,
       })
@@ -504,16 +509,12 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
       const command = await wrap(
         [LOCK],
-        `echo ${BOOTED}; echo x > ${LOCK}; echo rc=$?`,
+        `echo ${BOOTED}; rm -f ${LOCK}; echo x > ${LOCK}; echo rc=$?`,
       )
       expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
       const after = run(command)
       expect(after.stdout).toContain(BOOTED)
       expect(after.stdout).toMatch(/rc=[1-9]/)
-      // A manifest whose writer is gone and that no sandbox has locked counts
-      // as live for half a second, so the cleanup that takes its mount point
-      // away is the first one after that.
-      await new Promise(resolve => setTimeout(resolve, 600))
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
     },

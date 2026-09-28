@@ -2077,14 +2077,12 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
- * Call it once for each wrapped command, when that command is over. Two
- * commands of one process may be in flight at once, and a call cannot tell
- * which of them it is for, so with no argument nothing this process made is
- * taken away until it has been called once for every wrap handed out: the
- * command that has not started yet still needs what its wrap prepared. Pass
- * the `commandId` the wrap was given (`WrapWithSandboxOptions.commandId`) to
- * have that one command's mount points go at once, whatever else is running,
- * which matters when some command runs for a long time.
+ * Call it once for each wrapped command, when that command is over. With no
+ * argument nothing this process made is removed until it has been called
+ * once for every wrap handed out, because a call cannot tell which command
+ * it is for. Pass the `commandId` the wrap was given
+ * (`WrapWithSandboxOptions.commandId`) to have that command's mount points
+ * removed at once, which matters when another command runs for a long time.
  *
  * Safe to call on any platform: it does nothing except on Linux.
  * Also called automatically by reset() and on process exit as safety nets.

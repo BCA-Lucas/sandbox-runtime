@@ -35,8 +35,8 @@ import { usePrivateManifestDirectory } from '../helpers/private-manifest-directo
 /**
  * The manifests and the pass that collects on their word, below the level of a
  * sandbox: what a pass believes, what it looks at again before it removes
- * anything, and that nothing about the directory's lock can hold a process up
- * or be relied on.
+ * anything, and that the directory's lock neither holds a process up nor is
+ * relied on.
  */
 describe.if(isLinux)('The mount point manifests', () => {
   const runtime = usePrivateManifestDirectory()
@@ -124,10 +124,9 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   /**
    * Runs `source` with the module as `m` in a process of its own, which is
-   * killed if it has not ended by itself: what these cases guard against blocks
-   * the thread it happens on, so a test in this process could not time it out.
-   * `first` runs before the module is loaded, and an `env` entry that is
-   * undefined is one the child does not have.
+   * killed if it does not end by itself: what these cases guard against blocks
+   * the thread. `first` runs before the module is loaded, and an `env` entry
+   * that is undefined is removed from the child's environment.
    */
   function inAChild(
     source: string,
@@ -166,14 +165,12 @@ describe.if(isLinux)('The mount point manifests', () => {
   const COLLECT = `m.collectMountPoints()`
   const PUBLISH = `console.log(JSON.stringify(m.publishMountPointManifest(['/nonexistent/x'], []) ?? null))`
 
-  // ---- the directory's lock never holds a process up ---------------------
+  // ---- the directory's lock never holds a process up ----
   //
-  // Whatever is at the lock's name, a collect and a publish both come back:
-  // by the deadline when it is somebody's lock, and at once when it is nothing
-  // this process could ever take. Each used to go round for ever, on the one
-  // thread, in the wrap, in the clean-up after a command and in the exit
-  // handler. "At once" is held to well under the two seconds somebody's lock
-  // is waited for: the wait is made four times over by one command.
+  // Whatever is at the lock's name, a collect and a publish both come back: by
+  // the deadline when it is somebody's lock, and at once when it is nothing
+  // this process could ever take. "At once" is held to well under the
+  // two-second wait, which one command makes four times over.
   const AT_ONCE_MS = 1500
 
   const notALock: [string, () => void, boolean][] = [
@@ -227,10 +224,9 @@ describe.if(isLinux)('The mount point manifests', () => {
   it.if(BWRAP_CAN_NAMESPACE && NOT_ROOT)(
     'comes back from a collect at once where the directory is read-only from here, and collects nothing on its word',
     () => {
-      // What a process inside a sandbox sees of the directory: bound
-      // read-only, with a lock in it that it could never remove. It keeps its
-      // own manifests elsewhere, and what is in this one is not for it to
-      // judge: it could remove the mount point and not the manifest.
+      // What a process inside a sandbox sees of the directory: bound read-only,
+      // with a lock in it that it could never remove. It keeps its own
+      // manifests elsewhere and does not judge what is in this one.
       const lock = `${deadPid()} 1 ${OWN_NAMESPACE}\n`
       writeFileSync(LOCK, lock)
       leftover(X)
@@ -276,11 +272,9 @@ describe.if(isLinux)('The mount point manifests', () => {
   }, 15000)
 
   it('believes a lock that names nobody until it is old, and breaks it then', () => {
-    // An empty lock file is what a lock made in two steps looked like for a
-    // moment, and a waiter that read it then took it for nobody's and removed
-    // it at once: two processes inside. The lock is made whole now, and one
-    // that says nothing is believed like any other whose holder cannot be
-    // asked after.
+    // An empty lock file says nothing about its holder. It is believed like any
+    // other lock whose holder cannot be asked after, not taken for nobody's and
+    // removed.
     writeFileSync(LOCK, '')
     leftover(X)
     manifestOfADeadProcess([X])
@@ -351,11 +345,9 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it('keeps a mount point named by a manifest that is published while the pass is under way', () => {
-    // The lock does not exclude: its holder can be held up past the age at
-    // which it is broken, breaking one is not atomic, and a publish that
-    // cannot have it goes ahead without. So a manifest can appear between a
-    // pass listing the directory and its removals, naming a path the pass is
-    // about to remove, with a sandbox starting under it.
+    // The lock does not exclude, so a manifest can appear between a pass
+    // listing the directory and its removals, naming a path the pass is about
+    // to remove, with a sandbox starting under it.
     leftover(X)
     manifestOfADeadProcess([X])
     let published: { status: number | null; stdout: string } | undefined
@@ -380,8 +372,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('gives up only a lock that is still its own', () => {
     // Held up for longer than a lock is believed, a pass finds on its way out
-    // that the lock at that name is somebody else's by now. Removing it by
-    // name let a third process in beside the second.
+    // that the lock at that name is somebody else's by now, and must leave it.
     const theirs = `${process.ppid} 1 pid:[1]\n`
     let mine = ''
     const pass = duringTheNextPass(() => {
@@ -427,9 +418,8 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it('looks at /proc/locks a bounded number of times, not once for every mount point', () => {
-    // The list is the host's, and reading all of it for each removal made a
-    // pass over many mount points take seconds, under a lock whose waiters
-    // give up after two.
+    // The list is the host's: reading all of it for each removal would make a
+    // pass over many mount points outlast the lock's waiters.
     const many = 500
     const paths: string[] = []
     for (let i = 0; i < many; i++) {
@@ -453,8 +443,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(removed.length).toBe(many)
     // One to begin with, one before the first removal, one for every 64
     // removals after that, and one more for every two milliseconds the pass
-    // took, since a look goes out of date with time as well. No fewer than
-    // that either: one look is not good for ever.
+    // took. No fewer either: one look is not good for ever.
     expect(looks).toBeGreaterThanOrEqual(1 + Math.ceil(many / 64))
     expect(looks).toBeLessThanOrEqual(
       3 + Math.ceil(many / 64) + Math.ceil(tookMs / 2),
@@ -467,7 +456,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     () => {
       // Seen read-only from here, as from inside a sandbox that may not write
       // the directory it is in. The manifest is all that says the file is a
-      // mount point and whose; with it gone the file stayed for good.
+      // mount point, so it must stay while the file does.
       const readOnly = join(BASE, 'read-only-from-here')
       mkdirSync(readOnly)
       const inside = join(readOnly, 'config.lock')
@@ -486,14 +475,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     },
   )
 
-  // ---- a manifest goes last, this process's own like anybody's -----------
+  // ---- a manifest goes last, this process's own like anybody's ----
   //
-  // A manifest is all that names its mount points. One this process wrote
-  // used to be unlinked as soon as the caller said its command was over,
-  // before the pass knew whether it would get as far as the removals or
-  // whether they would work; after a pass that turned back, or a removal that
-  // was refused, nothing on disk named the mount points and no later pass
-  // removed them.
+  // A manifest is all that names its mount points. It stays until a pass has
+  // removed what it names: after a pass that turned back, or a removal that was
+  // refused, a later pass still has it to go by.
 
   it.if(NOT_ROOT)(
     'keeps the manifest of a wrap of its own whose mount point it could not remove, for a pass that can',
@@ -522,8 +508,8 @@ describe.if(isLinux)('The mount point manifests', () => {
     leftover(X)
     const manifest = publishMountPointManifest([X], [])!.file
     // Another version of this library publishes, in a layout this one cannot
-    // read, after the pass has listed the directory: what that names cannot be
-    // kept path by path, so the pass stops short of removing anything.
+    // read, after the pass has listed the directory: the pass stops short of
+    // removing anything.
     const stranger = join(DIR, '4242-0123456789abcdef.json')
     const pass = duringTheNextPass(() =>
       writeFileSync(stranger, '{"version":2}'),
@@ -586,8 +572,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('keeps what a finished manifest names when its lock shows on the look before the removals', () => {
     // The bubblewrap a wrap has handed to its caller takes its lock whenever
-    // the caller starts it, which no lock of this library's can put off: the
-    // kernel is asked again before anything goes.
+    // the caller starts it, so the kernel is asked again before anything goes.
     leftover(X)
     const manifest = manifestOfADeadProcess([X])
     const line = `1: POSIX  ADVISORY  READ 4242 ${deviceOf(manifest)}:${statSync(manifest).ino} 0 EOF\n`
@@ -614,10 +599,9 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it('lists the directory again between removals, not only before the first', () => {
-    // A sandbox about to start on a path shows as a manifest that was not
-    // there when the pass began, and it can appear at any point of a pass over
-    // many mount points. One listing is good for a quarter of a millisecond,
-    // far less than a sandbox needs to get to its binds.
+    // A sandbox about to start on a path shows as a manifest that was not there
+    // when the pass began, at any point of a pass over many mount points. One
+    // listing is good for a quarter of a millisecond.
     const Y = join(BASE, 'second.lock')
     leftover(X)
     leftover(Y)
@@ -628,8 +612,8 @@ describe.if(isLinux)('The mount point manifests', () => {
       unlink(file)
       if (file === X && arrived === undefined) {
         // Published the moment the first mount point has gone, with the pass
-        // held up for a millisecond before it goes on to the next: less than
-        // the two for which it trusts what it read from /proc/locks.
+        // held up for a millisecond before the next: less than the two for
+        // which it trusts what it read from /proc/locks.
         arrived = manifestOfADeadProcess([Y], {
           pid: process.pid,
           created: Date.now(),
@@ -738,12 +722,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(existsSync(young)).toBe(true)
   })
 
-  // ---- liveness is relative to a PID namespace ---------------------------
+  // ---- liveness is relative to a PID namespace ----
   //
-  // /proc/locks lists a lock only when its holder has a pid in the namespace
-  // of the /proc being read, and /proc/PID is local to it. From another
-  // namespace a running sandbox's manifest looks exactly like one a dead
-  // process left.
+  // /proc/locks lists a lock only when its holder has a pid in the namespace of
+  // the /proc being read, and /proc/PID is local to it. From another namespace
+  // a running sandbox's manifest looks like one a dead process left.
 
   it.each([
     ['written in another PID namespace', 'kept', { ns: 'pid:[1]' }],
@@ -808,9 +791,8 @@ describe.if(isLinux)('The mount point manifests', () => {
     'is not kept live by a lock on a file with the same inode number on another filesystem',
     () => {
       // Inode numbers are per filesystem, and on a young tmpfs they are small.
-      // A manifest whose number some unrelated locked file shared read as
-      // live for as long as that lock was held: never released, and every
-      // path it named a mount point to every later wrap.
+      // A manifest that shares its number with an unrelated locked file on
+      // another filesystem must not read as live.
       leftover(X)
       const manifest = publishMountPointManifest([X], [])!.file
       const inode = statSync(manifest).ino
@@ -860,8 +842,8 @@ describe.if(isLinux)('The mount point manifests', () => {
     'are never kept under /dev, which the sandbox mounts afresh over them',
     () => {
       // bubblewrap opens the manifest after its mounts, and the wrap mounts a
-      // new /dev after every bind: a manifest under /dev is not there to be
-      // opened, and every command with a mount point refused to start.
+      // new /dev after every bind: a manifest under /dev would not be there to
+      // be opened.
       const shm = mkdtempSync(join(SHM, 'mount-point-manifests-'))
       chmodSync(shm, 0o700)
       try {
@@ -896,9 +878,8 @@ describe.if(isLinux)('The mount point manifests', () => {
   )
 
   it("are not kept behind a link planted at the directory's name, whose target is left as it was", () => {
-    // The name is predictable and sits where sandboxed commands commonly
-    // write. A link there is refused, not followed: its target is somebody's
-    // directory, and would have had its mode changed.
+    // The name is predictable and sits where sandboxed commands commonly write.
+    // A link there is refused, not followed.
     const target = join(BASE, 'somebody-elses')
     mkdirSync(target)
     chmodSync(target, 0o755)
@@ -918,8 +899,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     'go to a directory this process can write when the usual one is read-only from here',
     () => {
       // A process inside a sandbox sees the directory bound read-only. It is
-      // ours in every other respect, and used to be settled on, after which
-      // every wrap of that process failed to record its mount points.
+      // ours in every other respect, and must not be settled on.
       const elsewhere = TMP
       const published = inAChild(PUBLISH, {
         launcher: [
@@ -942,12 +922,10 @@ describe.if(isLinux)('The mount point manifests', () => {
     15000,
   )
 
-  // ---- what is read as a manifest ----------------------------------------
+  // ---- what is read as a manifest ----
   //
-  // Whatever ends in `.json` in the directory used to be opened as it stood:
-  // a link was followed to wherever it led, and a FIFO held the thread for
-  // good, in the wrap, in the clean-up and in the exit handler. Only a
-  // regular file of the user's, of a size a manifest can have, is one.
+  // Only a regular file of the user's, of a size a manifest can have, is read:
+  // a link is not followed and a FIFO is not opened.
 
   /** Thirty seconds old: nothing can be starting under it any more. */
   function aged(file: string): string {
@@ -1061,12 +1039,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     })
   }, 15000)
 
-  // ---- which mount points a running sandbox relies on --------------------
+  // ---- which mount points a running sandbox relies on ----
   //
-  // A caller that removes paths of its own accord after a command removes by
-  // path, and removing a mount point from under a running sandbox lifts the
-  // deny there. So it can ask first which paths to leave out, and what it is
-  // told to leave out is never more than an empty placeholder.
+  // A caller that removes paths itself after a command can ask first which to
+  // leave out. What it is told to leave out is never more than an empty
+  // placeholder.
 
   /** The set, as a sorted list. */
   function live(): string[] {
@@ -1200,10 +1177,9 @@ describe.if(isLinux)('The mount point manifests', () => {
   })
 
   it('holds what any manifest names while a manifest that cannot be read may have a sandbox under it', () => {
-    // What another version of this library wrote, say. What it names cannot
-    // be listed, and whether the sandboxes of the others are over cannot be
-    // told apart from it, for as long as the clean-up takes it to be live:
-    // while it is new, or a lock is on it.
+    // What another version of this library wrote, say. What it names cannot be
+    // listed, so while the clean-up takes it to be live every named path
+    // counts.
     const written = join(BASE, 'written-to')
     writeFileSync(written, 'mine')
     chmodSync(written, 0o444)
@@ -1328,8 +1304,7 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   it('does nothing at all where the platform is not Linux', () => {
     // Every clean-up after a command, on every platform, comes through here.
-    // Off Linux it made the directory and its lock each time, and on a
-    // platform with no uids a fresh temporary directory each time.
+    // Off Linux it must make nothing.
     leftover(X)
     manifestOfADeadProcess([X])
     const before = readdirSync(DIR).sort()

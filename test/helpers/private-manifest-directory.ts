@@ -10,19 +10,14 @@ import { cleanupBwrapMountPoints } from '../../src/sandbox/linux-sandbox-utils.j
  * point manifests, for as long as its tests run.
  *
  * The manifests of every srt process of a user live in one directory, and a
- * collect reads, judges and removes all of them. A test that lists that
- * directory, attacks it from inside a sandbox or asserts on what is left in it
- * would otherwise be doing so to whatever else that user is running on the
- * machine, and be failed by it in turn. `$XDG_RUNTIME_DIR` is where the library
- * looks first, and child processes inherit it, so pointing it at a fresh
- * directory moves this process and everything it spawns at once.
+ * collect reads, judges and removes all of them, so a test that lists or
+ * attacks that directory would otherwise act on whatever else the user is
+ * running. `$XDG_RUNTIME_DIR` is where the library looks first and child
+ * processes inherit it.
  *
  * It also starts the `describe` with no wrap of this process outstanding, and
- * leaves it so. The library counts the wraps it has handed out and releases
- * nothing of this process's until each has been cleaned up after; the count is
- * the module's, shared by every test file of one run, and other suites wrap
- * without cleaning up. A test that expects one clean-up to take its mount point
- * away would otherwise pass or fail by which file ran before it.
+ * leaves it so: the library's count of wraps is shared by every test file of a
+ * run, and other suites wrap without cleaning up.
  *
  * Call it inside the `describe` callback. Returns where the manifests go.
  */

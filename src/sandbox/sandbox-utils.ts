@@ -1176,7 +1176,9 @@ export interface ExpandGlobOptions {
    * A directory the pattern is walked beneath, taken as the name it is: a
    * leading run of `globPath` that exists on disk and may itself hold `[`,
    * `*` or `?`. Only what follows it is pattern. The glob dialect has no
-   * escape, so this is the one way to say where such a name ends.
+   * escape, so this is the one way to say where such a name ends. A
+   * `TypeError` is thrown for one that is empty or the root, or that
+   * `globPath` does not start with, up to a separator.
    */
   anchor?: string
 }
@@ -1553,11 +1555,23 @@ export function walkGlobPattern(
     anchor === undefined
       ? toForwardSlashes(normalizePathForSandbox(globPath))
       : toForwardSlashes(globPath).slice(anchor.length)
+  // The tail is cut by length, so a wrong anchor would walk another directory
+  // and hand back its matches. Thrown, not skipped: a skipped deny is lost.
+  if (
+    anchor !== undefined &&
+    (!/[^/]/.test(anchor) ||
+      !toForwardSlashes(globPath).startsWith(anchor) ||
+      !(anchor.endsWith('/') || /^(\/|$)/.test(normalizedPattern)))
+  ) {
+    throw new TypeError(
+      `Glob pattern ${globPath} does not lie beneath the anchor ${opts.anchor}`,
+    )
+  }
   const patternBaseDir = globPatternBaseDir(normalizedPattern)
   const baseDirBelowAnchor = patternBaseDir === '/' ? '' : patternBaseDir
   const baseDir =
     anchor === undefined ? patternBaseDir : anchor + baseDirBelowAnchor
-  if (anchor === undefined && (baseDir === '' || baseDir === '/')) {
+  if (baseDir === '' || baseDir === '/') {
     logForDebugging(
       `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
       { level: 'warn' },

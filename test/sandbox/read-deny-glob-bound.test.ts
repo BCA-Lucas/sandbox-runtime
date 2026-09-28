@@ -718,6 +718,7 @@ describe('the filesystem.denyReadGlobBudget option', () => {
       { maxEntries: 1.5 },
       { maxEntries: '1000' },
       { maxEntries: Infinity },
+      { maxEntires: 1 },
       { timeoutMs: 0 },
       { timeoutMs: 0.5 },
       { timeoutMs: null },

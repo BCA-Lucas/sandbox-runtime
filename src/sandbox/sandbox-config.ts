@@ -914,6 +914,7 @@ export const FilesystemConfigSchema = z.object({
       maxEntries: z.number().int().positive().optional(),
       timeoutMs: z.number().int().positive().optional(),
     })
+    .strict()
     .optional()
     .describe(
       'Linux: what expanding the denyRead globs of one configuration may spend, all of them together, ' +

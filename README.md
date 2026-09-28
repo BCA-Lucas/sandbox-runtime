@@ -532,6 +532,10 @@ srt "jest --no-watchman"
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
 
+**Exit status under zsh (Linux):** From the first release after v0.0.77, a wrap that restricts the network reports the wrapped command's own exit status when `binShell` is zsh. Up to v0.0.77 a failing command could report 0 there: the wrapper's cleanup trap ended with a bare `exit`, which zsh resolves to the status of the trap's last command. bash (the default) and dash were not affected.
+
+**zod 4 in the same dependency tree:** The `zod` dependency range is `^3.25.0`. The library imports `zod/v3`, which exists from zod 3.25 on, so that it keeps the v3 API where a dependency tree resolves `zod` to version 4.
+
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
@@ -775,7 +779,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+**Note (Linux):** A mandatory deny path that does not exist yet is blocked as well. bubblewrap covers it with a read-only `/dev/null`, or mounts an empty read-only directory at the first missing intermediate component, and those host mount points are removed by `cleanupAfterCommand()` — see "Write denies on paths that do not exist yet (Linux)" above. macOS uses glob patterns, which cover existing and new files alike.
 
 **Note (Windows):** Windows applies the same list, resolved against the working directory, as a session-wide deny stamp at `initialize()` — so `allowWrite: ["."]` does not make `.git/hooks/pre-commit` or `.bashrc` writable there either, and `filesystem.allowGitConfig` lifts the `.git/config` deny the same way it does elsewhere. Two things are narrower than on Linux and macOS:
 
@@ -900,5 +904,3 @@ Users should be aware of potential risks that come from allowing broad domains l
 **Future improvements:**
 
 - **Proxychains support**: Add support for `proxychains` with `LD_PRELOAD` on Linux to intercept network calls at a lower level, making bypass more difficult
-
-- **Linux violation monitoring**: Implement automatic `strace`-based violation detection for Linux, integrated with the violation store. Currently, Linux users must manually run `strace` to see violations, unlike macOS which has automatic violation monitoring via the system log store

@@ -751,10 +751,9 @@ export type LinuxSandboxProfileErrorCode =
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
   /**
-   * The `denyRead` patterns could not be expanded within their budget of
-   * directory entries and time, so which paths to hide is not known. The
-   * error on `.cause` names the pattern, the directory being listed and what
-   * had been spent.
+   * The `denyRead` patterns could not be expanded within their budget, so
+   * which paths to hide is not known. The error on `.cause` names the
+   * pattern, the directory being listed and what had been spent.
    */
   | 'deny_glob_too_large'
 

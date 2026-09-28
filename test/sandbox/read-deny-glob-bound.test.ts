@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
-// The namespace the library binds, so a spy on it is seen by the code under
-// test.
+// The namespace the library binds, so the code under test sees a spy on it.
 import * as sandboxUtils from '../../src/sandbox/sandbox-utils.js'
 import {
   mkdirSync,
@@ -29,8 +28,7 @@ import { countMounts } from '../helpers/bwrap-argv.js'
 
 /**
  * `root/start/next -> ../pool/d1`, `pool/d1/next -> ../d2` and so on, each
- * `pool/d<i>` holding a `.env`: `links` directories that nothing but the link
- * before them leads to from `start`.
+ * `pool/d<i>` holding a `.env`: `links` directories only the links lead to.
  */
 function plantChain(root: string, links: number): void {
   mkdirSync(join(root, 'start'), { recursive: true })
@@ -58,9 +56,8 @@ function thrownBy(fn: () => unknown): unknown {
 describe.if(!isWindows)(
   'a read-deny glob and a link to a directory beside the project',
   () => {
-    // project/out -> ../outside, and outside/deep/.env: `project/**/.env`
-    // matches the file as project/out/deep/.env, and no other name for it
-    // lies under the project.
+    // project/out -> ../outside, which holds deep/.env: `project/**/.env`
+    // matches that file as project/out/deep/.env and under no other name.
     let ROOT: string
     let project: string
     let secret: string
@@ -159,8 +156,7 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     expect(GLOB_WALK_TIMEOUT_MS).toBe(10_000)
     const budget = newGlobWalkBudget()
     expect(budget.maxEntries).toBe(2_000_000)
-    // Rounded: the deadline is a clock reading plus ten seconds, and a
-    // floating-point sum less the reading need not be ten seconds exactly.
+    // Rounded: a floating-point sum less its first term need not be exact.
     expect(Math.round(budget.deadline - budget.startedAt)).toBe(10_000)
     expect(budget.entries).toBe(0)
   })
@@ -194,15 +190,12 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     const budgetError = error as GlobWalkBudgetError
     expect(budgetError.exhausted).toBe('entries')
     expect(budgetError.pattern).toBe(pattern)
-    // The directory it was in when the count ran out, which is one of the
-    // tree's own.
     expect(budgetError.directory.startsWith(TREE + '/')).toBe(true)
     expect(budgetError.entries).toBe(TREE_ENTRIES)
     expect(budgetError.maxEntries).toBe(TREE_ENTRIES - 1)
     expect(budgetError.elapsedMs).toBeGreaterThanOrEqual(0)
     expect(budgetError.message).toContain(pattern)
     expect(budgetError.message).toContain(budgetError.directory)
-    // The walk itself throws the same, whoever calls it.
     expect(() =>
       walkGlobPattern(pattern, {
         budget: newGlobWalkBudget({ maxEntries: 5 }),
@@ -230,11 +223,9 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
   })
 
   it('throws when the deadline passes while it walks', () => {
-    // A clock that moves a second each time it is read, and the walk reads
-    // it before each listing and at each entry. The budget is made at 1 s;
-    // the tree and its twelve entries take the readings up to 14 s, and each
-    // of the first two directories beneath it five more, up to 24 s. The
-    // next reading, before the third is listed, is past the deadline.
+    // A clock that moves a second each time it is read. The budget is made at
+    // 1 s, the tree and the first two directories beneath it take the readings
+    // to 24 s, and the next, before the third is listed, is past the deadline.
     let now = 0
     const clock = spyOn(performance, 'now').mockImplementation(
       () => (now += 1000),
@@ -255,11 +246,9 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
   })
 
   it('throws inside a directory of few entries, at the entry the deadline passes on', () => {
-    // The clock is read at every entry, not every so many: a name can be
-    // slow to match, and a directory of forty such names must not be walked
-    // to its end long after the time is up. One reading a second again: the
-    // budget is made at 1 s, the listing is at 2 s, and the fourth entry, at
-    // 6 s, is past the deadline.
+    // The clock is read at every entry, not every so many, so a directory of
+    // slow names is not walked to its end. One reading a second again: the
+    // fourth entry, at 6 s, is past the deadline.
     const few = join(ROOT, 'few')
     mkdirSync(few)
     for (let f = 0; f < 40; f++) writeFileSync(join(few, `f${f}`), '')
@@ -294,8 +283,7 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
     ).toHaveLength(12)
     expect(budget.entries).toBe(TREE_ENTRIES)
 
-    // The second tree fits a budget of its own, and does not fit what the
-    // first expansion left of this one.
+    // The second tree fits a fresh budget, and not what is left of this one.
     expect(
       expandReadDenyGlobLinux(join(second, '**/.env'), [], undefined, {
         budget: newGlobWalkBudget({ maxEntries: TREE_ENTRIES + 10 }),
@@ -312,9 +300,8 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
   })
 
   it('throws on a tree that only links inside it lead through', () => {
-    // start/next -> ../pool/d1, d1/next -> ../d2, …: a tree a command
-    // allowed to write there can make as long as it likes. `start*` names
-    // start alone, so nothing but the links leads into pool.
+    // A tree a command allowed to write there can make as long as it likes.
+    // `start*` names start alone, so nothing but the links leads into pool.
     const chain = join(ROOT, 'chain')
     const links = 40
     plantChain(chain, links)
@@ -341,8 +328,7 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
   })
 
   it('is spent on what a link to a directory beside the project leads to', () => {
-    // linked/bigtree -> tree: the link is the one entry under the directory
-    // the pattern starts from, and what it leads to holds sixty.
+    // linked/bigtree -> tree: one entry under the base, sixty behind the link.
     const proj = join(ROOT, 'linked')
     mkdirSync(proj)
     symlinkSync(join('..', 'tree'), join(proj, 'bigtree'))
@@ -370,11 +356,9 @@ describe.if(!isWindows)('the budget of a glob walk', () => {
   })
 
   it('does not take a spent budget for a directory that could not be listed', () => {
-    // An error from the listing itself marks the directory to be denied as
-    // a whole; the budget's error is not one of those, whether the entries
-    // ran out or the time did. The time is looked at right before each
-    // listing: taken for a listing that failed, it would deny the tree as a
-    // whole and hand that back.
+    // A listing that fails marks its directory to be denied whole. A spent
+    // budget, found right before a listing or at an entry, is not one of
+    // those: taken for one, it would deny the tree whole and hand that back.
     for (const limits of [{ maxEntries: 20 }, { timeoutMs: 0 }]) {
       const unlistable = new Set<string>()
       let mounts: string[] | undefined
@@ -482,8 +466,7 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
     const cause = profileError.cause as GlobWalkBudgetError
     expect(cause.exhausted).toBe('entries')
     expect(profileError.message).toContain(cause.directory)
-    // What a caller builds its own message from, read off `.cause` as plain
-    // fields: it needs neither the class nor the text of the message.
+    // Plain fields on `.cause`: a caller needs neither the class nor the text.
     const fields: Record<string, unknown> = { ...cause }
     expect(fields).toEqual({
       name: 'GlobWalkBudgetError',
@@ -553,8 +536,7 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
       `--ro-bind /dev/null ${join(chain, 'pool', 'd30', '.env')}`,
     )
 
-    // chain itself holds two entries: the rest of the twenty go on what the
-    // links lead to.
+    // chain itself holds two entries: the rest are spent behind the links.
     const { wrapped, error } = await withBudgetOf({ maxEntries: 20 }, () =>
       wrapOf([pattern]),
     )

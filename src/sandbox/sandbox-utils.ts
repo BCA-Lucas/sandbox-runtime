@@ -1137,19 +1137,16 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
-/**
- * The most directory entries the read-deny expansions of one read
- * configuration look at, all its patterns together.
- */
+/** The most directory entries the read-deny expansions of one read
+ *  configuration look at, all its patterns together. */
 export const GLOB_WALK_MAX_ENTRIES = 2_000_000
 
 /** The longest they take, all together, in milliseconds. */
 export const GLOB_WALK_TIMEOUT_MS = 10_000
 
 /**
- * What the walks handed it may spend between them. One budget is meant to be
- * shared: every walk draws on the same count and the same deadline, so the
- * patterns of one configuration cannot each spend a full one.
+ * What the walks handed it may spend between them: one count and one
+ * deadline, so the patterns of one configuration cannot each spend a full one.
  */
 export interface GlobWalkBudget {
   /** The directory entries the walks may look at, together. */
@@ -1176,9 +1173,8 @@ export function newGlobWalkBudget(
 }
 
 /**
- * Thrown by {@link walkGlobPattern} when its budget runs out. What the walk
- * had found by then is not handed back: for a deny expansion, a list cut
- * short is a path left readable.
+ * Thrown by {@link walkGlobPattern} when its budget runs out. What it had
+ * found is not handed back: a deny list cut short is a path left readable.
  */
 export class GlobWalkBudgetError extends Error {
   /** The pattern being walked, as the caller wrote it. */
@@ -1187,8 +1183,7 @@ export class GlobWalkBudgetError extends Error {
   readonly directory: string
   /** Which limit was reached. */
   readonly exhausted: 'entries' | 'time'
-  /** The directory entries looked at under the budget, by this walk and the
-   *  ones before it. */
+  /** The entries looked at under the budget, by this walk and those before. */
   readonly entries: number
   /** Milliseconds since the budget was made. */
   readonly elapsedMs: number
@@ -1569,10 +1564,8 @@ export function toForwardSlashes(s: string): string {
  * With `followSymlinkedDirectories` it also lists through a symlinked
  * directory and reports every match where it really lives.
  *
- * With a `budget` the walk throws {@link GlobWalkBudgetError} once the budget
- * is spent, and returns nothing. The clock is read before each listing and
- * at each entry, so what is not cut short is one step: a filesystem call
- * that blocks, or a name that is slow to match.
+ * With a `budget` it throws {@link GlobWalkBudgetError} once that is spent.
+ * One step is not cut short: a filesystem call that blocks, or a slow match.
  */
 export function walkGlobPattern(
   globPath: string,
@@ -1649,10 +1642,8 @@ export function walkGlobPattern(
   const listings = new Map<string, fs.Dirent[]>()
   const pending: Frame[] = []
   /** Counts one more entry of `dir` looked at, or none before a listing, and
-   *  throws once the budget is spent. The clock is read every time, before
-   *  each listing and at each entry: what an entry costs is not bounded (a
-   *  name can be slow to match, a link slow to resolve), so a stride of
-   *  entries between readings would be no bound on the time either. Called
+   *  throws once the budget is spent. The clock is read every time: what one
+   *  entry costs is not bounded, so a stride would not bound the time. Called
    *  outside every `try` here, so a spent budget is never taken for a
    *  directory that could not be listed. */
   const spend = (dir: string, entries: 0 | 1): void => {

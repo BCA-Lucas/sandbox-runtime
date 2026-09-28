@@ -1309,13 +1309,9 @@ function expandAllowReadGlob(pattern: string): string[] {
 }
 
 /**
- * The expansion of every denyRead glob of one read configuration, on Linux.
- * The patterns share one budget of directory entries and time, so a
- * configuration costs at most that however many patterns it holds. When the
- * budget runs out the returned function throws
- * {@link LinuxSandboxProfileError} `deny_glob_too_large`: there is no deny
- * list to go on with, since one cut short leaves readable what the pattern
- * was written to hide.
+ * The expansion of every denyRead glob of one read configuration, on Linux,
+ * all on one budget. When it runs out the returned function throws
+ * {@link LinuxSandboxProfileError} `deny_glob_too_large`.
  */
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
@@ -1350,8 +1346,7 @@ function readDenyGlobExpander(
  * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
  * `denyOnly` is only sound alongside that write config and must not be handed
  * to wrapCommandWithSandboxLinux with a different one. Throws
- * {@link LinuxSandboxProfileError} `deny_glob_too_large` when the globs
- * cannot be expanded within their budget, as the wrap does.
+ * {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {

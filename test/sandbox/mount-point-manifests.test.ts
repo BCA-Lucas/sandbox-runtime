@@ -23,9 +23,11 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import {
   collectMountPoints,
+  discardMountPointManifest,
   forgetMountPointManifestDirectory,
   liveMountPoints,
   namedMountPoints,
+  type NamedMountPoints,
   publishMountPointManifest,
 } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
@@ -169,10 +171,18 @@ describe.if(isLinux)('The mount point manifests', () => {
     return manifest.file
   }
 
+  /** A reading that is not in doubt. */
+  function reads(
+    reading: ReturnType<typeof namedMountPoints>,
+  ): NamedMountPoints {
+    if ('inDoubt' in reading) throw new Error(reading.inDoubt)
+    return reading
+  }
+
   /** What a wrap is told the manifests name, sorted; `undefined` in doubt. */
   function named(): string[] | undefined {
     const reading = namedMountPoints()
-    return reading && [...reading.paths].sort()
+    return 'inDoubt' in reading ? undefined : [...reading.paths].sort()
   }
 
   /** The claims in the manifest directory, by name. */
@@ -311,6 +321,32 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(removed).toEqual([])
     expect(existsSync(X)).toBe(true)
   }, 15000)
+
+  it('removes what a pass spared on the word of a manifest whose wrap then comes to nothing', () => {
+    // The pass drops the finished manifest, so the newcomer alone names the
+    // path from then on: merely unlinked, it would leave the path for good.
+    const Y = join(BASE, 'second.lock')
+    leftover(X)
+    leftover(Y)
+    manifestOfADeadProcess([X, Y])
+    let newcomer: string | undefined
+    const pass = duringTheNextPass(() => (newcomer = publish([X, Y])))
+    try {
+      expect(collectMountPoints('none')).toEqual([])
+    } finally {
+      pass.restore()
+    }
+    expect(readdirSync(DIR)).toEqual([basename(newcomer!)])
+
+    const live = started(manifestOfADeadProcess([Y]), thisProcess())
+    discardMountPointManifest(newcomer!)
+    expect(existsSync(X)).toBe(false)
+    // What another manifest names as well is that one's to keep.
+    expect(existsSync(Y)).toBe(true)
+    expect(readdirSync(DIR).sort()).toEqual(
+      [live, recordOf(live)].map(file => basename(file)).sort(),
+    )
+  })
 
   it.if(NOT_ROOT)(
     'keeps the manifest of a mount point it could not remove, for a pass that can',
@@ -975,6 +1011,12 @@ describe.if(isLinux)('The mount point manifests', () => {
   function write(file: string, text = ''): void {
     writeFileSync(file, text, { mode: 0o600 })
   }
+  if (NOT_ROOT) {
+    notARecord.push([
+      'one its owner may not read',
+      r => writeFileSync(r, gone(), { mode: 0 }),
+    ])
+  }
   for (const [what, plant] of notARecord) {
     it(`keeps what a manifest names while its record is ${what}`, () => {
       leftover(X)
@@ -1076,6 +1118,46 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(named()).toEqual([X])
     expect(collectMountPoints()).toEqual([X])
     expect(readdirSync(DIR)).toEqual([basename(young)])
+  })
+
+  for (const [what, plant] of notARecord) {
+    it(`is not held up by a record with no manifest that is ${what}`, () => {
+      // It refuses every wrap of the user for as long as it counts.
+      leftover(X)
+      manifestOfADeadProcess([X])
+      const orphan = join(DIR, '4242-0123456789abcdef.started')
+      plant(orphan)
+      const looked = inAChild(
+        `console.log(JSON.stringify({ named: [...m.namedMountPoints().paths], held: [...m.liveMountPoints()], removed: m.collectMountPoints() }))`,
+      )
+      expect(looked.status).toBe(0)
+      expect(looked.ms).toBeLessThan(AT_ONCE_MS)
+      expect(JSON.parse(looked.stdout)).toEqual({
+        named: [X],
+        held: [],
+        removed: [X],
+      })
+      // Dropped, where it can be.
+      expect(readdirSync(DIR)).toEqual(
+        what === 'a directory' ? [basename(orphan)] : [],
+      )
+    }, 15000)
+  }
+
+  it('removes nothing, however old it is, while a record with no manifest cannot be read for want of a descriptor', () => {
+    // That says nothing of the record: its manifest may be passing from one
+    // name to the other with a sandbox on it.
+    leftover(X)
+    manifestOfADeadProcess([X])
+    const orphan = join(DIR, '4242-0123456789abcdef.started')
+    write(orphan, gone())
+    const longAgo = new Date(Date.now() - MONTH_MS)
+    utimesSync(orphan, longAgo, longAgo)
+    expect(withThat(failing(orphan, 'EMFILE'))).toEqual({
+      removed: [],
+      held: undefined,
+    })
+    expect(existsSync(orphan)).toBe(true)
   })
 
   /** Hides `name` from the next listing of the manifest directory. */
@@ -1702,10 +1784,13 @@ describe.if(isLinux)('The mount point manifests', () => {
   // names paths nobody can list, so while it may have a sandbox under it
   // nothing at all is removed.
 
-  /** Two hours old: past the hour for which what is no manifest counts as live. */
-  function aged(file: string): string {
-    const hoursAgo = new Date(Date.now() - 2 * 3600 * 1000)
-    lutimesSync(file, hoursAgo, hoursAgo)
+  /**
+   * `minutes` old, two hours unless said: past the hour for which what is no
+   * manifest counts as live.
+   */
+  function aged(file: string, minutes = 120): string {
+    const then = new Date(Date.now() - minutes * 60 * 1000)
+    lutimesSync(file, then, then)
     return file
   }
 
@@ -1750,12 +1835,20 @@ describe.if(isLinux)('The mount point manifests', () => {
             .replace('"sources":[]', '"origins":[]'),
         ),
     ],
+    ['an empty file', name => writeFileSync(name, '')],
     ['a directory', name => mkdirSync(name)],
     [
       'a FIFO nobody writes to',
       name => expect(spawnSync('mkfifo', [name]).status).toBe(0),
     ],
   ]
+  if (NOT_ROOT) {
+    notAManifest.push([
+      'a manifest its owner may not read',
+      (name, paths) =>
+        writeFileSync(name, finishedManifestText(paths), { mode: 0 }),
+    ])
+  }
   for (const [what, plant] of notAManifest) {
     it(`removes nothing beside ${what} until it is an hour old, and passes over it then`, () => {
       const Y = join(BASE, 'second.lock')
@@ -1786,13 +1879,34 @@ describe.if(isLinux)('The mount point manifests', () => {
       writeFileSync(recordOf(junk), statLine(thisProcess()))
       expect(look()).toEqual(inDoubt)
 
-      rmSync(recordOf(junk))
+      // A record that names no process to ask after puts nothing off.
+      writeFileSync(recordOf(junk), 'ended\n')
       expect(look()).toEqual({ named: [Y], held: [], removed: [Y] })
       expect(existsSync(X)).toBe(true)
       // Dropped, where it is a file that can be.
       expect(existsSync(junk)).toBe(what === 'a directory')
     }, 30000)
   }
+
+  it.each(['version', 'pid', 'start', 'created', 'paths', 'sources'])(
+    'does not take for a manifest what holds no `%s`',
+    field => {
+      // A later version is read by the fields this one knows, so each of them
+      // has to be there: read without one, it would name nothing or be live
+      // for nobody.
+      const Y = join(BASE, 'second.lock')
+      leftover(X)
+      leftover(Y)
+      manifestOfADeadProcess([X], { [field]: undefined })
+      manifestOfADeadProcess([Y])
+
+      expect(named()).toBeUndefined()
+      expect(liveMountPoints()).toBeUndefined()
+      expect(collectMountPoints()).toEqual([])
+      expect(existsSync(X)).toBe(true)
+      expect(existsSync(Y)).toBe(true)
+    },
+  )
 
   it("removes nothing beside a manifest that is somebody else's until it is an hour old, and passes over it then", () => {
     const Y = join(BASE, 'second.lock')
@@ -1804,7 +1918,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     try {
       expect(named()).toBeUndefined()
       expect(collectMountPoints()).toEqual([])
-      aged(junk)
+      // An hour, not less and not much more.
+      aged(junk, 59)
+      expect(named()).toBeUndefined()
+      expect(collectMountPoints()).toEqual([])
+      aged(junk, 61)
       expect(collectMountPoints()).toEqual([Y])
     } finally {
       theirs.restore()
@@ -1951,14 +2069,15 @@ describe.if(isLinux)('The mount point manifests', () => {
       leftover(X)
       const manifest = started(manifestOfADeadProcess([X]), thisProcess())
       expect(live()).toEqual([X])
-      const earlier = namedMountPoints()
+      const earlier = reads(namedMountPoints())
       const injected = inject(manifest)
+      const doubt = { inDoubt: expect.stringContaining(DIR) }
       try {
         expect(liveMountPoints()).toBeUndefined()
-        expect(namedMountPoints()).toBeUndefined()
+        expect(namedMountPoints()).toEqual(doubt)
         // A manifest already read is not read again, so that is no doubt.
         if (!what.startsWith('a manifest')) {
-          expect(namedMountPoints(earlier)).toBeUndefined()
+          expect(namedMountPoints(earlier)).toEqual(doubt)
         }
       } finally {
         injected.restore()
@@ -1981,7 +2100,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   it('answers a wrap with an earlier reading while the directory lists nothing new, and reads again when it does', () => {
     const [Y, Z] = [join(BASE, 'second.lock'), join(BASE, 'third.lock')]
     manifestOfADeadProcess([X])
-    const first = namedMountPoints()!
+    const first = reads(namedMountPoints())
     const open = spyOn(fs, 'openSync')
     try {
       expect(namedMountPoints(first)).toBe(first)
@@ -1992,9 +2111,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     // The caller knows what it has published itself.
     const own = publish([Y])
     expect(namedMountPoints(first, own)).toBe(first)
-    expect([...namedMountPoints(first)!.paths].sort()).toEqual([X, Y].sort())
+    expect([...reads(namedMountPoints(first)).paths].sort()).toEqual(
+      [X, Y].sort(),
+    )
     manifestOfADeadProcess([Z])
-    expect([...namedMountPoints(first, own)!.paths].sort()).toEqual(
+    expect([...reads(namedMountPoints(first, own)).paths].sort()).toEqual(
       [X, Y, Z].sort(),
     )
   })

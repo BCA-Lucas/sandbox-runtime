@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
+import { basename } from 'node:path'
 import { quote } from '../../src/utils/shell-quote.js'
 
 /** The $0 renderBwrapInvocation gives the shell that opens an over-long
@@ -11,7 +12,9 @@ const ARGS_FILE_ARGV0 = 'srt-args'
  * this host: bash where it is at one of its two usual places, else /bin/sh.
  */
 export const STEP_SHELL = ((): string => {
-  const bash = ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell))
+  const bash =
+    ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell)) ??
+    ['/bin/sh'].find(shell => basename(realpathSync(shell)) === 'bash')
   return bash === undefined ? '/bin/sh -c' : `${bash} -p -c`
 })()
 

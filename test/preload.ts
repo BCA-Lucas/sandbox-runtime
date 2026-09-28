@@ -10,9 +10,14 @@ import { join } from 'node:path'
 // that lists or attacks the manifests takes its own on top of these (see
 // helpers/private-manifest-directory.ts).
 if (process.platform === 'linux') {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'srt-run-')))
-  for (const name of ['XDG_RUNTIME_DIR', 'TMPDIR']) {
-    process.env[name] = join(base, name)
+  // Short names: suites keep Unix sockets beneath these, and a socket's path is
+  // limited to 108 bytes.
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'srt-')))
+  for (const [name, dir] of [
+    ['XDG_RUNTIME_DIR', 'x'],
+    ['TMPDIR', 't'],
+  ] as const) {
+    process.env[name] = join(base, dir)
     mkdirSync(process.env[name], { mode: 0o700 })
   }
   // Once, after the last test file.

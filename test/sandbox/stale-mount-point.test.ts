@@ -505,7 +505,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       const left = lstatSync(LOCK)
       expect(left.isFile()).toBe(true)
       expect(left.size).toBe(0)
-      expect(left.mode & 0o222).toBe(0)
+      // Its mode is bubblewrap's own: 0444 from 0.5.0 on, with write bits before.
+      expect(left.nlink).toBe(1)
 
       const command = await wrap(
         [LOCK],

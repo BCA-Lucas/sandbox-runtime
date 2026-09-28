@@ -13,6 +13,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -722,6 +723,56 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     },
   )
 
+  for (const [sh, begins] of [
+    ['/nix/store/bash-5.2/bin/bash', `/bin/sh -p -c '`],
+    ['/usr/bin/dash', `/bin/sh -c '`],
+  ] as const) {
+    it(`takes them in /bin/sh where bash is at neither, which is ${sh}: ${begins}`, async () => {
+      const access = fs.accessSync
+      const realpath = fs.realpathSync
+      const spies = [
+        spyOn(fs, 'accessSync').mockImplementation(((
+          file: unknown,
+          mode: unknown,
+        ) => {
+          if (file === '/bin/bash' || file === '/usr/bin/bash') {
+            throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+          }
+          return (access as (...args: unknown[]) => void)(file, mode)
+        }) as never),
+        spyOn(fs, 'realpathSync').mockImplementation(((
+          file: unknown,
+          ...rest: unknown[]
+        ) =>
+          file === '/bin/sh'
+            ? sh
+            : (realpath as (...args: unknown[]) => string)(
+                file,
+                ...rest,
+              )) as never),
+      ]
+      try {
+        // The shell is found once, so in a copy of the library of its own.
+        const fresh = (await import(
+          `${JSON.parse(LIBRARY)}?${basename(sh)}`
+        )) as {
+          wrapCommandWithSandboxLinux: typeof wrapCommandWithSandboxLinux
+        }
+        expect(
+          await fresh.wrapCommandWithSandboxLinux({
+            command: 'true',
+            binShell: 'sh',
+            needsNetworkRestriction: false,
+            readConfig: { denyOnly: [] },
+            writeConfig: { allowOnly: [AREA], denyWithinAllow: [LOCK] },
+          }),
+        ).toStartWith(begins)
+      } finally {
+        spies.forEach(spy => spy.mockRestore())
+      }
+    })
+  }
+
   it.if(BWRAP_CAN_NAMESPACE && BASH !== undefined)(
     'hands the command every entry of the environment, whatever its name',
     async () => {
@@ -1086,6 +1137,9 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     writeFileSync(LOCK, '')
     chmodSync(LOCK, 0o444)
     const theirs = manifestNaming([LOCK], process.pid)
+    // However old it is: what this process is short of says nothing of the file.
+    const hoursAgo = new Date(Date.now() - 2 * 3600 * 1000)
+    utimesSync(theirs, hoursAgo, hoursAgo)
     const open = fs.openSync
     const spy = spyOn(fs, 'openSync').mockImplementation(((
       file: unknown,
@@ -1097,12 +1151,67 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
       return (open as (...args: unknown[]) => number)(file, ...rest)
     }) as never)
     try {
-      expect(await refusal(wrap('true'))).toBe('mount_points_unreadable')
+      const wrapping = wrap('true')
+      expect(await refusal(wrapping)).toBe('mount_points_unreadable')
+      // It refuses every wrap while it lasts, so it says which file and why.
+      const said = (await wrapping.catch((e: unknown) => e)) as Error
+      for (const where of [said.message, said.cause]) {
+        expect(where).toContain(theirs)
+        expect(where).toContain('EMFILE')
+      }
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(LOCK)).toBe(true)
     } finally {
       spy.mockRestore()
     }
     expect(readdirSync(dirname(theirs))).toEqual([basename(theirs)])
     expect(await wrap('true')).toContain(`--ro-bind /dev/null ${LOCK}`)
+  })
+
+  it('plans again, and does not call the manifests unreadable, when they keep moving while it reads them', async () => {
+    // Other processes are busy, in whatever project: listed, and gone when
+    // opened, is what a manifest claimed, given back or collected looks like.
+    writeFileSync(LOCK, '')
+    const theirs = manifestNaming([LOCK], process.pid)
+    const open = fs.openSync
+    let [opens, elusiveFor] = [0, Infinity]
+    const spy = spyOn(fs, 'openSync').mockImplementation(((
+      file: unknown,
+      ...rest: unknown[]
+    ) => {
+      if (file === theirs && opens++ < elusiveFor) {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      }
+      return (open as (...args: unknown[]) => number)(file, ...rest)
+    }) as never)
+    try {
+      expect(await refusal(wrap('true'))).toBe('mount_points_changed')
+      expect(readdirSync(dirname(theirs))).toEqual([basename(theirs)])
+      const inOnePlan = opens / 3
+      // Which planning again does not mend where something else is amiss too.
+      const junk = join(dirname(theirs), '4242-00.json')
+      writeFileSync(junk, 'no manifest')
+      expect(await refusal(wrap('true'))).toBe('mount_points_unreadable')
+      rmSync(junk)
+      ;[opens, elusiveFor] = [0, inOnePlan]
+      expect(await wrap('true')).toContain(`--ro-bind /dev/null ${LOCK}`)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('is not asked of a wrap that restricts no write, which has no mount point', async () => {
+    mkdirSync(runtime.manifestDir(), { recursive: true, mode: 0o700 })
+    writeFileSync(join(runtime.manifestDir(), '4242-00.json'), 'no manifest')
+    expect(await refusal(wrap('true'))).toBe('mount_points_unreadable')
+    expect(
+      await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [AREA] },
+        writeConfig: undefined,
+      }),
+    ).toContain(`--tmpfs ${AREA}`)
   })
 
   it('refuses to wrap what needs a manifest larger than can be read, and publishes none', async () => {
@@ -1151,6 +1260,27 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     expect(made).toBe(true)
     expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
     expect(command).not.toContain(`--ro-bind ${LOCK} ${LOCK}`)
+    expect(readFileSync(manifestOf(command), 'utf8')).toContain(LOCK)
+  })
+
+  it("is named by a wrap that took it for the caller's own file, another sandbox having made it again meanwhile", async () => {
+    // No manifest named it when the wrap read them: the one that had was
+    // collected. Not named, it would go with the sandbox that made it again.
+    writeFileSync(LOCK, '')
+    const exists = fs.existsSync
+    let theirs: string | undefined
+    const spy = spyOn(fs, 'existsSync').mockImplementation(((file: unknown) => {
+      if (file === LOCK) theirs ??= manifestNaming([LOCK], process.pid)
+      return exists(file as string)
+    }) as never)
+    let command: string
+    try {
+      command = await wrap('true')
+    } finally {
+      spy.mockRestore()
+    }
+    expect(theirs).toBeDefined()
+    expect(command).toContain(`--ro-bind ${LOCK} ${LOCK}`)
     expect(readFileSync(manifestOf(command), 'utf8')).toContain(LOCK)
   })
 
@@ -1546,7 +1676,8 @@ describe.if(isLinux)(
 
     /**
      * Has a process wrap the held command, start it and go, and checks the
-     * premise: that process is gone and its sandbox is running.
+     * premise: that process is gone, its sandbox is running, and its manifest
+     * is past the grace.
      */
     async function sandboxWhoseWriterHasGone(
       leave: string,
@@ -1568,6 +1699,17 @@ describe.if(isLinux)(
       expect(existsSync(`/proc/${info.writer}`)).toBe(false)
       expect(existsSync(SIGNAL)).toBe(true)
       expect(runningTree(info.launcher).length).toBeGreaterThan(1)
+      // Past its grace, or the grace is what keeps the manifest live and not
+      // the process on its record.
+      const manifest = recordedBy(info.wrapped)
+      expect(manifest).toBeDefined()
+      const { created } = JSON.parse(readFileSync(manifest!, 'utf8')) as {
+        created: number
+      }
+      await waitFor(
+        'the manifest to be past its grace',
+        () => Date.now() - created > 750,
+      )
       return info
     }
 
@@ -2075,6 +2217,48 @@ describe.if(isLinux)(
       90000,
     )
 
+    it.if(BWRAP_CAN_NAMESPACE)(
+      'covers all that is denied in it, though another sandbox makes it while the wrap goes from one deny to the next',
+      async () => {
+        // Absent for the first deny and there for the second, it would be
+        // planned as an empty read-only directory and, inside that, a mount
+        // point bubblewrap cannot make.
+        const OTHER = join(DIRECTORY, 'agents')
+        const first = await wrap('true', [LEAF, OTHER])
+        const lstat = fs.lstatSync
+        let ran = false
+        const spy = spyOn(fs, 'lstatSync').mockImplementation(((
+          file: unknown,
+          ...rest: unknown[]
+        ) => {
+          // The first deny is judged: the wrap looks at what it will bind from.
+          if (String(file).includes('claude-empty-') && !ran) {
+            ran = true
+            expect(run(first).status).toBe(0)
+            expect(existsSync(DIRECTORY)).toBe(true)
+          }
+          return (lstat as (...args: unknown[]) => unknown)(file, ...rest)
+        }) as never)
+        let second: string
+        try {
+          second = await wrap(`touch ${LEAF} ${OTHER}; echo rc=$?`, [
+            LEAF,
+            OTHER,
+          ])
+        } finally {
+          spy.mockRestore()
+        }
+        expect(ran).toBe(true)
+        expect(namedBy(second)).toEqual([DIRECTORY])
+        expect(run(second)).toMatchObject({ status: 0, stdout: 'rc=1\n' })
+
+        cleanupBwrapMountPoints()
+        cleanupBwrapMountPoints()
+        expect(readdirSync(join(AREA, 'proj'))).toEqual([])
+      },
+      90000,
+    )
+
     /** Runs `then` each time the wrap is about to publish a manifest. */
     function atEachPublish(then: () => void): { restore(): void } {
       const write = fs.writeFileSync
@@ -2088,42 +2272,223 @@ describe.if(isLinux)(
       return { restore: () => spy.mockRestore() }
     }
 
-    it('plans again when the directory has gone by the time its manifest is published', async () => {
-      // Until then nothing of this wrap's names it, and a clean-up in another
-      // process takes it away with the sandbox it was made for.
-      mkdirSync(DIRECTORY)
-      const left = manifestOfAKilledProcess([DIRECTORY])
-      let published = 0
-      const publishing = atEachPublish(() => {
-        if (published++ === 0) {
-          fs.rmdirSync(DIRECTORY)
-          rmSync(left)
+    /**
+     * Runs `then` when the wrap has decided where its mount points go and has
+     * yet to pin what lies above them: as it makes sure of the manifest
+     * directories.
+     */
+    function beforeThePins(then: () => void): { restore(): void } {
+      const mkdir = fs.mkdirSync
+      const spy = spyOn(fs, 'mkdirSync').mockImplementation(((
+        dir: unknown,
+        ...rest: unknown[]
+      ) => {
+        if (dir === runtime.manifestDir()) then()
+        return (mkdir as (...args: unknown[]) => unknown)(dir, ...rest)
+      }) as never)
+      return { restore: () => spy.mockRestore() }
+    }
+
+    for (const [when, early] of [
+      ['by the time its manifest is published', false],
+      ['between its decision to nest in it and the pin', true],
+    ] as const) {
+      it(`plans again when the directory has gone ${when}`, async () => {
+        // Until it has published nothing of this wrap's names it, and a clean-up
+        // in another process takes it away with the sandbox it was made for.
+        // That pass spares the file, which the new manifest names by then, and
+        // drops the manifest it was collecting.
+        const spared = join(AREA, 'proj', '.bashrc')
+        writeFileSync(spared, '')
+        mkdirSync(DIRECTORY)
+        const left = manifestOfAKilledProcess([spared, DIRECTORY])
+        const goes = (now: boolean): void => {
+          if (now && existsSync(left)) {
+            fs.rmdirSync(DIRECTORY)
+            rmSync(left)
+          }
         }
+        let published = 0
+        const publishing = atEachPublish(() =>
+          goes(published++ === 0 && !early),
+        )
+        const pinning = beforeThePins(() => goes(early))
+        let command: string
+        try {
+          command = await wrap('true', [spared, LEAF])
+        } finally {
+          pinning.restore()
+          publishing.restore()
+        }
+        // The plan that was handed out found it absent, and covers it itself.
+        expect(published).toBe(2)
+        expect(command).not.toContain(`--ro-bind /dev/null ${LEAF}`)
+        expect(command).toMatch(
+          new RegExp(`--ro-bind \\S+/claude-empty-\\S+ ${DIRECTORY} `),
+        )
+        // Nothing is left of the plan it gave up, nor of what only that named:
+        // found there, the file would be the caller's own from now on.
+        expect(command).toContain(`--ro-bind /dev/null ${spared}`)
+        expect(namedBy(command).sort()).toEqual([spared, DIRECTORY].sort())
+        expect(readdirSync(join(AREA, 'proj'))).toEqual([])
+        expect(readdirSync(runtime.manifestDir())).toEqual([
+          basename(recordedBy(command)!),
+        ])
       })
-      let command: string
+    }
+
+    for (const [what, meanwhile, names] of [
+      [
+        'a directory it mounts a tmpfs on has gone',
+        () => fs.rmdirSync(join(AREA, 'hidden')),
+        () => [LEAF],
+      ],
+      [
+        // Of a sandbox that has ended: the directory goes with the plan.
+        'a manifest has come that names the directory it nests in',
+        () => manifestOfAKilledProcess([DIRECTORY]),
+        () => [DIRECTORY],
+      ],
+    ] as const) {
+      it(`plans again when ${what} by the time its manifest is published`, async () => {
+        mkdirSync(DIRECTORY)
+        mkdirSync(join(AREA, 'hidden'))
+        let published = 0
+        const publishing = atEachPublish(() => {
+          if (published++ === 0) meanwhile()
+        })
+        let command: string
+        try {
+          command = await wrapCommandWithSandboxLinux({
+            command: 'true',
+            needsNetworkRestriction: false,
+            readConfig: { denyOnly: [join(AREA, 'hidden')] },
+            writeConfig: { allowOnly: [AREA], denyWithinAllow: [LEAF] },
+          })
+        } finally {
+          publishing.restore()
+        }
+        expect(published).toBe(2)
+        expect(namedBy(command)).toEqual(names())
+      })
+    }
+
+    it('takes what it cannot look at again for there', async () => {
+      // bubblewrap does not start on what it cannot bind.
+      let published = 0
+      const publishing = atEachPublish(() => published++)
+      const stat = fs.statSync
+      const spy = spyOn(fs, 'statSync').mockImplementation(((
+        file: unknown,
+        ...rest: unknown[]
+      ) => {
+        if (file === AREA && published > 0) {
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+        }
+        return (stat as (...args: unknown[]) => unknown)(file, ...rest)
+      }) as never)
       try {
-        command = await wrap('true', [LEAF])
+        await wrap('true', [LEAF])
       } finally {
+        spy.mockRestore()
         publishing.restore()
       }
-      // The plan that was handed out found it absent, and covers it itself.
-      expect(published).toBe(2)
-      expect(command).not.toContain(`--ro-bind /dev/null ${LEAF}`)
-      expect(command).toMatch(
-        new RegExp(`--ro-bind \\S+/claude-empty-\\S+ ${DIRECTORY} `),
+      expect(published).toBe(1)
+    })
+
+    it('plans again when its manifest went to a directory settled on since the pins', async () => {
+      // Nothing is pinned above that one. Both shared names are taken as the
+      // wrap reads the manifests, so it publishes in a directory of its own.
+      const shared = [
+        runtime.manifestDir(),
+        join(tmpdir(), `srt-mount-points-${process.getuid!()}`),
+      ]
+      const readdir = fs.readdirSync
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        dir: unknown,
+        ...rest: unknown[]
+      ) => {
+        const names = (readdir as (...args: unknown[]) => unknown)(dir, ...rest)
+        if (dir === shared[0]) {
+          for (const name of shared) {
+            fs.rmdirSync(name)
+            writeFileSync(name, '')
+          }
+        }
+        return names
+      }) as never)
+      let published = 0
+      const publishing = atEachPublish(() => published++)
+      try {
+        const command = await wrap('true', [LEAF])
+        expect(published).toBe(2)
+        const own = dirname(recordedBy(command)!)
+        expect(shared).not.toContain(own)
+        expect(countMounts(command, '--ro-bind', own, own)).toBe(1)
+        expect(readdirSync(own)).toEqual([basename(recordedBy(command)!)])
+      } finally {
+        publishing.restore()
+        spy.mockRestore()
+        shared.forEach(name => rmSync(name))
+      }
+    })
+
+    it('is let go of when a process exits whose wrap made no mount point of its own', () => {
+      mkdirSync(DIRECTORY)
+      manifestOfAKilledProcess([DIRECTORY])
+      const file = join(BASE, 'exits.ts')
+      writeFileSync(
+        file,
+        [
+          `import { wrapCommandWithSandboxLinux } from ${LIBRARY}`,
+          `await wrapCommandWithSandboxLinux({`,
+          `  command: 'true',`,
+          `  needsNetworkRestriction: false,`,
+          `  readConfig: { denyOnly: [] },`,
+          `  writeConfig: { allowOnly: [${JSON.stringify(AREA)}], denyWithinAllow: [${JSON.stringify(DIRECTORY)}] },`,
+          `})`,
+        ].join('\n'),
       )
-      expect(namedBy(command)).toEqual([DIRECTORY])
-      // Nothing is left of the plan it gave up.
-      expect(readdirSync(runtime.manifestDir())).toEqual([
-        basename(recordedBy(command)!),
-      ])
+      const exited = spawnSync(process.execPath, [file], {
+        env: { ...process.env },
+        timeout: 60000,
+        cwd: import.meta.dir,
+      })
+      expect(exited.status).toBe(0)
+      expect(readdirSync(runtime.manifestDir())).toEqual([])
+      expect(existsSync(DIRECTORY)).toBe(false)
+    }, 90000)
+
+    const emptySources = (): string[] =>
+      readdirSync(tmpdir())
+        .filter(name => name.startsWith('claude-empty-'))
+        .map(name => join(tmpdir(), name))
+
+    it('leaves nothing behind when it throws, having published or not', async () => {
+      const thrown: unknown = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        binShell: 'srt-no-such-shell',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: { allowOnly: [AREA], denyWithinAllow: [LEAF] },
+      }).catch((error: unknown) => error)
+      expect(String(thrown)).toContain('srt-no-such-shell')
+      expect(readdirSync(runtime.manifestDir())).toEqual([])
+      expect(emptySources()).toEqual([])
+
+      // Before it publishes: what it made goes once a clean-up can tell.
+      const junk = join(runtime.manifestDir(), '4242-00.json')
+      writeFileSync(junk, 'no manifest')
+      expect(await wrap('true', [LEAF]).catch((e: Error) => e.name)).toBe(
+        'LinuxSandboxProfileError',
+      )
+      expect(emptySources()).toHaveLength(1)
+      rmSync(junk)
+      cleanupBwrapMountPoints()
+      expect(emptySources()).toEqual([])
     })
 
     it('gives up, with a code of its own and nothing left behind, when that happens to every plan', async () => {
-      const emptySources = (): string[] =>
-        readdirSync(tmpdir())
-          .filter(name => name.startsWith('claude-empty-'))
-          .map(name => join(tmpdir(), name))
       let published = 0
       const publishing = atEachPublish(() => {
         published++

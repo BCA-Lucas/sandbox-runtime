@@ -395,10 +395,15 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     })
   })
 
-  it('keeps a pending profile through the clean-up after another command, and gives it back with the last', () => {
-    // A profile belongs to one wrap and nothing maps it back to a command, so
-    // none is closed while any wrap of this process is outstanding.
-    const seen = isolated(`
+  it.each([
+    ['that names no command', ''],
+    ['that names one', `{ commandId: 'another' }`],
+  ])(
+    'keeps a pending profile through a clean-up %s, and gives it back with the last',
+    (_how, first) => {
+      // A profile belongs to one wrap and nothing maps it back to a command, so
+      // none is closed while any wrap of this process is outstanding.
+      const seen = isolated(`
       const openFds = () => fs.readdirSync('/proc/self/fd').length
       // The runtime opens event-loop fds of its own on the first wrap.
       await wrap(small)
@@ -407,13 +412,15 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       await wrap(overLong)
       await wrap(overLong)
       const held = openFds() - baseline
-      cleanupBwrapMountPoints()
+      cleanupBwrapMountPoints(${first})
       const afterFirst = openFds() - baseline
       cleanupBwrapMountPoints()
       console.log(JSON.stringify({ held, afterFirst, afterSecond: openFds() - baseline }))
     `)
-    expect(seen).toEqual({ held: 2, afterFirst: 2, afterSecond: 0 })
-  }, 30000)
+      expect(seen).toEqual({ held: 2, afterFirst: 2, afterSecond: 0 })
+    },
+    30000,
+  )
 
   it('refuses at wrap time, with the reason, when no directory takes an unnamed file', () => {
     // Both candidates read-only: tmpdir and /dev/shm. A profile that fits

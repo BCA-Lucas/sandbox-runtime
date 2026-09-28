@@ -15,17 +15,14 @@ let pendingGlobalNpmPaths: Promise<string[]> | null = null
 const NPM_ROOT_COMMAND = 'npm root -g'
 const NPM_ROOT_TIMEOUT_MS = 5000
 
-/** The environment `npm root -g` runs in: this process's, with `searchPath`
- *  as its PATH where one is given. npm is a script that finds `node` by name,
- *  so what it may be taken from has to hold for what it starts as well. */
+/** `process.env` for `npm root -g`, with `searchPath` as its PATH if given. */
 function npmEnvironment(searchPath: string | undefined): NodeJS.ProcessEnv {
   return searchPath === undefined
     ? process.env
     : { ...process.env, PATH: searchPath }
 }
 
-/** Forget what `npm root -g` answered. For tests only: the answer is kept for
- *  the life of the process, which is what a test of the look-up has to undo. */
+/** For tests only: forget what `npm root -g` answered. */
 export function resetGlobalNpmPathsForTesting(): void {
   cachedGlobalNpmPaths = null
   pendingGlobalNpmPaths = null
@@ -35,9 +32,8 @@ export function resetGlobalNpmPathsForTesting(): void {
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  *
- * `searchPath` is the PATH `npm`, and what it starts, are looked up on: the
- * caller that knows what the sandboxed command may write passes one with
- * those places left out (see `hostSearchPath`). Without it, this process's.
+ * `searchPath` is the PATH `npm`, and what it starts, are looked up on (see
+ * `hostSearchPath`). Without it, this process's.
  *
  * Blocks the event loop on `npm root -g` (~100 ms) the first time it is
  * called in a process unless {@link getGlobalNpmPathsAsync} has already

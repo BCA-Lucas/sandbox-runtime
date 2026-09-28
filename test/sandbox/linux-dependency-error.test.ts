@@ -124,8 +124,7 @@ describe('checkLinuxDependencies', () => {
     },
   )
 
-  // An operator's bwrapPath is the binary probed, and the one the probe runs
-  // inside: nothing is looked up by name on the way.
+  // Nothing is looked up by name on the way.
   test.if(process.geteuid !== undefined)(
     'a uid-0 probe of an explicit bwrapPath runs that binary outside and inside',
     () => {
@@ -218,8 +217,7 @@ describe('uid0SandboxError', () => {
         bwrap: '/usr/bin/bwrap-refuses',
       }),
     ).toBe(`${CAP_SETFCAP_MISSING_MESSAGE} (bubblewrap: ${REFUSAL})`)
-    // The command inside is the same bubblewrap by its path, never a bare
-    // name bwrap would look up on PATH as uid 0 with everything writable.
+    // The command inside is the same bubblewrap by its path, never a bare name.
     expect(spawnSyncSpy.mock.calls[0]?.[0]).toBe('/usr/bin/bwrap-refuses')
     expect(spawnSyncSpy.mock.calls[0]?.[1]).toEqual([
       '--unshare-user',

@@ -26,16 +26,13 @@ export type HostHelperSearch = {
 const MAX_LINKS_FOLLOWED = 40
 
 /**
- * The forms of the allowed write paths a location is compared against: each
- * as `normalizePathForSandbox` gives it, which is how the wrap spells its
- * bind, and with every symlink resolved. `denyWithinAllow` is deliberately
- * not subtracted; passing over more is the safe direction.
+ * The allowed write paths in the forms a location is compared against: as
+ * `normalizePathForSandbox` spells each, and with every symlink resolved.
+ * `denyWithinAllow` is not subtracted: passing over more is the safe side.
  *
- * `undefined` means there is nothing to compare against. That is the answer
- * when the policy restricts no writes (no list at all), and also when the
- * list holds `/`: a policy that lets the command write everywhere leaves no
- * place this rule could prefer, and what then stands between the command and
- * a helper is the file's own permissions, which are not judged here.
+ * `undefined` when there is nothing to compare against: no list at all, or
+ * one that holds `/` and so leaves no place to prefer. A file's own
+ * permissions are not judged here.
  */
 function writableForms(
   allowedWritePaths: readonly string[] | undefined,
@@ -44,8 +41,7 @@ function writableForms(
   const forms = new Set<string>()
   for (const allowed of allowedWritePaths) {
     for (const form of pathSpellings(normalizePathForSandbox(allowed))) {
-      // The empty spelling (an empty $HOME expanding '~') is not a path, and
-      // as a prefix it would cover every absolute one.
+      // The empty spelling (an empty $HOME) would cover every path as a prefix.
       if (path.isAbsolute(form)) forms.add(form)
     }
   }
@@ -57,17 +53,12 @@ const components = (p: string): string[] =>
 
 /**
  * The places a lookup of the absolute path `file` passes through: `file` as
- * spelled, then each symbolic link followed on the way, by where the link
- * itself is, and last the file it all resolves to. The `PATH` entry is
- * covered by the first of them, which is spelled beneath it. `null` when the
- * path cannot be followed to the end.
+ * spelled (which covers the `PATH` entry it lies beneath), each symbolic link
+ * followed on the way, by where the link itself is, and last the file it
+ * resolves to. `null` when the path cannot be followed to the end.
  *
- * Every link counts, not only the outcome: a link the command may write can
- * be aimed elsewhere by the time the helper is run, wherever it led when it
- * was looked at. That catches a link in a safe directory that leads to a
- * writable file, and equally a `PATH` entry that is a link kept inside the
- * writable directory and leads to a safe one, whatever alias of that
- * directory `PATH` spells it through.
+ * Every link counts, not only the outcome: one the command may write can be
+ * aimed elsewhere by the time the helper is run.
  */
 function resolutionTrail(file: string): string[] | null {
   const trail = [file]
@@ -115,8 +106,7 @@ function firstWritablePlace(
 
 /**
  * Why `file` must not be run on the host under these write paths, or `null`
- * when it may. A file that cannot be followed to its end is refused: what
- * cannot be looked at cannot be shown to lie outside them.
+ * when it may. Refused too when it cannot be followed to its end.
  */
 function refusalFor(file: string, writable: readonly string[]): string | null {
   const trail = resolutionTrail(file)
@@ -130,38 +120,27 @@ function refusalFor(file: string, writable: readonly string[]): string | null {
     : `reached through the link ${found.place}, ${inside}`
 }
 
-// One accepted result per name and PATH string. Whether a result may be used
-// is a matter of the policy and not of the moment, so a hit is never returned
-// on trust: it is looked at again under the write paths of THIS call, and
-// searched for afresh once it has come to lie inside one of them (an
-// updateConfig() that widened allowWrite, a per-call configuration).
+// One accepted result per name and PATH string. A hit is never returned on
+// trust: it is judged again under the write paths of THIS call, which an
+// updateConfig() or a per-call configuration may have widened.
 const accepted = new Map<string, string>()
 
 /**
- * Find `name`, a program this library itself runs on the host: bubblewrap, the
- * socat bridges, the ripgrep scan. Those run with the caller's full
- * authority, outside any sandbox, so the rule is: never execute a file the
- * sandbox policy lets the wrapped command write, because such a file is
- * whatever an earlier wrapped command left there. It is a rule about the file
- * that gets chosen, not about `PATH` as such: a `PATH` that leads with a
- * directory the command may write (`<project>/node_modules/.bin` under `npx`
- * and `npm run`, with the project in `allowWrite`) is searched as it stands,
- * and what is found in such a place is passed over.
+ * Find `name`, a program this library itself runs on the host (bubblewrap, the
+ * socat bridges, the ripgrep scan) with the caller's full authority. A file
+ * the policy lets the wrapped command write is never executed: it is whatever
+ * an earlier wrapped command left there. `PATH` is searched as it stands,
+ * even when a writable directory leads it (`<project>/node_modules/.bin`
+ * under `npx`); what is found in such a place is passed over and recorded.
  *
- * Nothing is run to find it. This is the in-process search of `whichSync`,
- * taking the first candidate that lies outside everything
- * `allowedWritePaths` (a wrap's `writeConfig.allowOnly`) lets the wrapped
- * command write. A candidate inside is passed over, and recorded, and the
- * search goes on. A relative `PATH` entry, the empty one included, names
- * wherever the process happens to stand and is never used.
- *
- * With nothing to compare against (see `writableForms`) this is the plain
- * search, and nothing is passed over.
+ * Nothing is run to find it: this is the search of `whichSync`, taking the
+ * first candidate outside everything `allowedWritePaths` (a wrap's
+ * `writeConfig.allowOnly`) covers. A relative `PATH` entry, the empty one
+ * included, is never used. With nothing to compare against (see
+ * `writableForms`) it is the plain search.
  *
  * `path` is `null` when no candidate may be used. The caller refuses to go
- * on; it never falls back to the bare name, which would hand the choice back
- * to `PATH`.
- *
+ * on; falling back to the bare name would hand the choice back to `PATH`.
  * POSIX paths only: every helper looked for belongs to the Linux backend.
  */
 export function findHostHelper(
@@ -200,16 +179,13 @@ export function findHostHelper(
   return { path: null, skipped }
 }
 
-/** The option that names `helper` outright, for the message below. */
 /**
- * The PATH to give a program the library starts on the host that does look-ups
- * of its own (`npm`, which is a script and finds `node` by name): this
- * process's PATH with every entry left out that a host helper would not be
- * taken from. An entry is judged as a directory, and then by the copy it
- * holds of each of `programs`, the names the child is known to look up: what
- * gets run is a file, and a link kept in a directory nobody can write may
- * still lead to one somebody can. `undefined` where nothing is filtered, for
- * the child to inherit the PATH as it is.
+ * The PATH for a program the library starts on the host that does look-ups of
+ * its own (`npm`, a script that finds `node` by name): this process's PATH
+ * less every entry a host helper would not be taken from. An entry is judged
+ * as a directory and by its copy of each of `programs`, the names the child
+ * looks up: a link in a directory nobody can write may lead to a file
+ * somebody can. `undefined` where nothing is filtered.
  */
 export function hostSearchPath(
   allowedWritePaths: readonly string[] | undefined,
@@ -221,12 +197,11 @@ export function hostSearchPath(
     path.isAbsolute(entry) &&
     refusalFor(entry, writable) === null &&
     programs.every(program => {
-      // Joined as the shell joins them, with no `..` folded away by spelling:
-      // the walk resolves one through the file system, as the kernel does.
+      // Joined as the shell joins them: the walk resolves a `..` through the
+      // file system, not by spelling.
       const file = `${entry}${entry.endsWith('/') ? '' : '/'}${program}`
-      // Whatever is there is judged, executable today or not, a link with
-      // nothing behind it included: the command could supply the rest later.
-      // Only a name that is not there at all has nothing to say.
+      // Whatever is there is judged, executable or not, a dangling link
+      // included: the command could supply the rest later.
       try {
         fs.lstatSync(file)
       } catch {
@@ -240,6 +215,7 @@ export function hostSearchPath(
     .join(path.delimiter)
 }
 
+/** The option that names `helper` outright, for the message below. */
 function optionNaming(helper: string): string {
   if (helper === 'bwrap') return 'bwrapPath'
   if (helper === 'socat') return 'socatPath'
@@ -247,9 +223,8 @@ function optionNaming(helper: string): string {
 }
 
 /**
- * The refusal for a search that found nothing to use: which helper, that no
- * copy lies outside the write paths, what was passed over and why, and what
- * lifts it.
+ * The refusal for a search that found nothing to use: which helper, what was
+ * passed over and why, and what lifts it.
  */
 export function describeUnavailableHostHelper(
   helper: string,
@@ -269,13 +244,10 @@ export function describeUnavailableHostHelper(
 
 /**
  * The dependency-check warning for `file`, a helper the operator named
- * outright through `option` (`bwrapPath`, `socatPath`, `seccomp.applyPath`, a
- * `ripgrep.command` with a directory part), when it lies inside an allowed
- * write path by the same test as the search; `undefined` when it lies
- * outside them all, or is not set. Such a file is still used as given, since
- * naming it is a directive, and the operator is told what the sandboxed
- * command can do to it. A path that cannot be followed is judged by its
- * spelling.
+ * outright through `option`, when it lies inside an allowed write path by the
+ * same test as the search; `undefined` otherwise. The file is still used as
+ * given: naming it is a directive. A path that cannot be followed is judged
+ * by its spelling.
  */
 export function writableNamedHelperWarning(
   option: string,

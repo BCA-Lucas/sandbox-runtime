@@ -1034,15 +1034,13 @@ function isSandboxingEnabled(): boolean {
   return config !== undefined
 }
 
-/** What `npm root -g` looks up on PATH: npm itself, and the node its script
- *  is run by. */
+/** What `npm root -g` looks up on PATH: npm, and the node that runs it. */
 const NPM_LOOKS_UP = ['npm', 'node'] as const
 
 /**
  * What a wrap under the initialized configuration lets the sandboxed command
- * write, for finding the programs this library runs on the host outside it
- * (see `findHostHelper`). `undefined` when no writes are restricted: the
- * filesystem policy is off, or there is no configuration yet, in which case
+ * write (see `findHostHelper`). `undefined` when no writes are restricted:
+ * the filesystem policy is off, or there is no configuration yet, and then
  * `initialize()` runs the dependency check again once there is one.
  */
 function hostHelperWritePaths(): string[] | undefined {
@@ -1078,8 +1076,7 @@ function checkDependenciesCommon(
     const allowedWritePaths = hostHelperWritePaths()
     const rgNotFound = `ripgrep (${rgToCheck.command}) not found`
     if (isPathQualified(rgToCheck.command)) {
-      // Named outright: run as given, and reported when the sandboxed command
-      // may write it.
+      // Named outright: run as given, and warned about when writable.
       if (whichSync(rgToCheck.command) === null) errors.push(rgNotFound)
       const warning = writableNamedHelperWarning(
         'ripgrep.command',
@@ -1088,8 +1085,7 @@ function checkDependenciesCommon(
       )
       if (warning !== undefined) warnings.push(warning)
     } else {
-      // A bare name is looked for the way the wrap will look for it: on PATH,
-      // outside what the sandboxed command may write.
+      // A bare name is looked for the way the wrap will look for it.
       const search = findHostHelper(rgToCheck.command, allowedWritePaths)
       if (search.path === null) {
         errors.push(

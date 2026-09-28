@@ -16,8 +16,7 @@ export function isPathQualified(bin: string): boolean {
 
 /**
  * `file` is a regular file this process may execute: what a `PATH` search
- * accepts. A directory of the right name, a file without the execute bit and
- * a dangling link are all passed over, as a shell passes over them.
+ * accepts. Not a directory, a file without the execute bit or a dangling link.
  */
 export function isExecutableFile(file: string): boolean {
   try {
@@ -30,9 +29,8 @@ export function isExecutableFile(file: string): boolean {
 
 /**
  * Where `PATH` says a program called `bin` could be, in search order, whether
- * or not anything is there. `PATH` is read when called, so a caller that
- * changed `process.env.PATH` is searched the way a child it spawns would be.
- * An unset or empty `PATH` names no place at all.
+ * or not anything is there. `PATH` is read when called, as a spawned child
+ * would inherit it. An unset or empty `PATH` names no place at all.
  */
 export function* pathCandidates(
   bin: string,
@@ -45,19 +43,16 @@ export function* pathCandidates(
 }
 
 /**
- * Find the path to an executable, as the `which` command would, without
- * running one: a `which` program is itself found through `PATH`, so running
- * it executes whatever file of that name comes first there. The search is
- * done in this process, identically under Node.js and Bun: the first `PATH`
- * entry holding a regular file of that name this process may execute.
+ * Find the path to an executable as the `which` command would, without
+ * running one, which would execute whatever `which` comes first on `PATH`.
+ * The same search under Node.js and Bun: the first `PATH` entry holding a
+ * regular file of that name this process may execute. A name with a
+ * directory part is checked where it is and returned as given.
  *
- * `Bun.which` is not used although it also runs nothing. Called without an
- * explicit `PATH` it searches the one the process started with, not the
- * current `process.env.PATH` a spawned child inherits, and it passes over an
- * empty entry, which POSIX reads as the current directory. One search for
- * both runtimes means they cannot come to disagree about what is found.
- *
- * A name with a directory part is checked where it is and returned as given.
+ * `Bun.which` is not used: without an explicit `PATH` it searches the one the
+ * process started with, not the current `process.env.PATH` a spawned child
+ * inherits, and it passes over an empty entry, which POSIX reads as the
+ * current directory.
  *
  * Every `PATH` entry counts, the ones a sandboxed command may write among
  * them, so this is for a program that will run with the sandbox's authority.

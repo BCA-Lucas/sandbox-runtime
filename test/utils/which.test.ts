@@ -44,9 +44,8 @@ describe('whichSync', () => {
   })
 
   it('agrees with Bun.which on the PATH the process started with', () => {
-    // Bun.which is no longer what whichSync calls (it does not follow a
-    // changed process.env.PATH), but for an unchanged PATH the two searches
-    // must find the same file.
+    // Bun.which does not follow a changed process.env.PATH; for an unchanged
+    // one the two searches must find the same file.
     expect(whichSync('ls')).toBe(globalThis.Bun.which('ls'))
   })
 })

@@ -93,8 +93,7 @@ export interface LinuxSandboxParams {
   gitSafeDirectories?: readonly string[]
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
-  /** Absolute path to the bwrap binary (default: "bwrap" as found on PATH
-   *  outside the allowed write paths, see `findHostHelper`) */
+  /** Absolute path to bwrap (default: "bwrap" as `findHostHelper` finds it) */
   bwrapPath?: string
   /** Absolute path to the socat binary (default: "socat", found likewise) */
   socatPath?: string
@@ -758,20 +757,17 @@ export type LinuxSandboxProfileErrorCode =
   | 'command_too_long'
   /**
    * A program this library runs on the host (bubblewrap, socat, ripgrep) has
-   * no copy on PATH outside the paths the command may write, and one inside
-   * them is never run: it is whatever an earlier command left there. The
-   * message names the helper, each copy passed over and why. Lifted by
-   * installing it outside those paths, by a PATH that reaches such a copy, or
-   * by naming it (`bwrapPath`, `socatPath`, `ripgrep.command`).
+   * no copy on PATH outside the paths the command may write. The message
+   * names each copy passed over and why. Lifted by such a copy on PATH, or by
+   * naming the helper (`bwrapPath`, `socatPath`, `ripgrep.command`).
    */
   | 'host_helper_unavailable'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
  * configuration expands to is past a limit, or, for `command_too_long` and
- * `nul_in_path`, what the caller passed in is, or, for
- * `host_helper_unavailable`, a program the wrap itself runs is only to be had
- * from a place the command may write. The command was not run and no
+ * `nul_in_path`, what the caller passed in is, or (`host_helper_unavailable`)
+ * a program the wrap runs is not to be had. The command was not run and no
  * profile file stays open, so do not run the per-command cleanup
  * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
  * threw: it would release a second time, and a sandbox still running would
@@ -804,10 +800,8 @@ export class LinuxSandboxProfileError extends Error {
 }
 
 /**
- * The absolute path of `helper`, a program this library runs on the host,
- * found outside everything `allowedWritePaths` lets the wrapped command write
- * (see `findHostHelper`). Throws the typed refusal when there is none: going
- * on under the bare name would let `PATH` choose the file after all.
+ * The absolute path `findHostHelper` gives for `helper`. Throws the typed
+ * refusal when there is none, never going on under the bare name.
  */
 function requireHostHelper(
   helper: string,
@@ -824,10 +818,8 @@ function requireHostHelper(
 }
 
 /**
- * `ripgrepConfig` with a bare `command` (the default `rg`, or another name)
- * replaced by where `requireHostHelper` finds it: the scan runs on the host
- * on every wrap. A command with a directory part was named by the operator
- * and is run as given, `args` and `argv0` with it.
+ * `ripgrepConfig` for the scan, which runs on the host: a bare `command`
+ * becomes where `requireHostHelper` finds it, a path is run as given.
  */
 function hostRipgrepConfig(
   ripgrepConfig: RipgrepConfig,
@@ -1070,10 +1062,9 @@ export type LinuxDependencyOptions = {
   bwrapPath?: string
   socatPath?: string
   /**
-   * What the sandboxed command may write (a wrap's `writeConfig.allowOnly`).
-   * bwrap and socat are looked for on PATH outside these paths, as the wrap
-   * will look for them, and an explicit binary path inside them is warned
-   * about. Omitted, nothing is restricted and the whole PATH counts.
+   * What the sandboxed command may write (a wrap's `writeConfig.allowOnly`):
+   * bwrap and socat are looked for on PATH outside it, as the wrap does, and
+   * an explicit path inside it is warned about. Omitted: nothing restricted.
    */
   allowedWritePaths?: readonly string[]
 }
@@ -1117,9 +1108,8 @@ export function checkLinuxDependencies(
   const errors: string[] = []
   const warnings: string[] = []
 
-  // Found on PATH outside what the sandboxed command may write, as the wrap
-  // will find it. A copy that was passed over is named, so the caller learns
-  // at start-up, not at the first wrap, that the one on PATH will not be run.
+  // Found as the wrap will find it (see `findHostHelper`). A copy passed over
+  // is named, so the caller learns at start-up that it will not be run.
   const onPath = (helper: string, notInstalled: string): string | null => {
     const search = findHostHelper(helper, allowedWritePaths)
     if (search.path === null) {
@@ -1156,8 +1146,7 @@ export function checkLinuxDependencies(
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
-  // A directive is followed wherever it points, and reported when it points
-  // at a file the sandboxed command may write.
+  // A directive is followed wherever it points; a writable one is reported.
   for (const [option, file] of [
     ['bwrapPath', bwrapPath],
     ['socatPath', socatPath],
@@ -1210,16 +1199,14 @@ export function uid0SandboxError({
 const uid0UserNamespaceProbes = new Map<string, string | null>()
 
 /**
- * Run `bwrap --unshare-user --dev-bind / / <bwrap> --version` once and report
- * whether this kernel actually refuses to map uid 0. `null` means it does
- * not, so there is nothing to report; otherwise bubblewrap's own first stderr
- * line, or the empty string when the probe could not be run at all and the
- * prediction stands unaided.
+ * Run bwrap under `--unshare-user --dev-bind / /` once and report whether this
+ * kernel actually refuses to map uid 0. `null` means it does not, so there is
+ * nothing to report; otherwise bubblewrap's own first stderr line, or the
+ * empty string when the probe could not be run at all and the prediction
+ * stands unaided.
  *
- * The command run inside is the same bubblewrap, by the path it was given:
- * bwrap looks a bare command up on PATH, and this one runs as uid 0 with the
- * whole filesystem bound writable, so it must not be whatever a directory on
- * PATH holds under some name.
+ * The command run inside is bubblewrap's own `--version`, by its path: a bare
+ * name is looked up on PATH, and this runs as uid 0 with everything writable.
  */
 function probeUid0UserNamespace(bwrap: string): string | null {
   const cached = uid0UserNamespaceProbes.get(bwrap)
@@ -1276,8 +1263,7 @@ export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
   socatPath?: string,
-  /** What the sandboxed command may write: a socat found on PATH is taken
-   *  from outside these paths (see `findHostHelper`). */
+  /** What the sandboxed command may write (see `findHostHelper`). */
   allowedWritePaths?: readonly string[],
 ): Promise<LinuxNetworkBridgeContext> {
   // The bridges run on the host for as long as the sandbox is up.
@@ -1468,10 +1454,9 @@ function buildSandboxCommand(
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so the path socat was
-  // given or found at on the host names the same binary inside bwrap. Never
-  // the bare name: these listeners start before the seccomp filter is
-  // applied, so they must not be whatever PATH holds under that name inside.
+  // Host filesystem is bind-mounted into the sandbox, so socat's host path
+  // names the same binary inside bwrap. Never the bare name: these listeners
+  // start before the seccomp filter is applied.
   const socat = quote([socatPath])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
@@ -3358,10 +3343,9 @@ export async function wrapCommandWithSandboxLinux(
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
-    // Resolve the full path to the shell binary since bwrap doesn't use $PATH.
-    // The shell runs inside the sandbox, with the sandbox's authority, so it
-    // is found with the plain search over the whole PATH, writable entries
-    // included, unlike the helpers this library runs on the host.
+    // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+    // The shell runs inside the sandbox, so the plain search over the whole
+    // PATH is right for it, writable entries included.
     const shellName = binShell || 'bash'
     const shell = whichSync(shellName)
     if (!shell) {

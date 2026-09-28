@@ -15,11 +15,9 @@ let hostHelperSpy: ReturnType<typeof spyOn>
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync')
   platformSpy = spyOn(platform, 'getPlatform')
-  // checkDependencies() looks a helper up outside what the manager's
-  // configuration lets the sandboxed command write, and the manager keeps the
-  // configuration of whichever suite ran before this one in the same process.
-  // Pin the lookup to the unrestricted case, which is the whichSync mocked
-  // here, so these tests are about the platform and nothing else.
+  // The manager keeps the configuration of whichever suite ran before, and
+  // findHostHelper judges by it: pin the lookup to the unrestricted case,
+  // which is the whichSync mocked here.
   hostHelperSpy = spyOn(hostHelpers, 'findHostHelper').mockImplementation(
     (name: string) => ({ path: which.whichSync(name), skipped: [] }),
   )

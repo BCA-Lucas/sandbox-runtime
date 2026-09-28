@@ -1450,9 +1450,8 @@ export function wrapCommandWithSandboxMacOS(
   }
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
-  // Resolve the full path to the shell binary. It runs under sandbox-exec,
-  // with the sandbox's authority, so it is found with the plain search over
-  // the whole PATH, entries the sandboxed command may write included.
+  // Resolve the full path to the shell binary
+  // It runs under sandbox-exec, so the plain search of the whole PATH is right
   const shellName = binShell || 'bash'
   const shell = whichSync(shellName)
   if (!shell) {
@@ -1471,11 +1470,9 @@ export function wrapCommandWithSandboxMacOS(
   )
 
   // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that quote() escapes properly, avoiding shell quoting issues.
-  // env runs on the host, ahead of sandbox-exec, so like sandbox-exec it is
-  // named by the fixed path macOS ships it at: a bare name would be whatever
-  // file PATH holds under it, a directory the sandboxed command may write
-  // included.
+  // argument that quote() escapes properly, avoiding shell quoting issues
+  // env runs on the host, ahead of sandbox-exec, so it is named by its fixed
+  // path: a bare name would be whatever file PATH holds under it.
   const wrappedCommand = quote([
     '/usr/bin/env',
     ...unsetEnvArgs,
@@ -1528,7 +1525,7 @@ export function startMacOSSandboxLogMonitor(
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
 
   // Stream and filter kernel logs for all sandbox violations
-  // We can't filter by specific logTag since it's dynamic per command.
+  // We can't filter by specific logTag since it's dynamic per command
   // By its fixed path, not through PATH: the monitor runs on the host.
   const logProcess = spawn('/usr/bin/log', [
     'stream',

@@ -39,11 +39,9 @@ import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
  * The programs the library itself runs on the host are never taken from a
- * place the sandboxed command may write. The fixture is the usual way that
- * goes wrong: a project directory that is in `allowWrite` and whose
- * `node_modules/.bin` leads PATH (as under `npx` and `npm run`), holding files
- * named like the helpers. Each of them leaves a marker behind if it is ever
- * run, and no test may find that marker.
+ * place the sandboxed command may write. The fixture: a project directory in
+ * `allowWrite` whose `node_modules/.bin` leads PATH, holding files named like
+ * the helpers. Each leaves a marker behind if run; no test may find it.
  */
 describe('programs run on the host are found outside the allowed write paths', () => {
   const savedPath = process.env.PATH ?? ''
@@ -268,8 +266,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         path: join(projectBin, HELPER),
         skipped: [],
       })
-      // No allowed write path at all is a restriction: nothing is writable,
-      // so nothing is passed over either.
+      // An empty list restricts everything: nothing is writable to pass over.
       expect(findHostHelper(HELPER, [])).toEqual({
         path: join(projectBin, HELPER),
         skipped: [],
@@ -278,8 +275,7 @@ describe('programs run on the host are found outside the allowed write paths', (
 
     it('passes over nothing when the policy lets the command write everywhere', () => {
       // With '/' allowed there is no place outside the write paths to prefer.
-      // The helper is still found in this process, from the whole PATH, by an
-      // absolute path.
+      // The helper is still found in this process, by an absolute path.
       plant(join(projectBin, HELPER))
       plant(join(safe, HELPER))
       const cwd = dir('cwd')
@@ -362,8 +358,7 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(firstWord(wrapped)).toBe(realBwrap)
       expect(isAbsolute(firstWord(wrapped))).toBe(true)
       expect(wrapped).not.toContain(projectBin)
-      // The scan ran, with the real ripgrep: the nested file it alone finds
-      // is made read-only, and the planted rg was not run to find it.
+      // Only the scan finds the nested file: the real ripgrep ran.
       expect(wrapped).toContain(join(project, 'nested', '.bashrc'))
       expect(existsSync(marker)).toBe(false)
 
@@ -450,8 +445,7 @@ describe('programs run on the host are found outside the allowed write paths', (
     })
 
     it('uses bwrapPath, socatPath and a ripgrep command with a directory part as given', async () => {
-      // Named outright, even inside the write path: a directive. Nothing is
-      // looked up, so a PATH that holds none of them does not matter.
+      // Named outright, even inside the write path: a directive, not looked up.
       const tools = dir('tools')
       symlinkSync(whichSync('bash')!, join(tools, 'bash'))
       process.env.PATH = tools
@@ -508,7 +502,7 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(restricted.errors[0]).toContain(join(projectBin, 'bwrap'))
       // The same PATH with nothing restricted: that copy is the one to run.
       expect(checkLinuxDependencies().errors).toEqual([])
-      // One that is nowhere keeps the message it always had.
+      // One that is nowhere gets the plain message.
       process.env.PATH = tools
       expect(
         checkLinuxDependencies({ allowedWritePaths: [project] }).errors,
@@ -565,8 +559,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         network: { allowedDomains: [], deniedDomains: [] },
         filesystem: { denyRead: [], allowWrite: [project], denyWrite: [] },
       }
-      // initialize() runs the check under the configuration it is given, and
-      // refuses to start with a required helper it would never run.
+      // initialize() refuses to start with a helper it would never run.
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(SandboxManager.initialize(config)).rejects.toThrow(
         /Sandbox dependencies not available: rg runs on the host and was not found on PATH outside the paths the sandboxed command may write\. Passed over: .*node_modules\/\.bin\/rg/,
@@ -591,9 +584,8 @@ describe('programs run on the host are found outside the allowed write paths', (
     })
   })
 
-  // `npm root -g` finds a global install of this package where the helper or
-  // the JVM agent's jar is not beside the library. npm is a script and looks
-  // `node` up by name, so it is a PATH, not a file, that the rule is put to.
+  // `npm root -g` is run to find a global install of this package. npm is a
+  // script and looks `node` up by name, so the rule is put to a PATH.
   describe.if(!isWindows)(
     'the PATH given to a program that searches it itself',
     () => {
@@ -614,9 +606,8 @@ describe('programs run on the host are found outside the allowed write paths', (
         ].join(':')
 
         expect(hostSearchPath([project])).toBe([safe, '/usr/bin'].join(':'))
-        // A directory nobody can write, whose `node` is a link to a file
-        // somebody can: left out for a child that looks `node` up, kept for
-        // one that does not.
+        // A directory nobody can write, whose `node` links to a file somebody
+        // can: left out only for a child that looks `node` up.
         const shims = dir('shims')
         plant(join(project, 'node'))
         symlinkSync(join(project, 'node'), join(shims, 'node'))
@@ -624,8 +615,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         expect(hostSearchPath([project])).toBe([shims, safe].join(':'))
         expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
 
-        // A link with nothing behind it yet, into where the command may
-        // write, counts the same: the command could put the file there.
+        // A dangling link into where the command may write counts the same.
         const dangling = dir('dangling')
         symlinkSync(join(project, 'not-there-yet'), join(dangling, 'npm'))
         process.env.PATH = [dangling, safe].join(':')
@@ -639,8 +629,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         process.env.PATH = [`${safe}/jump/..`, safe].join(':')
         expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
 
-        // Nothing the policy keeps the command from writing: nothing left out,
-        // and the program inherits the PATH as it is.
+        // Nothing restricted: the program inherits the PATH as it is.
         expect(hostSearchPath(undefined)).toBeUndefined()
         expect(hostSearchPath(['/'])).toBeUndefined()
       })
@@ -654,8 +643,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         await getGlobalNpmPathsAsync(hostSearchPath([project], ['npm', 'node']))
         expect(existsSync(marker)).toBe(false)
 
-        // The control: asked with the PATH as it is, the planted one answers,
-        // which is what the marker is there to show.
+        // The control: asked with the PATH as it is, the planted one answers.
         resetGlobalNpmPathsForTesting()
         await getGlobalNpmPathsAsync()
         expect(existsSync(marker)).toBe(true)

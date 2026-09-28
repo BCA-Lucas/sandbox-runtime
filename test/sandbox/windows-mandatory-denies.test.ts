@@ -11,17 +11,15 @@ import { windowsGetCwdMandatoryDenyPaths } from '../../src/sandbox/windows-sandb
 /**
  * The Windows mandatory write denies, which `computeWindowsFsAccessSet` unions
  * into the session's `denyWrite` stamp. The producer is a plain path
- * computation over the working directory, so it runs on every platform and
- * these rows do too; what a stamped deny then costs a sandboxed write is in
- * test/sandbox/winsrt.test.ts, on the Windows legs.
+ * computation, so these rows run on every platform; what a stamped deny
+ * costs a sandboxed write is in test/sandbox/winsrt.test.ts.
  */
 describe('windowsGetCwdMandatoryDenyPaths', () => {
   let root: string
   let originalCwd: string
 
-  // One tree carrying: every dangerous file but `.profile`, every dangerous
-  // directory but `.idea`, a `.git` directory with hooks and config, an
-  // ordinary project file, and a nested repository.
+  // One tree: every dangerous name but `.profile` and `.idea`, a `.git` with
+  // hooks and config, an ordinary project file, and a nested repository.
   beforeAll(() => {
     originalCwd = process.cwd()
     root = mkdtempSync(join(tmpdir(), 'srt-winmand-'))

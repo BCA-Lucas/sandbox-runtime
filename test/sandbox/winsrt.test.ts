@@ -1938,12 +1938,10 @@ describe.if(isWindows)(
     }, 90_000)
 
     // ── M1-M3: the mandatory write denies ──
-    // `computeWindowsFsAccessSet` unions them into the session stamp
-    // from the working directory `initialize()` runs in, so each row
-    // chdirs into its own tree first. Which paths the producer picks
-    // is covered platform-independently by
-    // test/sandbox/windows-mandatory-denies.test.ts; these rows are
-    // what the stamp then costs a sandboxed write.
+    // Resolved from the working directory `initialize()` runs in, so
+    // each row chdirs into its own tree first. Which paths are picked
+    // is in test/sandbox/windows-mandatory-denies.test.ts; these rows
+    // are what the stamp costs a sandboxed write.
 
     /** A working directory carrying the mandatory names, all of them there. */
     function mandatoryTree(): string {
@@ -1973,8 +1971,7 @@ describe.if(isWindows)(
       const app = join(dir, 'app.txt')
       try {
         // The hooks directory is granted EXPLICITLY as well as by the
-        // tree root: srt-win writes the deny ahead of the allow, so
-        // the deny still wins.
+        // tree root, and the deny still wins.
         const r = await rexecIn(
           dir,
           `echo POISON>"${hook}" & echo POISON>"${rc}" & echo OK>"${app}"`,

@@ -1392,9 +1392,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
  *
  * `denyWrite` also carries the mandatory set
- * ({@link windowsGetCwdMandatoryDenyPaths}), which no configuration
- * lifts: a path that is denied and granted lands as both ACEs, and
- * srt-win writes the deny ahead of the allow, so the deny wins.
+ * ({@link windowsGetCwdMandatoryDenyPaths}), which no grant lifts:
+ * srt-win writes a path's deny ahead of its allow, so the deny wins.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]
@@ -1428,8 +1427,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     { mode: 'deny' },
   )
   // The mandatory set is resolved once here, against the working directory
-  // `initialize()` runs in: on Windows the grants and denies are session-level
-  // (`srt-win acl stamp`), where on macOS and Linux they are rebuilt per wrap.
+  // `initialize()` runs in: the `srt-win acl stamp` is session-level.
   const denyWrite = expand(
     [
       ...new Set([
@@ -1459,9 +1457,8 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  */
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed on every CONFIG field {@link computeWindowsFsAccessSet}
-  // reads. The mandatory set it also resolves is keyed by
-  // `allowGitConfig` alone: the rest of it follows from the working
-  // directory, which the session keeps.
+  // reads. Of the mandatory set that is `allowGitConfig` alone: the
+  // rest follows from the working directory, which the session keeps.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {

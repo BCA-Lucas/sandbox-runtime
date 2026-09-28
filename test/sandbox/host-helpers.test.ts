@@ -423,6 +423,29 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(existsSync(marker)).toBe(false)
     })
 
+    it('runs no planted bubblewrap while building a wrap, whatever the options', async () => {
+      // Building a wrap may ask bubblewrap about itself (its version, its
+      // help): that question goes to the copy the wrap runs, never to PATH's.
+      process.env.PATH = `${projectBin}:${savedPath}`
+
+      for (const options of [
+        {},
+        { allowAllUnixSockets: true },
+        { enableWeakerNestedSandbox: true },
+        { allowAllUnixSockets: true, enableWeakerNestedSandbox: true },
+      ]) {
+        const wrapped = await wrapCommandWithSandboxLinux({
+          command: 'echo wrapped-ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: [project], denyWithinAllow: [] },
+          ...options,
+        })
+        expect(firstWord(wrapped)).toBe(realBwrap)
+        expect(existsSync(marker)).toBe(false)
+      }
+    })
+
     it('starts the listeners inside the sandbox with the real socat', async () => {
       process.env.PATH = `${projectBin}:${savedPath}`
       const httpSocket = join(base, 'http.sock')

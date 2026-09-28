@@ -374,10 +374,10 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(readdirSync(DIR)).toEqual([])
   })
 
-  it('lists the directory again between removals, not only before the first', () => {
+  it('lists the directory again before every removal of an ordinary pass', () => {
     // A sandbox about to start on a path shows as a manifest that was not there
-    // when the pass began, at any point of a pass over many mount points. One
-    // listing is good for a quarter of a millisecond.
+    // when the pass began, at any point of the pass, with no time having to go
+    // by: each removal is judged on a listing made just before it.
     const Y = join(BASE, 'second.lock')
     leftover(X)
     leftover(Y)
@@ -387,13 +387,11 @@ describe.if(isLinux)('The mount point manifests', () => {
     const spy = spyOn(fs, 'unlinkSync').mockImplementation(((file: string) => {
       unlink(file)
       if (file === X && arrived === undefined) {
-        // Published the moment the first mount point has gone, with the pass
-        // held up for a millisecond before the next.
+        // Published the moment the first mount point has gone.
         arrived = manifestOfADeadProcess([Y], {
           pid: process.pid,
           created: Date.now(),
         })
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1)
       }
     }) as never)
     let removed: string[]
@@ -405,6 +403,30 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(arrived).toBeDefined()
     expect(removed).toEqual([X])
     expect(existsSync(Y)).toBe(true)
+  })
+
+  it('lists by the clock, not before every removal, in a pass of many mount points', () => {
+    // A directory of thousands is not listed thousands of times.
+    const many = Array.from({ length: 200 }, (_, i) => join(BASE, `m${i}.lock`))
+    many.forEach(leftover)
+    manifestOfADeadProcess(many)
+    const readdir = fs.readdirSync
+    let listings = 0
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (args[0] === DIR) listings++
+      return readdir(...args)
+    }) as never)
+    let removed: string[]
+    try {
+      removed = collectMountPoints()
+    } finally {
+      spy.mockRestore()
+    }
+    expect(removed.sort()).toEqual([...many].sort())
+    expect(listings).toBeGreaterThan(2)
+    expect(listings).toBeLessThan(many.length)
   })
 
   it('is live for half a second from when it was written, though its writer is gone', () => {
@@ -636,9 +658,6 @@ describe.if(isLinux)('The mount point manifests', () => {
     const removal = atTheRemovalOf(X, () => {
       fs.renameSync(claim, manifest)
       started(manifest, thisProcess())
-      // A sandbox takes longer than this to start, and a listing is good for a
-      // quarter of a millisecond.
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1)
     })
     try {
       // Y stays: the manifest is at its own name by the time Y's turn comes.

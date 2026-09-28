@@ -59,10 +59,16 @@ const CLAIMED_SUFFIX = '.claimed'
 const MANIFEST_GRACE_MS = 500
 
 /**
- * For how long one listing of the manifest directory is good during the
- * removals: well under the time a starting sandbox needs to reach its binds,
- * and a time rather than "before every removal" so a directory of thousands is
- * not listed thousands of times.
+ * A pass with no more candidates than this lists the manifest directory again
+ * before every removal, so each is judged on a listing a few microseconds old.
+ * An ordinary pass is a handful of paths.
+ */
+const LISTS_BEFORE_EACH_REMOVAL_UP_TO = 64
+
+/**
+ * For how long one listing is good in a larger pass: well under the time a
+ * starting sandbox needs to reach its binds, and a time so a directory of
+ * thousands is not listed thousands of times.
  */
 const LISTING_GOOD_FOR_MS = 0.25
 
@@ -1019,8 +1025,9 @@ export function collectMountPoints(
  * a process on the record. So what remains is a manifest that comes to its own
  * name after the reading, published or given back, whose sandbox reaches its
  * bind on a path a claimed manifest names too. The directory is listed again
- * before the first removal and whenever that listing is {@link
- * LISTING_GOOD_FOR_MS} old, and what has come to its name keeps what it names,
+ * before every removal (in a pass of over {@link
+ * LISTS_BEFORE_EACH_REMOVAL_UP_TO} candidates, whenever the listing is {@link
+ * LISTING_GOOD_FOR_MS} old), and what has come to its name keeps what it names,
  * so the pass would have to be held up between a listing and the removal that
  * follows it for as long as a sandbox takes to start.
  *
@@ -1097,6 +1104,8 @@ function collect(dir: string, unrecordedToo: boolean): string[] {
     }
   }
   const known = new Set(reading.names)
+  const goodFor =
+    candidates.size <= LISTS_BEFORE_EACH_REMOVAL_UP_TO ? 0 : LISTING_GOOD_FOR_MS
   let listedAt = -Infinity
   const newcomersKeepWhatTheyName = (): boolean => {
     try {
@@ -1124,7 +1133,7 @@ function collect(dir: string, unrecordedToo: boolean): string[] {
   const notRemoved = new Set<string>()
   for (const [candidate, isSource] of candidates) {
     if (
-      performance.now() - listedAt >= LISTING_GOOD_FOR_MS &&
+      performance.now() - listedAt >= goodFor &&
       !newcomersKeepWhatTheyName()
     ) {
       return removed

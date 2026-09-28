@@ -2473,11 +2473,14 @@ async function generateFilesystemArgs(
       // This wrap names them in its manifest, so a collect can remove them
       // once no running sandbox relies on them.
       if (!pathExists) {
-        // Fix 1 (worktree): If any existing component in the deny path is a
-        // file (not a directory), skip the deny entirely. You can't mkdir
+        // Fix 1 (worktree): If any existing component above the deny path is
+        // a file (not a directory), skip the deny entirely. You can't mkdir
         // under a file, so the deny path can never be created. This handles
-        // git worktrees where .git is a file.
-        if (hasFileAncestor(normalizedPath)) {
+        // git worktrees where .git is a file. Asked of what lies above the
+        // path, not of the path: another sandbox's bubblewrap may have made a
+        // mount point at it since the look above, and a file there is no
+        // reason to leave it unbound.
+        if (hasFileAncestor(path.dirname(normalizedPath))) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
           )

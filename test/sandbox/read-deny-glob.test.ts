@@ -318,61 +318,30 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect([...unlistable]).toEqual([])
   })
 
-  it('denies whole what a pattern it cannot read a name at a time reaches', () => {
-    // `?[*].pem` cannot be followed one path component at a time, so no
-    // directory is listed through a symlink. What one that leads out of the
-    // tree reaches is denied whole, and nothing is bound back beneath that
-    // mount, since what is in there was never enumerated.
+  it('denies nothing for a link out of the tree when the pattern cannot be read a name at a time', () => {
+    // `id[*].pem` cannot be followed one path component at a time, so no
+    // directory is listed through a symlink, and what such a pattern would
+    // match through one goes undenied: a known gap. Denying whole what every
+    // link out of the tree leads to is no cure: with vendor/sdk/conf -> /usr
+    // that masks /usr, and no command starts.
     const unsplit = caseRoot('unsplit')
-    mkdirSync(join(unsplit, 'proj', 'inner'), { recursive: true })
+    mkdirSync(join(unsplit, 'proj', 'vendor', 'sdk'), { recursive: true })
     mkdirSync(join(unsplit, 'outside'))
-    writeFileSync(join(unsplit, 'proj', 'inner', 'a].pem'), '')
-    writeFileSync(join(unsplit, 'outside', 'b].pem'), '')
-    symlinkSync(join(unsplit, 'outside'), join(unsplit, 'proj', 'away'))
-
-    const unlistable = new Set<string>()
-    const mounts = expandReadDenyGlobLinux(
-      join(unsplit, 'proj', '**/?[*].pem'),
-      [],
-      unlistable,
-    )
-
-    expect(mounts).toEqual([
+    writeFileSync(join(unsplit, 'outside', 'x'), '')
+    symlinkSync(
       join(unsplit, 'outside'),
-      join(unsplit, 'proj', 'inner', 'a].pem'),
-    ])
-    expect([...unlistable]).toEqual([join(unsplit, 'outside')])
-  })
-
-  it('mounts nothing over what holds the tree for a link that leads up it', () => {
-    // The same pattern, and links any command able to write the tree can
-    // make: proj/inner/up -> ../.. leads to the directory holding proj,
-    // proj/x -> ../.. to the one above that. Denied whole, either is a tmpfs
-    // over all of it, with nothing bound back beneath, for every later
-    // command. The link that leads out of the tree without leading up it is
-    // still denied whole.
-    const upward = caseRoot('unsplit-up')
-    const proj = join(upward, 'home', 'proj')
-    mkdirSync(join(proj, 'inner'), { recursive: true })
-    mkdirSync(join(upward, 'home', 'beside'))
-    writeFileSync(join(proj, 'inner', 'a].pem'), '')
-    writeFileSync(join(upward, 'home', 'beside', 'b].pem'), '')
-    symlinkSync(join('..', '..'), join(proj, 'x'))
-    symlinkSync(join('..', '..'), join(proj, 'inner', 'up'))
-    symlinkSync(join('..', 'beside'), join(proj, 'away'))
+      join(unsplit, 'proj', 'vendor', 'sdk', 'conf'),
+    )
 
     const unlistable = new Set<string>()
     const mounts = expandReadDenyGlobLinux(
-      join(proj, '**/?[*].pem'),
+      join(unsplit, 'proj', 'id[*].pem'),
       [],
       unlistable,
     )
 
-    expect(mounts).toEqual([
-      join(upward, 'home', 'beside'),
-      join(proj, 'inner', 'a].pem'),
-    ])
-    expect([...unlistable]).toEqual([join(upward, 'home', 'beside')])
+    expect(mounts).toEqual([])
+    expect([...unlistable]).toEqual([])
   })
 
   it('lists every match where it really is when the base is a symlink', () => {

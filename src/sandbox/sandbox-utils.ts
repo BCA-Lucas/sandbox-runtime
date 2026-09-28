@@ -1186,9 +1186,10 @@ export interface GlobWalk {
    *  `realOf` has no entry for them. Unreadable now is not absent: a deny
    *  expansion must cover such a link rather than drop it. */
   uninspectableLinks: Set<string>
-  /** Directories the walk reached but could not list (any error but
-   *  absence). Whatever the pattern matches beneath them is missing from
-   *  `matches`; a deny expansion must cover them whole. */
+  /** Directories the walk could not list (any error but absence) under a
+   *  name it reached them by, each named once. What the pattern matches
+   *  beneath one can be missing from `matches`; a deny expansion must cover
+   *  them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
    *  lives, for each one that is a symlink or is spelled through one above
@@ -1246,12 +1247,16 @@ export function expandGlobPattern(
  * wildcard inside a bracket expression (globToRegex rewrites that wildcard
  * like any other, and what is left no longer reads as one character), with a
  * second `[` that nothing closes, or that spells one of globToRegex's
- * placeholders. Its positions say nothing, so every directory is listed, an
- * entry is matched by its whole spelling, and {@link walkGlobPattern} does
- * not list such a pattern through symlinks.
+ * placeholders; and for one that is not split: over {@link MAX_GLOB_PIECES}
+ * pieces, or with a piece that does not compile on its own (`whyNot` says
+ * which). Its positions say nothing, so every directory is listed, an entry
+ * is matched by its whole spelling, and {@link walkGlobPattern} does not list
+ * such a pattern through symlinks.
  */
 interface GlobPositions {
   splits: boolean
+  /** Why a pattern of a shape that splits was not, for the walk's warning. */
+  whyNot?: string
   /** The positions beneath the root directory. */
   start: readonly number[]
   next: (positions: readonly number[], name: string) => readonly number[]
@@ -1330,9 +1335,9 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
   )
 }
 
-/** The most pieces a pattern may hand the automaton, which is built by
- *  recursion, one call per path component: thousands would overflow the
- *  stack. A longer pattern is matched against real paths instead. */
+/** The most pieces a pattern is split into, which bounds the recursion that
+ *  builds the automaton (one call per path component). A longer pattern is
+ *  matched against real paths instead. */
 const MAX_GLOB_PIECES = 1024
 
 function globPositions(
@@ -1437,16 +1442,6 @@ function globPositions(
     return componentAt(0, false)
   }
 
-  /** The weaker reading, said out loud where it is taken: the walk matches
-   *  whole paths, and on a deny path descends no symlinked directory. */
-  const cannotBeSplit = (why: string): GlobPositions => {
-    logForDebugging(
-      `[Sandbox] Glob pattern ${normalizedPattern} cannot be read one path component at a time (${why}), so it is matched against real paths only`,
-      { level: 'warn' },
-    )
-    return unsplit
-  }
-
   let starts: number[]
   let firstOfDirectoryForm: number
   try {
@@ -1457,7 +1452,10 @@ function globPositions(
     // A shape globPieces is documented not to take.
     if (pieces === undefined || directoryPieces === undefined) return unsplit
     if (pieces.length + directoryPieces.length > MAX_GLOB_PIECES) {
-      return cannotBeSplit(`it has more than ${MAX_GLOB_PIECES} pieces`)
+      return {
+        ...unsplit,
+        whyNot: `it has more than ${MAX_GLOB_PIECES} pieces`,
+      }
     }
     starts = [build(pieces)]
     firstOfDirectoryForm = states.length
@@ -1465,7 +1463,7 @@ function globPositions(
   } catch (err) {
     // A piece of the pattern that is no regular expression on its own, or an
     // automaton too deep to build.
-    return cannotBeSplit(String(err))
+    return { ...unsplit, whyNot: String(err) }
   }
 
   const open = (into: Set<number>, position: number | undefined): void => {
@@ -1601,8 +1599,10 @@ export function walkGlobPattern(
     opts.withDirectoryForm === true,
   )
   if (opts.followSymlinkedDirectories && !positions.splits) {
+    // The weaker reading, said out loud where it costs coverage.
+    const why = positions.whyNot === undefined ? '' : ` (${positions.whyNot})`
     logForDebugging(
-      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,
+      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time${why}, so it is matched against real paths only and not through symlinked directories`,
       { level: 'warn' },
     )
   }
@@ -1651,13 +1651,6 @@ export function walkGlobPattern(
     unlisted?: true
   }
   const records = new Map<string, DirectoryRecord>()
-  const recordFor = (real: string): DirectoryRecord => {
-    let record = records.get(real)
-    if (record === undefined) {
-      records.set(real, (record = { listedFor: new Set() }))
-    }
-    return record
-  }
   const pending: Frame[] = []
   /** A filesystem call on a real path, and on a shorter name for it when the
    *  real path is too long to name. Nothing else is retried: every other
@@ -1730,7 +1723,10 @@ export function walkGlobPattern(
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
-    const record = recordFor(real)
+    const record: DirectoryRecord = records.get(real) ?? {
+      listedFor: new Set(),
+    }
+    records.set(real, record)
     // What a position finds beneath a directory does not depend on the
     // others it came with, so only the ones new to this directory are taken.
     const fresh = frame.positions.filter(p => !record.listedFor.has(p))
@@ -1800,15 +1796,9 @@ export function walkGlobPattern(
         positions.matchesDirectoryForm(fresh, entry.name, candidate)
       // A pattern that does not split is not listed through a link: no two
       // names for a directory can be told apart, so none but its own is
-      // listed. A link that is itself a match still denies what it leads to,
-      // and one that leads out of the walk's tree is denied whole below.
+      // listed. A link that is itself a match still denies what it leads to.
       const beneath = positions.splits ? positions.next(fresh, entry.name) : []
-      if (
-        positions.splits &&
-        !isMatch &&
-        !isDirectoryFormCandidate &&
-        beneath.length === 0
-      ) {
+      if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
         continue
       }
       const shortPath = path.join(frame.short, entry.name)
@@ -1828,34 +1818,7 @@ export function walkGlobPattern(
         walk.directoryMatches.push(fullPath)
         walk.realOf.set(fullPath, target.real)
       }
-      if (beneath.length === 0) {
-        if (
-          !positions.splits &&
-          !isMatch &&
-          !isDirectoryFormCandidate &&
-          !isAtOrUnder(target.real, baseReal) &&
-          !isAtOrUnder(baseReal, target.real)
-        ) {
-          // This link is not listed through, so what the pattern matches in
-          // there is found by no other name: the directory it leads to is
-          // denied whole. A target inside the walk's own tree is listed under
-          // its own name. One that leads up, to the walk's base or above it,
-          // is left alone, as below for a pattern that splits: denied whole
-          // it would hide the base and everything beside it, over a link
-          // anything able to write the tree can make.
-          const targetRecord = recordFor(target.real)
-          if (!targetRecord.unlisted) {
-            targetRecord.unlisted = true
-            walk.unlisted.push(fullPath)
-            logForDebugging(
-              `[Sandbox] Glob pattern ${globPath} cannot be followed through ${fullPath} -> ${target.real}, which lies outside ${baseReal}: denying it whole`,
-              { level: 'warn' },
-            )
-          }
-          walk.realOf.set(fullPath, target.real)
-        }
-        continue
-      }
+      if (beneath.length === 0) continue
       // A link that leads up — to this directory or above it, or to the
       // walk's base or above it — is not listed through: beneath it is a tree
       // the pattern was never aimed at (`/`, a home directory).

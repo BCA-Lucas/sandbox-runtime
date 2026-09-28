@@ -846,65 +846,6 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
-  it('denies whole what a pattern it cannot split reaches through a link', () => {
-    // `?[*].pem` cannot be read one name at a time, so no directory is
-    // listed through a link: what one that leads out of the tree reaches is
-    // denied whole rather than dropped. A link within the tree loses
-    // nothing, since every directory there is listed under its own name.
-    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-')))
-    try {
-      mkdirSync(join(root, 'proj', 'inner'), { recursive: true })
-      mkdirSync(join(root, 'outside'))
-      writeFileSync(join(root, 'proj', 'inner', 'a].pem'), 'KEY')
-      writeFileSync(join(root, 'outside', 'b].pem'), 'KEY')
-      symlinkSync(join(root, 'outside'), join(root, 'proj', 'away'))
-      symlinkSync(join(root, 'proj', 'inner'), join(root, 'proj', 'near'))
-
-      const walk = walkGlobPattern(join(root, 'proj', '**/?[*].pem'), {
-        followSymlinkedDirectories: true,
-      })
-
-      expect(walk.matches).toEqual([join(root, 'proj', 'inner', 'a].pem')])
-      expect(walk.unlisted).toEqual([join(root, 'proj', 'away')])
-      expect(walk.realOf.get(join(root, 'proj', 'away'))).toBe(
-        join(root, 'outside'),
-      )
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-
-  it('leaves alone a link that leads up the tree from a pattern it cannot split', () => {
-    // What such a link leads to holds the base being walked: denied whole,
-    // it would hide the base itself and everything beside it. A link to a
-    // directory beside the base is still denied whole.
-    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-up-')))
-    const proj = join(root, 'home', 'proj')
-    try {
-      mkdirSync(join(proj, 'inner'), { recursive: true })
-      mkdirSync(join(root, 'home', 'beside'))
-      writeFileSync(join(proj, 'inner', 'a].pem'), 'KEY')
-      writeFileSync(join(root, 'home', 'beside', 'b].pem'), 'KEY')
-      // To the base, to its parent and to the parent's parent.
-      symlinkSync(proj, join(proj, 'self'))
-      symlinkSync(join('..', '..'), join(proj, 'inner', 'up'))
-      symlinkSync(root, join(proj, 'inner', 'upper'))
-      symlinkSync(join('..', 'beside'), join(proj, 'away'))
-
-      const walk = walkGlobPattern(join(proj, '**/?[*].pem'), {
-        followSymlinkedDirectories: true,
-      })
-
-      expect(walk.matches).toEqual([join(proj, 'inner', 'a].pem')])
-      expect(walk.unlisted).toEqual([join(proj, 'away')])
-      expect([...walk.realOf]).toEqual([
-        [join(proj, 'away'), join(root, 'home', 'beside')],
-      ])
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-
   it('does not let one name that fails to list answer for the others', () => {
     // A listing can fail for a reason that has nothing to do with the
     // directory (too many open files at that moment). Letting that failure
@@ -1020,9 +961,10 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     )
 
     expect(result.matches).toEqual([])
-    expect(
-      warnings.some(w => w.includes('pieces') && w.includes('real paths only')),
-    ).toBe(true)
+    // Once, with the reason in it.
+    const said = warnings.filter(w => w.includes('real paths only'))
+    expect(said).toHaveLength(1)
+    expect(said[0]).toContain('pieces')
   })
 })
 

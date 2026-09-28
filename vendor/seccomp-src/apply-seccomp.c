@@ -21,30 +21,22 @@
  * tree. The bwrap init, bash wrapper, and socat helpers are not addressable,
  * so they cannot be ptraced or patched via /proc/N/mem even on systems with
  * kernel.yama.ptrace_scope=0. Both halves of this program are non-dumpable
- * from before the first fork, so neither can be ptraced or written through
- * /proc/N/mem. That matters for the outer half where the fresh /proc below
- * cannot be mounted (the enableWeakerNestedSandbox case): the command then
- * still sees it, and one started by uid 0 holds the capabilities to reach
- * into a dumpable process in its user namespace. The outer half also takes
- * the namespaces filter (not when SRT_ALLOW_NESTED_USERNS=1).
+ * from before the first fork, and the outer half takes the namespaces filter
+ * too (not with SRT_ALLOW_NESTED_USERNS=1): where the fresh /proc below cannot
+ * be mounted (enableWeakerNestedSandbox) the command still sees the outer
+ * half, and one started by uid 0 holds capabilities in its user namespace.
  *
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
  *
- * Keeping the command in these namespaces. A command that can create a user
+ * The command may not make namespaces of its own: one that can create a user
  * namespace can undo the sandbox's write denies (NESTED_USERNS_ENV in
- * src/sandbox/linux-sandbox-utils.ts says how). So it may not make further
- * namespaces, by two independent means: the `namespaces` seccomp filter
- * (seccomp-unix-block.c) and a limit of zero on user.max_user_namespaces in
- * the user namespace this helper made. The filter is what holds a command
- * started by uid 0, which could lift the limit; the limit still holds if a
- * call is missing from the filter. SRT_ALLOW_NESTED_USERNS=1 turns both off,
- * for a command that has to make namespaces of its own. It is read before
- * the command exists, and removed from its environment.
- *
- * SRT_HELPER_FEATURES=1 makes this program print what it supports, one word a
- * line, and exit 0, so that a caller can tell a helper that has the namespace
- * limit (`userns-limit`) from one that has not, which runs argv[1].
+ * src/sandbox/linux-sandbox-utils.ts says how). Two independent means: the
+ * `namespaces` seccomp filter (seccomp-unix-block.c), which is what holds a
+ * command started by uid 0, and user.max_user_namespaces=0 in the user
+ * namespace this helper made, which holds if a call is missing from the
+ * filter. SRT_ALLOW_NESTED_USERNS=1, read before the command exists and
+ * removed from its environment, turns both off.
  *
  * Compile: gcc -static -O2 -o apply-seccomp apply-seccomp.c
  */
@@ -114,11 +106,10 @@
  * When SRT_OBSERVE_SOCK is set the worker installs a second seccomp filter
  * that traps write-intent filesystem syscalls to
  * SECCOMP_RET_USER_NOTIF, then ships the listener fd to the OUTER STUB over
- * a pre-fork socketpair. The outer stub is under neither that filter nor the
- * Unix-socket one, so it services every notification with
- * SECCOMP_USER_NOTIF_FLAG_CONTINUE — the workload's behaviour is unchanged —
- * and writes one JSON line per observed call to the SRT_OBSERVE_SOCK unix
- * socket (a Node net.Server).
+ * a pre-fork socketpair. The outer stub is under neither of the two, so it
+ * services every notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE — the
+ * workload's behaviour is unchanged — and writes one JSON line per
+ * observed call to the SRT_OBSERVE_SOCK unix socket (a Node net.Server).
  *
  * Paths are read from the workload's address space with process_vm_readv.
  * That memory is ATTACKER-CONTROLLED and racy (the workload can rewrite the
@@ -680,13 +671,6 @@ static int reap_until(pid_t main_child) {
 }
 
 int main(int argc, char *argv[]) {
-    /* Before the argc check: the probe is asked with no real command. */
-    const char *features = getenv("SRT_HELPER_FEATURES");
-    if (features && strcmp(features, "1") == 0) {
-        puts("userns-limit");
-        return 0;
-    }
-
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         return 1;
@@ -761,12 +745,13 @@ int main(int argc, char *argv[]) {
         /* If this binary was exec'd without read permission (e.g. installed
          * mode 0111), the kernel marked the process non-dumpable, which
          * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
-         * writes below would fail with EACCES. Flip dumpable on for the
-         * uid/gid mapping; it is cleared for good before the first fork. While
+         * writes below would fail with EACCES. Temporarily flip dumpable
+         * on for the uid/gid mapping; it is cleared before the fork. While
          * dumpable is 1, a same-uid process can ptrace us (under yama
          * ptrace_scope=0) and dump the mapped pages that mode 0111 is
-         * meant to hide, for a few-syscall window — the same unavoidable
-         * window runc and systemd accept for this pattern.
+         * meant to hide; that exposure is kept to a
+         * few-syscall race window — the same unavoidable window runc and
+         * systemd accept for this pattern.
          *
          * A prctl failure here is ignored: it is next to impossible for
          * this call, and if raising dumpable did fail the map writes
@@ -872,8 +857,7 @@ int main(int argc, char *argv[]) {
      * Inner init — PID 1 in the nested PID namespace.
      * ================================================================ */
 
-    /* Block ptrace and /proc/1/mem writes against this process. Already so
-     * since before the fork. */
+    /* Block ptrace and /proc/1/mem writes against this process. */
     if (prctl(PR_SET_DUMPABLE, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_DUMPABLE)");
     }
@@ -894,14 +878,11 @@ int main(int argc, char *argv[]) {
 
     /* No further user namespaces below this one. The sysctl is per user
      * namespace and the path resolves to the opener's, so it is written only
-     * in path (b): in path (a) it would be the caller's, and on a bare host
-     * the machine's. Zero, not one: the limit counts namespaces created
-     * beneath this one, so one would still let the command make the one it
-     * needs. Writing it takes CAP_SYS_RESOURCE over this namespace, which a
-     * command not started by uid 0 loses at exec.
-     *
-     * Not fatal: where /proc could not be mounted above, /proc/sys is
-     * commonly read-only, and the filter installed below refuses the same
+     * in path (b): in path (a) it would be the caller's, on a bare host the
+     * machine's. Zero: the limit counts namespaces created beneath this one.
+     * Raising it takes CAP_SYS_RESOURCE here, which a command not started by
+     * uid 0 loses at exec. Not fatal: where /proc could not be mounted above,
+     * /proc/sys is commonly read-only, and the filter below refuses the same
      * calls. */
     if (!allow_nested_userns && made_userns
         && write_file("/proc/sys/user/max_user_namespaces", "0") < 0) {
@@ -959,7 +940,6 @@ int main(int argc, char *argv[]) {
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
     unsetenv("SRT_ALLOW_NESTED_USERNS");
-    unsetenv("SRT_HELPER_FEATURES");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }

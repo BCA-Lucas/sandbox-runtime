@@ -1057,20 +1057,9 @@ function checkDependenciesCommon(
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
-      allowAllUnixSockets: getAllowAllUnixSockets(),
-      allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
-      enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
-    return {
-      done: {
-        errors,
-        warnings,
-        features: linuxDeps.features,
-        details: linuxDeps.details,
-      },
-    }
   } else if (platform === 'windows') {
     let srtWin: SrtWinSpawn
     try {

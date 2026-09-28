@@ -32,18 +32,13 @@
  * If arch is given (x86_64 or aarch64), the filter is generated for that
  * architecture instead of the native one. Lets a single-arch builder emit
  * filters for both x64 and arm64; for `namespaces`, only with a libseccomp
- * that names every call in the filter (2.6.1 and later), see
- * add_namespace_rules.
+ * that names every call in it (2.6.1 and later).
  *
- * The third argument picks the rule set. `unix` (the default) is the filter
- * described above. `namespaces` is a second, separate filter that
- * apply-seccomp stacks on top of it to keep the command in the namespaces
- * the sandbox made for it (apply-seccomp.c says why). It refuses the
- * user-namespace flag to unshare(2) and clone(2), clone3(2) outright, and
- * setns(2) and the calls that change a mount tree. The last group is what
- * holds a command started by uid 0, which has those capabilities in the
- * helper's own namespace and needs no new one. Two filters rather than one
- * so that a caller who opts a command out of this one keeps the first.
+ * The third argument picks the rule set: `unix` (the default) is the filter
+ * above; `namespaces` is a second one, which apply-seccomp stacks on it to
+ * keep the command in the namespaces the sandbox made for it (apply-seccomp.c
+ * says why). Two filters, so that a command opted out of the second keeps the
+ * first.
  *
  * Dependencies:
  *   - libseccomp (libseccomp-dev package on Debian/Ubuntu)
@@ -65,112 +60,67 @@
 
 /*
  * The rules of the `namespaces` filter. None is ever left out: a call this
- * libseccomp cannot name for the architecture fails the build, except the two
- * newest, which go in by number where that can be done (below). "Cannot name"
- * is any negative answer to the lookup: -1 is a name the library does not
- * know, a number below that one it reports absent on the architecture. The
- * plain seccomp_rule_add() takes such a number, or a call the target
- * architecture lacks, adds nothing and returns success, so every rule here
- * goes in with seccomp_rule_add_exact(), which fails instead.
+ * libseccomp cannot name fails the generator, except the two newest, which go
+ * in by number where that can be done. Every rule goes in with
+ * seccomp_rule_add_exact(): the plain seccomp_rule_add() takes a call the
+ * target architecture lacks, adds nothing, and returns success.
  */
 static int add_namespace_rules(scmp_filter_ctx ctx, int native,
                                const char *arch_name) {
-    int rc;
-
-    /* The flags word is arg0 of unshare(2), and of clone(2) on both
-     * architectures this generator emits for. Masked, so the flag is caught
-     * whatever else is set beside it. */
-    const char *flag_calls[] = { "unshare", "clone" };
-    for (size_t i = 0; i < sizeof(flag_calls) / sizeof(flag_calls[0]); i++) {
-        int nr = seccomp_syscall_resolve_name(flag_calls[i]);
-        if (nr < 0) {
-            fprintf(stderr, "Error: libseccomp cannot name %s on this architecture\n",
-                    flag_calls[i]);
-            return -1;
-        }
-        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 1,
-                                    SCMP_A0(SCMP_CMP_MASKED_EQ, SRT_CLONE_NEWUSER,
-                                            SRT_CLONE_NEWUSER));
-        if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add %s rule: %s\n", flag_calls[i],
-                    strerror(-rc));
-            return -1;
-        }
-    }
-
-    /* clone3(2) passes its flags in a struct, which a filter cannot read.
-     * ENOSYS, not EPERM: libc and the language runtimes treat ENOSYS as "this
-     * kernel has no clone3" and fall back to clone(2), which the rule above
-     * does cover; EPERM reads as a real failure and breaks thread creation. */
-    {
-        int nr = seccomp_syscall_resolve_name("clone3");
-        if (nr < 0) {
-            fprintf(stderr, "Error: libseccomp cannot name clone3 on this architecture\n");
-            return -1;
-        }
-        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(ENOSYS), nr, 0);
-        if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add clone3 rule: %s\n", strerror(-rc));
-            return -1;
-        }
-    }
-
-    /* Joining another namespace, and the calls that change a mount tree, the
-     * old interface and the fd-based one. */
-    const char *refused[] = {
-        "setns",      "mount",    "umount2",  "pivot_root",
-        "open_tree",  "move_mount", "fsopen", "fsconfig",
-        "fsmount",    "fspick",
-    };
-    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
-        int nr = seccomp_syscall_resolve_name(refused[i]);
-        if (nr < 0) {
-            fprintf(stderr,
-                    "Error: libseccomp cannot name %s on this architecture\n",
-                    refused[i]);
-            return -1;
-        }
-        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
-        if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add %s rule: %s\n", refused[i],
-                    strerror(-rc));
-            return -1;
-        }
-    }
-
-    /* Two calls newer than the libseccomp some builders have: mount_setattr
-     * (named from libseccomp 2.5.2) and open_tree_attr (from 2.6.1). Where
-     * the library cannot name one it goes in by number, which is the same on
-     * every architecture for each call added since Linux 5.1. That works
-     * only for the builder's own architecture: libseccomp refuses a bare
-     * number for another one. Emitting for another architecture is then an
-     * error, never a filter with the call left out. */
     static const struct {
         const char *name;
-        int nr;
-    } newer[] = {
-        { "mount_setattr", 442 },
-        { "open_tree_attr", 467 },
+        int err;
+        /* Refused only with CLONE_NEWUSER in arg0, the flags word of both
+         * calls on both architectures. Masked: other flags beside it too. */
+        int newuser_only;
+        /* For a call newer than the libseccomp some builders have
+         * (mount_setattr is named from 2.5.2, open_tree_attr from 2.6.1): its
+         * number, the same on every architecture since Linux 5.1. Taken by
+         * libseccomp for the builder's own architecture only. */
+        int nr_if_unnamed;
+    } rules[] = {
+        { "unshare", EPERM, 1, 0 },
+        { "clone", EPERM, 1, 0 },
+        /* clone3(2) passes its flags in a struct, which a filter cannot read.
+         * ENOSYS, not EPERM: libc and the language runtimes take ENOSYS as
+         * "this kernel has no clone3" and fall back to clone(2), which the
+         * rule above covers; EPERM breaks thread creation. */
+        { "clone3", ENOSYS, 0, 0 },
+        /* Joining another namespace, and changing a mount tree: what holds a
+         * command started by uid 0, which has those capabilities in the
+         * helper's namespace and needs no new one. */
+        { "setns", EPERM, 0, 0 },
+        { "mount", EPERM, 0, 0 },
+        { "umount2", EPERM, 0, 0 },
+        { "pivot_root", EPERM, 0, 0 },
+        { "open_tree", EPERM, 0, 0 },
+        { "move_mount", EPERM, 0, 0 },
+        { "fsopen", EPERM, 0, 0 },
+        { "fsconfig", EPERM, 0, 0 },
+        { "fsmount", EPERM, 0, 0 },
+        { "fspick", EPERM, 0, 0 },
+        { "mount_setattr", EPERM, 0, 442 },
+        { "open_tree_attr", EPERM, 0, 467 },
     };
-    for (size_t i = 0; i < sizeof(newer) / sizeof(newer[0]); i++) {
-        int nr = seccomp_syscall_resolve_name(newer[i].name);
-        if (nr < 0) {
-            if (!native) {
-                const struct scmp_version *v = seccomp_version();
-                fprintf(stderr,
-                        "Error: libseccomp %u.%u.%u cannot name %s, and a call can "
-                        "go in by number only for the builder's own architecture, "
-                        "not for %s. Build with a libseccomp that names it, or "
-                        "generate this architecture's filter on that architecture.\n",
-                        v ? v->major : 0, v ? v->minor : 0, v ? v->micro : 0,
-                        newer[i].name, arch_name);
-                return -1;
-            }
-            nr = newer[i].nr;
+    for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+        int nr = seccomp_syscall_resolve_name(rules[i].name);
+        if (nr < 0 && rules[i].nr_if_unnamed != 0 && native) {
+            nr = rules[i].nr_if_unnamed;
         }
-        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
+        if (nr < 0) {
+            const struct scmp_version *v = seccomp_version();
+            fprintf(stderr, "Error: libseccomp %u.%u.%u cannot name %s for %s\n",
+                    v ? v->major : 0, v ? v->minor : 0, v ? v->micro : 0,
+                    rules[i].name, arch_name);
+            return -1;
+        }
+        int rc = rules[i].newuser_only
+            ? seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(rules[i].err), nr, 1,
+                                     SCMP_A0(SCMP_CMP_MASKED_EQ, SRT_CLONE_NEWUSER,
+                                             SRT_CLONE_NEWUSER))
+            : seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(rules[i].err), nr, 0);
         if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add %s rule: %s\n", newer[i].name,
+            fprintf(stderr, "Error: Failed to add %s rule: %s\n", rules[i].name,
                     strerror(-rc));
             return -1;
         }
@@ -178,44 +128,7 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     return 0;
 }
 
-/* The rules of the `unix` filter. */
-static int add_unix_rules(scmp_filter_ctx ctx) {
-    int rc;
-
-    /* Add rule to block socket(AF_UNIX, ...) */
-    /* socket() syscall signature: int socket(int domain, int type, int protocol) */
-    /* arg0 = domain (AF_UNIX = 1) */
-    /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
-     * int, so the kernel ignores the upper 32 bits of the register. A plain
-     * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
-     * are set. */
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
-    if (rc < 0) {
-        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
-        return -1;
-    }
-
-    /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
-     * in kernel context without going through the socket() syscall, bypassing
-     * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
-     * shared-memory ring), so the only safe option is to deny ring creation
-     * and use. Blocking all three syscalls also covers the case of an
-     * inherited ring fd. */
-    int io_uring_calls[] = {
-        SCMP_SYS(io_uring_setup),
-        SCMP_SYS(io_uring_enter),
-        SCMP_SYS(io_uring_register),
-    };
-    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
-        if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
-            return -1;
-        }
-    }
-    return 0;
-}
+static int export_filter(scmp_filter_ctx ctx, const char *output_file);
 
 int main(int argc, char *argv[]) {
     scmp_filter_ctx ctx;
@@ -267,13 +180,56 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    rc = strcmp(rule_set, "namespaces") == 0
-             ? add_namespace_rules(ctx, native, arch_name ? arch_name : "native")
-             : add_unix_rules(ctx);
+    if (strcmp(rule_set, "namespaces") == 0) {
+        if (add_namespace_rules(ctx, native,
+                                arch_name ? arch_name : "native") < 0) {
+            seccomp_release(ctx);
+            return 1;
+        }
+        return export_filter(ctx, output_file);
+    }
+
+    /* Add rule to block socket(AF_UNIX, ...) */
+    /* socket() syscall signature: int socket(int domain, int type, int protocol) */
+    /* arg0 = domain (AF_UNIX = 1) */
+    /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
+     * int, so the kernel ignores the upper 32 bits of the register. A plain
+     * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
+     * are set. */
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
     if (rc < 0) {
+        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
         seccomp_release(ctx);
         return 1;
     }
+
+    /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
+     * in kernel context without going through the socket() syscall, bypassing
+     * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
+     * shared-memory ring), so the only safe option is to deny ring creation
+     * and use. Blocking all three syscalls also covers the case of an
+     * inherited ring fd. */
+    int io_uring_calls[] = {
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(io_uring_register),
+    };
+    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return 1;
+        }
+    }
+
+    return export_filter(ctx, output_file);
+}
+
+/* Writes the filter to output_file, and releases it. */
+static int export_filter(scmp_filter_ctx ctx, const char *output_file) {
+    int rc;
 
     /* Export the filter to a file */
     int fd = open(output_file, O_CREAT | O_WRONLY | O_TRUNC, 0600);

@@ -433,13 +433,57 @@ function connectAs(
 }
 
 /**
+ * The same over SOCKS5: the reply code to a CONNECT for `target` under
+ * `username` (0 is granted, 2 is refused by the rules).
+ */
+function socksConnectAs(
+  proxyPort: number,
+  target: string,
+  username: string,
+): Promise<number | undefined> {
+  return new Promise(resolve => {
+    const [host, port] = target.split(':') as [string, string]
+    const field = (text: string): Buffer =>
+      Buffer.concat([Buffer.from([Buffer.byteLength(text)]), Buffer.from(text)])
+    const socket = connect(proxyPort, '127.0.0.1', () => {
+      socket.write(
+        Buffer.concat([
+          // Offer username/password only, authenticate, then CONNECT by name.
+          Buffer.from([0x05, 0x01, 0x02, 0x01]),
+          field(username),
+          field(SandboxManager.getProxyAuthToken() ?? ''),
+          Buffer.from([0x05, 0x01, 0x00, 0x03]),
+          field(host),
+          Buffer.from([Number(port) >> 8, Number(port) & 0xff]),
+        ]),
+      )
+    })
+    let reply = Buffer.alloc(0)
+    socket.on('data', chunk => {
+      reply = Buffer.concat([reply, chunk])
+      // Method selection (2 bytes), auth status (2), then VER and REP.
+      if (reply.length >= 6) socket.destroy()
+    })
+    socket.on('close', () => resolve(reply[5]))
+    socket.on('error', () => {})
+    socket.setTimeout(2000, () => socket.destroy())
+  })
+}
+
+/**
  * A listener on loopback for the proxy to dial, so an allow is observed as a
  * 200 without leaving the machine: an IP literal has no name to resolve and
- * nothing for the resolved-address check to refuse.
+ * nothing for the resolved-address check to refuse. It answers a request with
+ * the body `ok`.
  */
 function listenOnLoopback(): Promise<{ server: Server; target: string }> {
   return new Promise(resolve => {
-    const server = createServer(socket => socket.on('error', () => {}))
+    const server = createServer(socket => {
+      socket.on('error', () => {})
+      socket.once('data', () =>
+        socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'),
+      )
+    })
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address() as AddressInfo
       resolve({ server, target: `127.0.0.1:${port}` })
@@ -515,6 +559,56 @@ describe('per-command network allow lists', () => {
       `deny network-outbound ${loopback.target} (host is not on the allow list)`,
     ])
   })
+
+  it('applies over SOCKS5 as it does over CONNECT', async () => {
+    await start({})
+    const port = SandboxManager.getSocksProxyPort()!
+    const registered = randomCommandId()
+    SandboxManager.registerCommandNetworkLists(registered, {
+      allowedDomains: [loopback.target],
+    })
+
+    expect(
+      await socksConnectAs(port, loopback.target, usernameFor(registered)),
+    ).toBe(0)
+    expect(
+      await socksConnectAs(
+        port,
+        loopback.target,
+        usernameFor(randomCommandId()),
+      ),
+    ).toBe(2)
+  })
+
+  // The one case where the wrap, not usernameFor(), mints the username.
+  it.if(isMacOS || isLinux)(
+    'reaches a sandboxed command through the commandId its wrap was given',
+    async () => {
+      await start({})
+      const curlAs = async (commandId: string): Promise<string> => {
+        const wrapped = await SandboxManager.wrapWithSandbox(
+          // NO_PROXY in the sandbox exempts loopback; this goes to the proxy.
+          `curl -s --noproxy '' --max-time 3 http://${loopback.target}/`,
+          undefined,
+          undefined,
+          undefined,
+          { commandId },
+        )
+        return (await spawnAsync('bash', ['-c', wrapped])).stdout
+      }
+      const registered = randomCommandId()
+      SandboxManager.registerCommandNetworkLists(registered, {
+        allowedDomains: [loopback.target],
+      })
+
+      expect(await curlAs(registered)).toBe('ok')
+      expect(await curlAs(randomCommandId())).not.toBe('ok')
+      expect(violationLines()).toEqual([
+        `deny network-outbound ${loopback.target} (host is not on the allow list)`,
+      ])
+    },
+    30000,
+  )
 
   it('is consulted before the ask callback, which still decides every host it does not list', async () => {
     const port = await start({}, denyAndRecord)
@@ -679,6 +773,48 @@ describe('per-command network allow lists', () => {
     ).toBe(403)
   })
 
+  it('registers under an external network.httpProxyPort, where no list applies, and says so in the debug log', async () => {
+    const before = process.env.SRT_DEBUG
+    process.env.SRT_DEBUG = '1'
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    const warnings = (): string[] =>
+      warnSpy.mock.calls
+        .map(call => String(call[0]))
+        .filter(message => message.includes('registerCommandNetworkLists'))
+    try {
+      await start({})
+      SandboxManager.registerCommandNetworkLists(randomCommandId(), {})
+      expect(warnings()).toEqual([])
+
+      await SandboxManager.reset()
+      await start({ httpProxyPort: 8888 })
+      const registered = randomCommandId()
+      SandboxManager.registerCommandNetworkLists(registered, {
+        allowedDomains: [loopback.target],
+      })
+      expect(warnings()).toHaveLength(1)
+      expect(warnings()[0]).toContain('this list will never apply')
+      expect(warnings()[0]).not.toContain(registered)
+      // The library's own port still serves SOCKS and CONNECT, and reads no id.
+      expect(
+        await connectAs(
+          SandboxManager.getSocksProxyPort()!,
+          loopback.target,
+          usernameFor(registered),
+        ),
+      ).toBe(403)
+    } finally {
+      warnSpy.mockRestore()
+      errorSpy.mockRestore()
+      if (before === undefined) {
+        delete process.env.SRT_DEBUG
+      } else {
+        process.env.SRT_DEBUG = before
+      }
+    }
+  })
+
   it('refuses an id shorter than 22 characters, and says what an id has to be', () => {
     const lists = { allowedDomains: ['example.com'] }
     for (const tooShort of ['', '1', 'inv-0001', 'a'.repeat(21)]) {
@@ -727,6 +863,23 @@ describe('per-command network allow lists', () => {
     }
     expect(message).not.toBe('')
     expect(message).not.toContain(almost)
+  })
+
+  it('measures the floor on the key it stores, where an unpaired surrogate counts for nothing', () => {
+    // Each is 22 characters long, and is stored with U+FFFD in place of every
+    // unpaired surrogate. U+FFFD is not counted.
+    for (const hollow of [
+      '\ud800'.repeat(22),
+      `${'a'.repeat(21)}\udc00`,
+      '\ufffd'.repeat(22),
+    ]) {
+      expect(hollow).toHaveLength(22)
+      expect(() =>
+        SandboxManager.registerCommandNetworkLists(hollow, {}),
+      ).toThrow(/at least 22 characters, unpaired surrogates not counted/)
+    }
+    // A pair is a character like any other, counted as String.length does.
+    SandboxManager.registerCommandNetworkLists('\u{1f600}'.repeat(11), {})
   })
 
   // A list arriving at run time cannot carry an entry the configuration

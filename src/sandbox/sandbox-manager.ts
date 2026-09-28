@@ -275,15 +275,19 @@ function registerCommandNetworkLists(
   commandId: string,
   lists: { allowedDomains?: string[] },
 ): void {
+  // The floor is measured on the key the map holds, not on the raw id, and
+  // less U+FFFD: every unpaired surrogate becomes one, so it carries nothing.
+  const key =
+    typeof commandId === 'string'
+      ? decodeSandboxedCommand(encodeSandboxedCommand(commandId))
+      : ''
   // The id is not echoed in either message: it is what stands between a
   // sandboxed process and this list, and error text ends up in logs.
-  if (
-    typeof commandId !== 'string' ||
-    commandId.length < MIN_NETWORK_LISTS_COMMAND_ID_LENGTH
-  ) {
+  if (key.replace(/\ufffd/g, '').length < MIN_NETWORK_LISTS_COMMAND_ID_LENGTH) {
     throw new Error(
       `registerCommandNetworkLists: commandId must be a string of at least ` +
-        `${MIN_NETWORK_LISTS_COMMAND_ID_LENGTH} characters. The id is the ` +
+        `${MIN_NETWORK_LISTS_COMMAND_ID_LENGTH} characters, unpaired ` +
+        `surrogates not counted. The id is the ` +
         `only thing that binds a proxy connection to this allow list, and ` +
         `the sandboxed process chooses which id it presents, so it must be ` +
         `random (at least 128 bits, e.g. 16 random bytes as base64url) and ` +
@@ -305,10 +309,18 @@ function registerCommandNetworkLists(
     }
   }
   commandNetworkListsByKey.set(
-    decodeSandboxedCommand(encodeSandboxedCommand(commandId)),
+    key,
     // Copied, so the caller cannot change what was validated.
     { allowedDomains: [...allowedDomains] },
   )
+  // An external HTTP proxy is handed no username, so no connection names an id.
+  if (config?.network.httpProxyPort !== undefined) {
+    logForDebugging(
+      'registerCommandNetworkLists: network.httpProxyPort is set (an ' +
+        'external proxy), so this list will never apply',
+      { level: 'warn' },
+    )
+  }
 }
 
 function unregisterCommandNetworkLists(commandId: string): void {
@@ -2612,7 +2624,13 @@ export interface ISandboxManager {
    *
    * As with every attribution key, only the first 100 characters of an id
    * take part, and a list under an id whose encoded form does not fit in the
-   * proxy username (possible only with non-ASCII ids) never applies.
+   * proxy username (possible only with non-ASCII ids) never applies. An
+   * unpaired surrogate does not count towards the 22 characters.
+   *
+   * No list applies while `network.httpProxyPort` names an external proxy:
+   * the wrap gives that proxy no username, so no connection carries an id.
+   * Registering still succeeds, and every connection is decided as if no list
+   * existed.
    */
   registerCommandNetworkLists(
     commandId: string,

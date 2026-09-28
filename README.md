@@ -328,7 +328,7 @@ child.once('exit', unregister)
 child.once('error', unregister) // the child never started
 ```
 
-Entries use the grammar and the matcher of `network.allowedDomains` and get the same validation. `registerCommandNetworkLists` throws on an invalid entry, and on a `commandId` shorter than 22 characters. Registering an id again replaces its list; `unregisterCommandNetworkLists` is a no-op for an id that has none; `reset()` removes every registration.
+Entries use the grammar and the matcher of `network.allowedDomains` and get the same validation. `registerCommandNetworkLists` throws on an invalid entry, and on a `commandId` shorter than 22 characters (an unpaired surrogate does not count). Registering an id again replaces its list; `unregisterCommandNetworkLists` is a no-op for an id that has none; `reset()` removes every registration.
 
 The order of evaluation for a connection is:
 
@@ -340,7 +340,9 @@ The order of evaluation for a connection is:
 
 So a per-command entry never overrides a configured `deniedDomains` entry, and is ignored entirely under `strictAllowlist`. It never enters `network.*` either: `getConfig()` and `getNetworkRestrictionConfig()` do not show it, and the default `injectHosts` scope of a masked credential, which is `network.allowedDomains`, does not grow. A host allowed this way still goes through the resolved-address check when it is dialed, and an IP literal in a per-command list adds no exemption there.
 
-What the id has to be, and what this feature is not: the proxy learns which invocation a connection belongs to from the proxy username, and the username is presented by the client inside the sandbox. The id is therefore the **only** thing binding a connection to an allow list. It **must** be unguessable: at least 128 bits of randomness, never a counter, a timestamp or anything derived from the command. A sandboxed process that presents another live invocation's id gets that invocation's allows, so this is attribution, not a boundary between concurrent commands of one session. Register just before spawning the wrapped command, and unregister when the child exits or never started: a registration that outlives its command widens the window in which its id is worth presenting. As with every attribution key, only the first 100 characters of an id take part.
+What the id has to be, and what this feature is not: the proxy learns which invocation a connection belongs to from the proxy username, and the username is presented by the client inside the sandbox. The id is therefore the **only** thing binding a connection to an allow list. It **must** be unguessable: at least 128 bits of randomness, never a counter, a timestamp or anything derived from the command. A sandboxed process that presents another live invocation's id gets that invocation's allows, so this is attribution, not a boundary between concurrent commands of one session. Register just before spawning the wrapped command, and unregister when the child exits or never started: a registration that outlives its command widens the window in which its id is worth presenting. As with every attribution key, only the first 100 characters of an id take part. Keep ids ASCII: a list under a non-ASCII id whose encoded form does not fit in the proxy username (255 bytes) registers and never applies.
+
+No list applies while `network.httpProxyPort` names an external proxy: the wrap gives that proxy no username, so no connection carries an id. `registerCommandNetworkLists` still succeeds (and says so in one line under `SRT_DEBUG`), and every connection is decided as if no list existed.
 
 #### Available exports
 

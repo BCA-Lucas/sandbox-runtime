@@ -45,11 +45,6 @@ export interface FsReadRestrictionConfig {
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
   denyWithinAllow: string[]
-  /**
-   * More paths to deny within `allowOnly`, read off the disk by the library.
-   * They are names: `[`, `*` and `?` in them are never pattern syntax.
-   */
-  literalDenyWithinAllow?: string[]
 }
 
 /**

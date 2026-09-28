@@ -89,7 +89,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
-import { ownFilesWriteDenies } from './own-files.js'
+import { ownInstallWarning } from './own-files.js'
 import {
   SandboxViolationStore,
   sanitizeUnregisteredCommandKey,
@@ -137,6 +137,7 @@ let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
+let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
@@ -727,9 +728,6 @@ async function initialize(
           ...monitoredWrites.denyWithinAllow.map(p =>
             normalizePathForSandbox(p),
           ),
-          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
-            normalizePathForSandbox(p, { literal: true }),
-          ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
           // them, so the monitor must not judge by them either.
@@ -1081,6 +1079,12 @@ function checkDependenciesCommon(
     }
   }
 
+  // The library itself writable from inside the sandbox: see own-files.ts.
+  const ownInstall = config?.filesystem.disabled
+    ? undefined
+    : ownInstallWarning(getFsWriteConfig().allowOnly)
+  if (ownInstall !== undefined) warnings.push(ownInstall)
+
   return { done: { errors, warnings } }
 }
 
@@ -1373,8 +1377,6 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
-    // The library's own files beside the caller's denies: see own-files.ts.
-    literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
   }
 }
 
@@ -1682,27 +1684,32 @@ async function wrapWithSandbox(
         config?.filesystem.allowWrite ??
         [],
     )
-    const allowOnly = [
-      ...defaultWritePathsUnder({
-        denyRead:
-          customConfig?.filesystem?.denyRead ??
-          config?.filesystem.denyRead ??
-          [],
-        allowRead:
-          customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
-        credentials: customConfig?.credentials ?? config?.credentials,
-      }),
-      ...userAllowWrite,
-    ]
     writeConfig = {
-      allowOnly,
+      allowOnly: [
+        ...defaultWritePathsUnder({
+          denyRead:
+            customConfig?.filesystem?.denyRead ??
+            config?.filesystem.denyRead ??
+            [],
+          allowRead:
+            customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+          credentials: customConfig?.credentials ?? config?.credentials,
+        }),
+        ...userAllowWrite,
+      ],
       denyWithinAllow: stripWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
       ),
-      // No wrap may write the library's own files: see own-files.ts.
-      literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
+    }
+    // For a caller that never reads checkDependencies(), the CLI among them.
+    if (!ownInstallLogged) {
+      ownInstallLogged = true
+      const ownInstall = ownInstallWarning(writeConfig.allowOnly)
+      if (ownInstall !== undefined) {
+        logForDebugging(ownInstall, { level: 'warn' })
+      }
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never

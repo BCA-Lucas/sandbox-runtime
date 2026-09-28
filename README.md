@@ -532,6 +532,10 @@ srt "jest --no-watchman"
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
 
+**Exit status under zsh (Linux):** From the first release after v0.0.77, a wrap that restricts the network reports the wrapped command's own exit status when `binShell` is zsh. Up to v0.0.77 a failing command could report 0 there: the wrapper's cleanup trap ended with a bare `exit`, which zsh resolves to the status of the trap's last command. bash (the default) and dash were not affected.
+
+**zod 4 in the same dependency tree:** The `zod` dependency range is `^3.25.0`. The library imports `zod/v3`, which exists from zod 3.25 on, so that it keeps the v3 API where a dependency tree resolves `zod` to version 4.
+
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
@@ -728,6 +732,8 @@ Filesystem restrictions are enforced at the OS level:
   - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas. On Linux that also holds when the `denyWrite` entry is at or above the `allowWrite` one — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only rather than writable — and with debug logging on (`SRT_DEBUG`) the wrap logs a warning naming both paths.
+
+**Writes through links (Linux and macOS):** a write is judged by where it lands, after symbolic links are followed. A link inside an allowed write path that leads out of it gives a command nothing: the write is refused. A link that leads into an allowed write path works like any other name for that place. A hard link is a second name for the file itself: on Linux a file outside the allowed write paths that already has a hard link inside one can be written through it, and a sandboxed command cannot create such a link. On macOS nothing is promised for such a file.
 
 **Read-side rules (Linux):** an entry is matched by the name it is, not by what it points at.
 

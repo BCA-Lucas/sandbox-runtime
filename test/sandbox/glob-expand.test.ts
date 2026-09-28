@@ -716,6 +716,34 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('follows a placeholder name and a second unclosed `[` through a link', () => {
+    // Both are plain text to globToRegex, so the walk splits such a pattern
+    // like any other: certs leads out of the pattern's base.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-text-')))
+    try {
+      mkdirSync(join(root, 'outside'))
+      writeFileSync(join(root, 'outside', 'x.pem'), 'KEY')
+      for (const name of ['__GLOBSTAR__', 'a[b[c']) {
+        mkdirSync(join(root, 'proj', name), { recursive: true })
+        symlinkSync(
+          join('..', '..', 'outside'),
+          join(root, 'proj', name, 'certs'),
+        )
+
+        const walk = walkGlobPattern(join(root, 'proj', name, '*/x.pem'), {
+          followSymlinkedDirectories: true,
+        })
+
+        expect([name, walk.matches]).toEqual([
+          name,
+          [join(root, 'outside', 'x.pem')],
+        ])
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 // ============================================================================
@@ -1037,16 +1065,11 @@ function compiledSets(regex: string): string[] {
  *   is never all the set holds;
  * - every other `-` is the middle of a range with no `-` at either end;
  * - a backslash, a member to that engine, is written only doubled, as that
- *   member, and, in a set with no leading `-`, before `. ^ $ + { } ( ) |`.
+ *   member.
  */
 function readsAlikeInBothEngines(set: string): boolean {
-  const plain = String.raw`(?:\\\\|[^\\\]-])`
-  const escaped = String.raw`(?:\\[.^$+{}()|\\]|[^\\\]-])`
-  const members = (one: string): string => `(?:${one}(?:-${one})?)`
-  return (
-    new RegExp(`^\\^?-${members(plain)}+$`).test(set) ||
-    new RegExp(`^\\^?${members(escaped)}+$`).test(set)
-  )
+  const one = String.raw`(?:\\\\|[^\\\]-])`
+  return new RegExp(`^\\^?-?(?:${one}(?:-${one})?)+$`).test(set)
 }
 
 describe('globToRegex (shared)', () => {
@@ -1124,10 +1147,16 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(dash).test('/tmp/test/a')).toBe(false)
   })
 
-  it('reads a `-` that stands for itself wherever the set has it', () => {
+  it('reads each member as itself, and a `-` wherever it stands for itself', () => {
     // What each set holds: a `-` first, last or straight after a range is
     // itself; between two characters it makes a range, and either may be `-`.
     const sets: [body: string, holds: string][] = [
+      ['$', '$'],
+      ['a-c.', 'abc.'],
+      ['.^$+{}()|', '.^$+{}()|'],
+      ['+-0', '+,-./0'],
+      ['\\', '\\'],
+      ['[.', '[.'],
       ['-', '-'],
       ['a-', 'a-'],
       ['-a', '-a'],
@@ -1197,7 +1226,7 @@ describe('globToRegex (shared)', () => {
     }
   })
 
-  it('writes that `-` first in its set and escapes nothing beside it', () => {
+  it('writes that `-` first in its set and escapes no member but a backslash', () => {
     // The regex engine of a macOS sandbox profile reads `[^/\-a]` as a range
     // and refuses `[a-]`; first in the set a `-` is the character to it too.
     expect(globToRegex('/d/[!-a]')).toBe('^/d/[^-/a]$')
@@ -1224,21 +1253,47 @@ describe('globToRegex (shared)', () => {
     expect(globToRegex('/d/[!+--]')).toBe('^/d/[^-/+-,]$')
     expect(globToRegex('/d/[,--]')).toBe('^/d/[-,]$')
 
-    // A backslash is the one member that cannot be written plainly.
+    // A backslash is the one member not written as it is: before another
+    // character it would be one more member to that engine.
     expect(globToRegex('/d/[\\-]')).toBe('^/d/[-\\\\]$')
-
-    // A set with no `-` of its own keeps its members and their escapes.
+    expect(globToRegex('/d/[!\\]')).toBe('^/d/[^/\\\\]$')
     expect(globToRegex('/d/[a-c]')).toBe('^/d/[a-c]$')
-    expect(globToRegex('/d/[!a-c.]')).toBe('^/d/[^/a-c\\.]$')
-    expect(globToRegex('/d/[+-9]')).toBe('^/d/[\\+-9]$')
+    expect(globToRegex('/d/[!a-c.]')).toBe('^/d/[^/a-c.]$')
+    expect(globToRegex('/d/[!$]')).toBe('^/d/[^/$]$')
+    expect(globToRegex('/d/[+-9]')).toBe('^/d/[+-9]$')
+    expect(globToRegex('/d/[.^$+{}()|]')).toBe('^/d/[.^$+{}()|]$')
+
+    // A set that holds a wildcard is not read as one, and keeps its `-` first.
+    expect(globToRegex('/d/[!-*]')).toBe('^/d/[^-/[^/]*]$')
   })
 
   it('writes every set the way both regex engines read alike', () => {
     expect(compiledSets('^/d/[^-/a]x\\[y[b-c]$')).toEqual(['^-/a', 'b-c'])
-    for (const bad of ['a-', '^/a-', 'ab-', '^/\\-a', 'a\\-', '-', '--0']) {
+    for (const bad of [
+      'a-',
+      '^/a-',
+      'ab-',
+      '^/\\-a',
+      'a\\-',
+      '-',
+      '--0',
+      '^/\\$',
+      '^/a-c\\.',
+      '\\+-9',
+    ]) {
       expect([bad, readsAlikeInBothEngines(bad)]).toEqual([bad, false])
     }
-    for (const good of ['-a', '^-/a', '^-/.-0', '-a-c', '^/a-c\\.', '-\\\\']) {
+    for (const good of [
+      '-a',
+      '^-/a',
+      '^-/.-0',
+      '-a-c',
+      '^/a-c.',
+      '-\\\\',
+      '^/$',
+      '+-9',
+      '^/\\\\',
+    ]) {
       expect([good, readsAlikeInBothEngines(good)]).toEqual([good, true])
     }
 

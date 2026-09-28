@@ -1096,7 +1096,7 @@ const REGEX_METACHARACTER = /[.^$+{}()|\\]/
  * or whose set would hold no members (`[]`, `[!]`). The string is compiled
  * by JavaScript and by the regex engine of a macOS sandbox profile, so `]`
  * is never a member of a set, no spelling of it reading the same to both,
- * and a `-` that is one is written first ({@link setWithDashFirst}).
+ * and the other members are written the way both read ({@link setRegex}).
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
@@ -1140,24 +1140,18 @@ export function globToRegex(globPattern: string): string {
         i++
         continue
       }
-      const dashFirst = setWithDashFirst(
-        globPattern.slice(set.members, set.close),
-        set.negated,
-      )
-      if (dashFirst !== undefined) {
-        regex += dashFirst
+      const body = globPattern.slice(set.members, set.close)
+      if (!/[*?]/.test(body)) {
+        regex += setRegex(body, set.negated)
         i = set.close + 1
         continue
       }
-      regex += set.negated ? '[^/' : '['
+      // A set that holds a wildcard is not read as one, but a `-` first in
+      // it stays first, not a range from the `/`.
+      const lead = set.negated && body[0] === '-' ? '-' : ''
+      regex += set.negated ? `[^${lead}/` : '['
       inSet = true
-      i = set.members
-      // Only a set that holds a wildcard still gets here with a `-` first
-      // among its members, where it would read as a range with that `/`.
-      if (set.negated && globPattern[i] === '-') {
-        regex += '\\-'
-        i++
-      }
+      i = set.members + lead.length
       continue
     }
     regex += REGEX_METACHARACTER.test(char) ? `\\${char}` : char
@@ -1183,21 +1177,23 @@ function setOpenedAt(
 }
 
 /**
- * The whole regex for a set in which a `-` stands for itself: first, last,
- * straight after a range, or at either end of one. Undefined for a set with
- * no such `-`, and for one that holds a wildcard, which is not read as a set.
+ * The regex for a set with no wildcard in it, written the way JavaScript
+ * and the regex engine of a macOS sandbox profile read alike.
  *
- * The regex engine of a macOS sandbox profile takes a backslash inside a set
- * for a member, so `[^/\-a]` is the range from `\` to `a` there and lets a
- * `-` through, and it refuses a set that ends in one character and a `-`
+ * That engine takes a backslash inside a set for a member (`[^/\$]` leaves
+ * out `\` as well as `$`), so a member is written as it is, and a backslash
+ * doubled, which is one `\` to both. Nothing else needs more: `]` is never a
+ * member, and no set that is not negated starts with a `^`, `[^` opening a
+ * negated one in the glob.
+ *
+ * That engine also refuses a set that ends in one character and a `-`
  * (`[a-]`), and the whole profile with it. Only first among the members do
- * it and JavaScript read a `-` alike, so it goes there, ahead of the `/` of
- * a negated set, and a range that starts or ends at one is the `-` and the
- * rest of the range, from `.` or up to `,`. Behind it only a backslash gets
- * one in front: before anything else it would be a member to that engine.
+ * both read a `-` alike, so one that stands for itself (first, last,
+ * straight after a range, or at either end of one) goes there, ahead of the
+ * `/` of a negated set, and a range that starts or ends at one is the `-`
+ * and the rest of the range, from `.` or up to `,`.
  */
-function setWithDashFirst(body: string, negated: boolean): string | undefined {
-  if (/[*?]/.test(body)) return undefined
+function setRegex(body: string, negated: boolean): string {
   let dash = false
   let members = ''
   const member = (char: string): string => (char === '\\' ? '\\\\' : char)
@@ -1216,10 +1212,10 @@ function setWithDashFirst(body: string, negated: boolean): string | undefined {
     }
     members += low === high ? member(low) : `${member(low)}-${member(high)}`
   }
-  if (!dash) return undefined
-  if (negated) return `[^-/${members}]`
+  const lead = dash ? '-' : ''
+  if (negated) return `[^${lead}/${members}]`
   // Alone in its set, the `-` is as well written without one.
-  return members === '' ? '-' : `[-${members}]`
+  return members === '' ? '-' : `[${lead}${members}]`
 }
 
 /**

@@ -422,9 +422,9 @@ Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
 - `**` - Matches any characters including `/` (e.g., `src/**/*.ts` matches all `.ts` files in `src/`)
 - `?` - Matches any single character except `/` (e.g., `file?.txt` matches `file1.txt`)
 - `[abc]` - Matches any character in the set (e.g., `file[0-9].txt` matches `file3.txt`)
-- `[!abc]` and `[^abc]` - Matches any character outside the set, and never `/` (e.g., `file[!0-9].txt` matches `filea.txt` but not `file3.txt`)
+- `[!abc]` and `[^abc]` - Matches any character outside the set, and never `/` (e.g., `file[!a-c].txt` matches `filed.txt` but not `fileb.txt`)
 
-A negated set whose members sit next to `/` in the character order (`[!0-9]`, `[!.]`) is read by a sandbox profile's own regex engine as any character but `/` wherever the rule carries the optional tail a deny gets, so such a deny covers the characters it lists as well: wider than written, never narrower.
+A deny rule also covers everything beneath what its pattern matches, and in such a rule a sandbox profile's own regex engine reads a negated set whose members sit next to `/` in the character order (`[!0-9]`, `[!.]`) as any character but `/`, so that deny covers the characters it lists as well: wider than written, never narrower.
 
 Examples:
 

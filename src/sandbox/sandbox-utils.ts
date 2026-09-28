@@ -1073,8 +1073,7 @@ export function encodedCommandFromProxyUser(
   return suffix
 }
 
-/** A character a regex reads as syntax and a glob does not. `*`, `?`, `[`
- *  and `]` are glob syntax and are emitted where they are met. */
+/** A character that is syntax to a regex and, unlike `*?[]`, not to a glob. */
 const REGEX_METACHARACTER = /[.^$+{}()|\\]/
 
 /**
@@ -1091,17 +1090,13 @@ const REGEX_METACHARACTER = /[.^$+{}()|\\]/
  * - [!abc] and [^abc] match any character outside the set, never a `/`
  *
  * The pattern is read once, left to right, and the regex is emitted as it
- * goes, so nothing of the pattern is ever parked under a marker and no text
- * in it can be taken for one: a directory called `__GLOBSTAR__` is that
- * name and nothing else.
+ * goes, so no literal text in the pattern is ever read as a wildcard.
  *
  * A `[` that opens no set is a literal character: one that nothing closes,
- * and one whose set would hold no members (`[]`, `[!]`). `]` is never a
- * member of a set, because no spelling of it inside one reads the same to a
- * JavaScript regular expression and to the regex engine of a macOS sandbox
- * profile, which this same string is also compiled into. A `-` that is a
- * member is written first in its set, the one place where both read it as
- * the character ({@link setWithDashFirst}).
+ * or whose set would hold no members (`[]`, `[!]`). The string is compiled
+ * by JavaScript and by the regex engine of a macOS sandbox profile, so `]`
+ * is never a member of a set, no spelling of it reading the same to both,
+ * and a `-` that is one is written first ({@link setWithDashFirst}).
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
@@ -1115,9 +1110,8 @@ export function globToRegex(globPattern: string): string {
     if (char === '*') {
       const run = i
       while (globPattern[i] === '*') i++
-      // `**/` is one piece and takes the separator with it, so the last two
-      // stars of a run before one go there. What is left of the run is `**`
-      // pairs from the left and then a lone `*`.
+      // The last two stars of a run before a separator go with it, as `**/`;
+      // the rest of the run is `**` pairs from the left and then a lone `*`.
       const withSeparator = i - run >= 2 && globPattern[i] === '/'
       let stars = i - run - (withSeparator ? 2 : 0)
       for (; stars >= 2; stars -= 2) regex += '.*' // ** matches anything including /
@@ -1174,9 +1168,8 @@ export function globToRegex(globPattern: string): string {
 
 /**
  * The set the `[` at `open` opens: where its members start, the `]` that
- * closes it, and whether a leading `!` or `^` negates it. Undefined when the
- * `[` opens no set — nothing closes it, or the first thing after it is the
- * `]`, which closes the set here rather than standing for itself.
+ * closes it, and whether a leading `!` or `^` negates it. Undefined when
+ * nothing closes it or it would hold no members.
  */
 function setOpenedAt(
   pattern: string,
@@ -1190,23 +1183,18 @@ function setOpenedAt(
 }
 
 /**
- * The whole regex for a set in which a `-` stands for itself: one that is
- * first or last among the members or comes straight after a range, or that
- * a range starts or ends at. Undefined for a set with no such `-`, which is
- * emitted a character at a time like any other text, to the string it always
- * was; and for one that holds a wildcard, which is not read as a set at all.
+ * The whole regex for a set in which a `-` stands for itself: first, last,
+ * straight after a range, or at either end of one. Undefined for a set with
+ * no such `-`, and for one that holds a wildcard, which is not read as a set.
  *
- * The two engines this string is compiled by read a `-` alike in one place
- * only, first among the members. The regex engine of a macOS sandbox profile
- * takes a backslash inside a set for a member, so `\-` escapes nothing there
- * (`[^/\-a]` is the range from `\` to `a`, and lets a `-` through), and it
- * refuses a set that ends in one character and a `-` (`[a-]`), and the whole
- * profile with it. So the `-` goes first, ahead of the `/` a negated set
- * excludes, and a range that starts or ends at one is written as the `-` and
- * the rest of the range: from `.`, the character after it, or up to `,`, the
- * one before. Behind that `-` a backslash is the only member that needs one
- * in front of it, so the others are written as they are, a backslash before
- * a `.` being one more member to that engine.
+ * The regex engine of a macOS sandbox profile takes a backslash inside a set
+ * for a member, so `[^/\-a]` is the range from `\` to `a` there and lets a
+ * `-` through, and it refuses a set that ends in one character and a `-`
+ * (`[a-]`), and the whole profile with it. Only first among the members do
+ * it and JavaScript read a `-` alike, so it goes there, ahead of the `/` of
+ * a negated set, and a range that starts or ends at one is the `-` and the
+ * rest of the range, from `.` or up to `,`. Behind it only a backslash gets
+ * one in front: before anything else it would be a member to that engine.
  */
 function setWithDashFirst(body: string, negated: boolean): string | undefined {
   if (/[*?]/.test(body)) return undefined

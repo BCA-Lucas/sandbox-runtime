@@ -1074,10 +1074,9 @@ export const SeccompConfigSchema = z
       ),
   })
   .superRefine((seccomp, ctx) => {
-    // A helper that is a file of its own is looked up from this process and
-    // named on a command line, like bwrapPath and socatPath, so it takes their
-    // rule. With argv0 the path only has to mean something inside the sandbox
-    // and is passed on as given.
+    // A helper that is a file of its own is looked up from this process, like
+    // bwrapPath and socatPath, so it takes their rule. With argv0 the path
+    // only has to mean something inside the sandbox and is passed on as given.
     if (seccomp.argv0 || seccomp.applyPath === undefined) return
     const result = binaryPathSchema.safeParse(seccomp.applyPath)
     if (result.success) return

@@ -50,22 +50,18 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   const PROTECTED = join(ALLOWED, 'protected.txt')
   // What a uid-0 command can do INSTEAD of unmounting a deny: make its copy
   // of the mount tree private, put a tmpfs on a directory it may write, make
-  // that the root, and let go of the old root lazily. Every deny is a mount,
-  // so in the command's namespace no name is a mount point any more. A
-  // lookup through a directory descriptor opened beforehand still crosses
-  // the denies (the kernel keeps locked mounts connected inside a tree that
-  // was let go lazily), but a RENAME of the denied name does not look through
-  // it: it is refused only while that name is a mount point in the caller's
-  // own namespace. So the denied file is moved aside and a new one written
-  // in its place. None of the four calls needs a new namespace for this
-  // caller, which already holds CAP_SYS_ADMIN in the helper's.
+  // that the root, and let go of the old root lazily. No name is then a mount
+  // point in its namespace, and a RENAME of the denied name, through a
+  // directory descriptor opened beforehand, is refused only while it is one:
+  // the denied file is moved aside and a new one written in its place. None
+  // of the four calls needs a new namespace for this caller, which already
+  // holds CAP_SYS_ADMIN in the helper's.
   const DISPLACE_PROBE = join(WORK, 'displace-probe.py')
   const NEW_ROOT = join(ALLOWED, 'new-root')
   // The calls the namespace filter refuses that an unmount or a remount does
-  // not make: pivot_root, and the newer mount interface. Each with arguments
-  // the kernel can only turn down, so that what comes back says who answered.
-  // Only a caller holding CAP_SYS_ADMIN over its mount namespace can tell: the
-  // kernel says EPERM to anyone else before it looks at them.
+  // not make, each with arguments the kernel can only turn down, so that what
+  // comes back says who answered. Only a caller holding CAP_SYS_ADMIN over
+  // its mount namespace can tell: the kernel says EPERM to anyone else.
   const MOUNT_CALLS_PROBE = join(WORK, 'mount-calls-probe.py')
   const MOUNT_CALLS = [
     'pivot_root',
@@ -261,8 +257,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   })
 
   // Allowing a command namespaces of its own leaves out the namespace filter
-  // and nothing else: the helper's two filters are separate so that this one
-  // stays. The run without the helper shows the probe can tell.
+  // and nothing else. The run without the helper shows the probe can tell.
   it('seccomp still blocks AF_UNIX socket creation where namespaces are allowed', () => {
     const probe = `echo SANDBOX-RAN; python3 ${UNIX_SOCKET_PROBE}`
     const r = srt(probe, CONFIG_NESTED_USERNS)
@@ -274,13 +269,11 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(control.stdout).toContain('unix-socket: made')
   })
 
-  // What the dependency check says about the helper it has from the helper,
-  // which it runs for that inside bubblewrap and never as this process. Two
-  // things about that show only here. This job's /proc is masked the way an
-  // unprivileged container's is, so bubblewrap cannot mount a fresh one, and
-  // the question must get through without. And the caller is uid 0, which
-  // bubblewrap lets keep its capabilities in the new namespace unless told to
-  // drop them: a file put in the helper's place says what it was left with.
+  // The dependency check asks the helper inside bubblewrap, never as this
+  // process. Two things about that show only here: this job's /proc is
+  // masked, so the question must get through without a fresh one, and the
+  // caller is uid 0, which bubblewrap lets keep its capabilities unless told
+  // to drop them: a file put in the helper's place says what it was left with.
   it('asks the helper what it supports inside bubblewrap, with no fresh /proc and no capabilities', () => {
     const standIn = join(WORK, 'stand-in-helper')
     writeFileSync(
@@ -360,11 +353,10 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     }
   })
 
-  // This job's /proc is masked the way an unprivileged container's is, so the
-  // helper cannot mount a fresh one and the command still sees the helper's
-  // outer process, which shares its user namespace. The command holds a full
-  // capability set there; what keeps it out of that process is that the
-  // helper made itself non-dumpable before it forked.
+  // This job's /proc is masked, so the helper cannot mount a fresh one and
+  // the command still sees the helper's outer process, which shares its user
+  // namespace. The command holds a full capability set there; what keeps it
+  // out is that the helper made itself non-dumpable before it forked.
   it('cannot open the memory of the helper process it can see (seccomp helper)', () => {
     const probe = join(WORK, 'helper-mem-probe.py')
     writeFileSync(
@@ -406,9 +398,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
 
   // With the filter left out, what refuses a plain unmount is the kernel: the
   // mounts the command inherited were copied across a user-namespace boundary
-  // and are locked, which reads EINVAL. The two barriers are separate, and
-  // this is the older one still standing on its own. It is not the whole of
-  // what this caller can try: see the two cases after the next one.
+  // and are locked, which reads EINVAL. It is not the whole of what this
+  // caller can try: see the two cases after the next one.
   it('still has the kernel refuse a plain unmount of a deny (seccomp helper, namespaces allowed)', () => {
     const out = join(DENIED, 'escaped-nested-userns')
     const r = srt(escapeAttempt(out), CONFIG_NESTED_USERNS)
@@ -454,8 +445,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   })
 
   // The route that needs no unmount and, for this caller, no namespace. Under
-  // the helper every one of its four calls is one the namespace filter
-  // refuses, so it stops at the first and the descriptor leads where it did.
+  // the helper the namespace filter refuses every one of its four calls.
   it('refuses every step of putting another root in place of the denies (seccomp helper)', () => {
     const r = srt(
       `echo SANDBOX-RAN; python3 ${DISPLACE_PROBE} ${WORK} ${NEW_ROOT}`,
@@ -476,11 +466,9 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(existsSync(join(ALLOWED, 'protected.old'))).toBe(false)
   })
 
-  // The control for the case above: with the command allowed namespaces of
-  // its own the filter is left out, the same four calls go through, and the
-  // denied file is replaced on the host. That is what
-  // allowNestedUserNamespaces gives up for a uid-0 caller, and it shows the
-  // probe can tell.
+  // The control for the case above: with the filter left out the same four
+  // calls go through, and the denied file is replaced on the host. That is
+  // what allowNestedUserNamespaces gives up for a uid-0 caller.
   it('lets that through where namespaces are allowed, which is what the option gives up', () => {
     try {
       const r = srt(

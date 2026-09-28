@@ -32,18 +32,13 @@ import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 /**
- * A write deny is a read-only bind, and a bind protects a path only in the
- * mount namespace it was made in. Creating a user namespace takes no
- * capability and gives its creator a full set over a private copy of the
- * mount tree, from which every bind can be detached at once; a directory
- * opened beforehand then reaches the denied names with nothing over them. So
- * the sandboxed command must not be able to make one, unless the caller asks
- * for that and takes the consequence.
+ * A sandboxed command that can create a user namespace can undo the write
+ * denies (see NESTED_USERNS_ENV in linux-sandbox-utils.ts), so it must not be
+ * able to unless the caller allows it.
  *
- * CHAIN below does the whole thing rather than stopping at the first call, so
- * that the arms which expect it to fail would see the file replaced if it did
- * not, and the arm which allows it shows that it then does replace the file:
- * a test of a refusal is worth what its counterpart proves it can detect.
+ * CHAIN does the whole thing rather than stopping at the first call, so that
+ * the arms which expect it to fail would see the file replaced if it did
+ * not, and the arm which allows it shows that it then does replace the file.
  */
 const CHAIN = String.raw`
 import ctypes, errno, os, platform, sys
@@ -104,13 +99,12 @@ except OSError as e:
 `
 
 // Stands in for a helper file that a sandboxed command got to replace. It
-// says where it found itself, as words of its answer: which namespaces, which
-// session, and the names of the variables in its environment. And it tries to
-// leave a file beside itself, which it can do only if it was run outside the
-// confinement the library asks a helper in.
+// says where it found itself (namespaces, session, names of the variables in
+// its environment) and tries to leave a file beside itself, which it can do
+// only if run outside the confinement the library asks a helper in.
 const HELPER_NAMESPACES = ['user', 'mnt', 'pid', 'net', 'ipc', 'uts'] as const
-// What it may find in its environment: PATH, which is all it is given of this
-// process's, the question, and what a shell sets for itself.
+// What it may find in its environment: PATH, the question, and what a shell
+// sets for itself.
 const HELPER_ENVIRONMENT = [
   'PATH',
   'SRT_HELPER_FEATURES',
@@ -149,10 +143,9 @@ describe.if(isLinux)(
       PYTHON !== null &&
       (process.arch === 'x64' || process.arch === 'arm64')
     const BWRAP = which.whichSync('bwrap')
-    // Bubblewrap's own word, had by using the option, and not that of the
-    // function the library asks with: gated on that function, a probe that
-    // wrongly said no would turn every arm below that needs the option into a
-    // skip, and one that wrongly said yes would go unnoticed.
+    // Bubblewrap's own word, had by using the option, not that of the function
+    // under test: gated on that, a probe that wrongly said no would turn every
+    // arm below that needs the option into a skip.
     const BWRAP_DISABLES_USERNS =
       BWRAP !== null &&
       spawnSync(
@@ -215,7 +208,6 @@ describe.if(isLinux)(
       chmodSync(path, mode)
       return path
     }
-    // And one that does only what `script` does, a way of failing each.
     function brokenBwrap(name: string, script: string): string {
       const path = join(BASE, name)
       writeFileSync(path, `#!/bin/sh\n${script}\n`)
@@ -227,8 +219,7 @@ describe.if(isLinux)(
       HELP_WITHOUT +
       '    --disable-userns             Disable further use of user namespaces inside sandbox'
 
-    // A directory of its own for each, so that the file it would leave
-    // beside itself says which one was run where it should not have been.
+    // In a directory of its own, so that the file it leaves says which one ran.
     function replacedHelper(name: string): string {
       mkdirSync(join(BASE, name))
       const path = join(BASE, name, 'apply-seccomp')
@@ -238,7 +229,6 @@ describe.if(isLinux)(
     }
     const ranOutside = (helper: string) =>
       existsSync(join(dirname(helper), 'ran-outside'))
-    // What it said under one of its headings, and the same about this process.
     const said = (answer: Set<string> | null, heading: string) =>
       [...(answer ?? [])].find(word => word.startsWith(`${heading}=`))
     const ownNamespace = (kind: string) =>
@@ -249,9 +239,8 @@ describe.if(isLinux)(
           .replace(/^.*\) /s, '')
           .split(' ')[3]
       }`
-    // Nothing of what it found is this process's: every namespace is another,
-    // the session is another, and of the environment, which here holds more
-    // than that, only PATH is there.
+    // Nothing of what it found is this process's: every namespace and the
+    // session are another, and of the environment only PATH is there.
     function expectConfined(answer: Set<string> | null): void {
       for (const kind of HELPER_NAMESPACES) {
         expect(said(answer, kind)).toMatch(/=[a-z]+:\[\d+\]$/)
@@ -283,10 +272,8 @@ describe.if(isLinux)(
       }
     }
 
-    // Starts the helper on its own with a command that stays a while, gives
-    // it time to set up, and reads those lines for the process that was
-    // started: the outer half, which waits for the command and never becomes
-    // it.
+    // Starts the helper on its own with a command that stays a while, and
+    // reads those lines for the process that was started: the outer half.
     async function outerHalfSeccompStatus(allowNestedUserNamespaces: boolean) {
       const env = { ...process.env }
       delete env.SRT_ALLOW_NESTED_USERNS
@@ -336,9 +323,8 @@ describe.if(isLinux)(
     it.if(APPLY_SECCOMP !== null)(
       'starts the helper with both variables assigned on its own command line, from the configuration',
       async () => {
-        // An assignment before a command holds whatever ran between bubblewrap
-        // clearing the variable and the helper starting, a shell start-up
-        // file the caller's environment names included.
+        // Holds against a shell start-up file the caller's environment names
+        // (see helperEnvironmentPrefix).
         const helper = APPLY_SECCOMP!
         expect(await wrap('true')).toContain(
           `SRT_ALLOW_NESTED_USERNS=0 SRT_HELPER_FEATURES=0 ${helper}`,
@@ -395,8 +381,7 @@ describe.if(isLinux)(
         by: 'nobody',
         because: 'weaker-nested-sandbox',
       })
-      // Which bubblewrap it would be is looked up only where nothing above
-      // has decided: a lookup can cost a process.
+      // Bubblewrap is looked up only where nothing above has decided.
       let lookups = 0
       const lookedUp = () => {
         lookups++
@@ -423,9 +408,8 @@ describe.if(isLinux)(
         bwrap: lookedUp,
       })
       expect(lookups).toBe(1)
-      // Bubblewrap's, where the bubblewrap here honours the option; nobody's
-      // where there is none, or one that works and does not. One that cannot
-      // make namespaces at all has not said which of the two it is.
+      // Bubblewrap's where the one here honours the option, nobody's where
+      // none does. One that cannot make namespaces at all has not said which.
       if (BWRAP_DISABLES_USERNS) {
         expect(plan(false)).toEqual({ by: 'bwrap' })
       } else if (bwrap === null || BWRAP_CAN_NAMESPACE) {
@@ -531,12 +515,11 @@ describe.if(isLinux)(
     // ---- what the helper says about itself -----------------------------
 
     // The helper is asked inside bubblewrap, so there is an answer only where
-    // bubblewrap can make namespaces. The gate is the one the live arms use
-    // and is not quite the question's own. It mounts a fresh /proc, which the
-    // question does without: where that is refused these skip, and the
-    // container suite, which runs there, asks instead. And it makes no network
-    // namespace, which the question does: a host that refuses only that one
-    // fails these, as it has a caller read 'unknown'.
+    // bubblewrap can make namespaces. The gate is the live arms' and not quite
+    // the question's own: it mounts a fresh /proc, which the question does
+    // without (where that is refused these skip, and the container suite asks
+    // instead), and it makes no network namespace, which the question does (a
+    // host that refuses only that one fails these).
     it.if(APPLY_SECCOMP !== null && BWRAP_CAN_NAMESPACE)(
       'the helper built from this tree reports the limit, and the dependency check passes it on as data',
       () => {
@@ -556,9 +539,8 @@ describe.if(isLinux)(
     )
 
     it("asks with a name no PATH is searched for, and asks nothing of a helper that is part of the caller's binary", () => {
-      // A helper that does not know the question tries to run its argument.
-      // With a slash in it no PATH is searched, and nothing can be created in
-      // the root of procfs.
+      // A helper that does not know the question tries to run this: with a
+      // slash no PATH is searched, and nothing can be created in /proc.
       expect(HELPER_FEATURES_PROBE_ARGUMENT).toMatch(/^\/proc\/[^/]+$/)
       // Its applyPath only has to mean something inside the sandbox, so it is
       // not run from here at all: /bin/true would answer, and is not asked.
@@ -603,8 +585,7 @@ describe.if(isLinux)(
       "the dependency check asks a helper file inside bubblewrap, not in this process's namespaces",
       () => {
         const applyPath = replacedHelper('asked-by-the-check')
-        // Not having been able to ask is not an answer to keep: the check
-        // below is answered although this came first.
+        // Not an answer to keep: the check below still asks.
         expect(probeSeccompHelperFeatures({ applyPath }, null)).toBeNull()
         const check = checkLinuxDependencies({ seccompConfig: { applyPath } })
         expect(check.features?.usernsLimit).toBe(true)
@@ -620,7 +601,6 @@ describe.if(isLinux)(
       async () => {
         const applyPath = replacedHelper('asked-by-a-wrap')
         const command = await wrap('true', { seccompConfig: { applyPath } })
-        // The helper is in the chain, so the wrap had its question to ask.
         expect(command).toContain(applyPath)
         expect(ranOutside(applyPath)).toBe(false)
         const answer = probeSeccompHelperFeatures({ applyPath })
@@ -785,12 +765,10 @@ describe.if(isLinux)(
         // arguments are looked at before permission, open_tree of "/" needs
         // none, and a second user namespace under a limit of zero is ENOSPC.
         // So EPERM is the filter, and a filter missing the rule for one of
-        // these shows here: unshare, clone, clone3, setns, mount, umount2,
-        // open_tree, fsconfig, mount_setattr and open_tree_attr. The other
-        // five (pivot_root, move_mount, fsopen, fsmount, fspick) the kernel
-        // itself answers with EPERM before it looks at anything, for a
-        // caller without the capability, so they cannot be told apart here.
-        // They are in the container suite, which runs as uid 0.
+        // these shows here. The other five (pivot_root, move_mount, fsopen,
+        // fsmount, fspick) the kernel itself answers with EPERM for a caller
+        // without the capability; they are in the container suite, which
+        // runs as uid 0.
         const probe = [
           'import ctypes, errno, os, platform',
           'libc = ctypes.CDLL(None, use_errno=True)',
@@ -913,8 +891,7 @@ describe.if(isLinux)(
           ),
         )
         const said = `${result.stdout}${result.stderr}`
-        // The helper was told, and took the variable out again before the
-        // command: it is the helper's business, not the command's.
+        // The helper was told, and took the variable out before the command.
         expect(said).toContain('seen=[unset]')
         // Only the namespaces filter is left out. The other one stays.
         expect(said).toContain('unix-socket: refused EPERM')

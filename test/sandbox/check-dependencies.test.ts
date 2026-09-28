@@ -83,10 +83,9 @@ describe('SandboxManager.checkDependenciesAsync', () => {
   })
 })
 
-// What the Linux check finds about the limit on user namespaces is read here,
-// as data, and this is the one place where that check and the wrap are both
-// fed from the configuration. Lose an option on the way and the check reports
-// a limit that the wrap, which does get the option, does not impose.
+// The one place where the Linux check and the wrap are both fed from the
+// configuration. Lose an option on the way and the check reports a limit on
+// user namespaces that the wrap, which does get the option, does not impose.
 describe('SandboxManager.checkDependencies: the limit on user namespaces', () => {
   const OPTIONS = [
     'allowAllUnixSockets',

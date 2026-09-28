@@ -587,9 +587,8 @@ describe('Config Validation', () => {
     })
   })
 
-  // A helper that is a file of its own is found and named by this process,
-  // like the two above. One that is part of the caller's binary (argv0) is
-  // only ever named inside the sandbox, and its path is passed on as given.
+  // A helper that is a file of its own takes the rule of the two above. With
+  // argv0 its path only has to work inside the sandbox and is taken as given.
   describe('seccomp.applyPath', () => {
     const base = {
       network: { allowedDomains: [], deniedDomains: [] },

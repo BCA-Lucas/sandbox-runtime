@@ -31,8 +31,7 @@ let euidSpy: ReturnType<typeof spyOn> | undefined
 let spawnSyncSpy: ReturnType<typeof spyOn>
 
 // Where the mocked PATH lookup finds everything. No such directory, so that
-// nothing this file is told about a binary there can be taken for an answer
-// about a real one: what bubblewrap supports is remembered by path.
+// a mock's answer is never remembered under a real binary's path.
 const installed = (bin: string) => `/nonexistent/bin/${bin}`
 
 // A bwrap that exits `status`, so the uid-0 probe never runs a real binary.
@@ -49,10 +48,8 @@ const bwrapProbes = () =>
   )
 
 beforeEach(() => {
-  // What the helper and bubblewrap support is remembered for the life of the
-  // process, which is every test file of the run. Forgotten here, so that the
-  // mocks below are what gets asked whatever ran before, and again in
-  // afterEach, so that what they answered is not what a later file is told.
+  // Here and in afterEach, so that the mocks below are what gets asked, and
+  // what they answered is not what a later file is told.
   resetProbeCachesForTesting()
   whichSpy = spyOn(which, 'whichSync').mockImplementation(installed)
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
@@ -63,10 +60,9 @@ beforeEach(() => {
   euidSpy = process.geteuid
     ? spyOn(process, 'geteuid').mockReturnValue(1000)
     : undefined
-  // Answers the two questions checkLinuxDependencies asks of real binaries the
-  // way current ones do: the seccomp helper says it limits user namespaces,
-  // and bubblewrap's help lists --disable-userns. Anything else is the uid-0
-  // probe, which exits 0 unless a test says otherwise.
+  // Answers as current binaries do: the seccomp helper says it limits user
+  // namespaces, and bubblewrap's help lists --disable-userns. Anything else
+  // is the uid-0 probe, which exits 0 unless a test says otherwise.
   spawnSyncSpy = spyOn(childProcess, 'spawnSync').mockImplementation(((
     _command: string,
     args?: readonly string[],
@@ -173,8 +169,7 @@ describe('checkLinuxDependencies', () => {
       { timeout?: number },
     ]
     expect(argv.at(-1)).toBe(HELPER_QUESTION)
-    // Required, as it is for a wrap. Taken only where one can be had, the
-    // helper file would run in this process's own where none can.
+    // Required, not taken where one can be had: see HELPER_PROBE_CONFINEMENT.
     expect(argv).toContain('--unshare-user')
     expect(argv).not.toContain('--unshare-user-try')
     expect(argv).not.toContain('--unshare-all')

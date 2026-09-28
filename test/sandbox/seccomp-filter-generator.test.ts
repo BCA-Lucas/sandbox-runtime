@@ -7,16 +7,14 @@ import { isLinux } from '../helpers/platform.js'
 
 /**
  * The generator of the helper's two seccomp filters
- * (vendor/seccomp-src/seccomp-unix-block.c) is a build tool:
- * vendor/seccomp/build.ts compiles it, runs it for the builder's own
- * architecture and deletes it. So it is compiled here once more, the same way,
- * where there is a compiler and a libseccomp to link against. Elsewhere these
- * tests skip.
+ * (vendor/seccomp-src/seccomp-unix-block.c) is a build tool that
+ * vendor/seccomp/build.ts compiles, runs and deletes, so it is compiled here
+ * once more, where there is a compiler and a libseccomp to link against.
+ * Elsewhere these tests skip.
  *
- * What it must never do is write a `namespaces` filter with one of its calls
- * left out. For the builder's own architecture it cannot have to: a call its
- * libseccomp has no name for goes in by number. For another architecture it
- * may have to refuse, and then it says which call and leaves no file.
+ * It must never write a `namespaces` filter with one of its calls left out:
+ * for another architecture than the builder's it may have to refuse, and
+ * then it says which call and leaves no file.
  */
 
 type Arch = 'x86_64' | 'aarch64'
@@ -62,11 +60,9 @@ const NATIVE: Arch | undefined = ({ x64: 'x86_64', arm64: 'aarch64' } as const)[
 const OTHER: Arch = NATIVE === 'x86_64' ? 'aarch64' : 'x86_64'
 
 // Whether the generator can be built here: a compiler that finds libseccomp's
-// header and its static library. Asked when the file is loaded, where a test
-// is declared skipped or not, and leaves nothing behind. The building itself
-// waits for a test of this file to be about to run (see beforeAll): run with
-// a name filter that matches none of them, nothing is built, which no hook
-// would then be run to remove.
+// header and its static library. Asked when the file is loaded, and leaves
+// nothing behind. The building itself waits for beforeAll: under a name
+// filter that matches no test here, no hook would run to remove it.
 function canBuildGenerator(): boolean {
   if (!isLinux || NATIVE === undefined) return false
   const header = spawnSync('gcc', ['-E', '-x', 'c', '-'], {
@@ -87,8 +83,7 @@ function canBuildGenerator(): boolean {
 }
 const CAN_BUILD = canBuildGenerator()
 
-// The generator, compiled with the flags build.ts gives it into a directory
-// of its own.
+// The generator, compiled with the flags build.ts gives it.
 let GENERATOR: string | undefined
 function compileGenerator(): void {
   const work = mkdtempSync(join(tmpdir(), 'seccomp-generator-'))

@@ -737,11 +737,14 @@ export type LinuxSandboxProfileErrorCode =
  * configuration expands to is past a limit, or, for `command_too_long` and
  * `nul_in_path`, what the caller passed in is. The command was not run and no
  * profile file stays open; the wrap has already let go of the mount points it
- * had named, so the per-command cleanup (`cleanupAfterCommand()`,
- * `cleanupBwrapMountPoints()`) is neither needed nor harmful after one.
- * Branch on `.code`, never on `.message`, which carries the sizes of the
- * moment. Other wrap-time failures (a shell that is not on PATH, a bridge
- * socket that is gone) are plain Errors.
+ * had named and is not counted among the commands to clean up after. So do not
+ * make the per-command cleanup call (`cleanupAfterCommand()`,
+ * `cleanupBwrapMountPoints()`) for a wrap that threw: it counts for another
+ * wrap of this process, whose command is then refused its start if it has not
+ * started yet. It takes nothing from a running sandbox. Branch on `.code`,
+ * never on `.message`, which carries the sizes of the moment. Other wrap-time
+ * failures (a shell that is not on PATH, a bridge socket that is gone) are
+ * plain Errors.
  */
 export class LinuxSandboxProfileError extends Error {
   readonly code: LinuxSandboxProfileErrorCode
@@ -776,13 +779,45 @@ export class LinuxSandboxProfileError extends Error {
  * again through /proc. Every other word, the per-command environment and the
  * command among them, stays on the line. The result stays a simple command,
  * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
+ *
+ * With `started`, the record of a wrap that named mount points, the string is
+ * a shell that appends its own /proc/$$/stat line to that record and then execs
+ * bwrap in its place: the pid on record is bwrap's, written before bwrap has
+ * made a mount. Appended, not written over, so that every run of the string is
+ * on record while it lasts. One shell does both where both are needed.
  * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
   mounts: { start: number; end: number },
+  started?: string,
 ): string {
+  /** What the string's own shell does, to the file it is given as "$1". */
+  type Step = { run: string; file: string }
+  const record: Step[] =
+    started === undefined
+      ? []
+      : [
+          {
+            run: 'read -r s </proc/$$/stat && printf "%s\\n" "$s" >>"$1"',
+            file: started,
+          },
+        ]
+  /** `words`, run by a shell named `name` once it has taken `steps`. */
+  const afterSteps = (steps: Step[], name: string, words: string[]): string =>
+    steps.length === 0
+      ? quote(words)
+      : quote([
+          '/bin/sh',
+          '-c',
+          [...steps.map(step => `${step.run} && shift`), 'exec "$@"'].join(
+            ' && ',
+          ),
+          name,
+          ...steps.map(step => step.file),
+          ...words,
+        ])
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
     throw new LinuxSandboxProfileError(
       'too_many_arguments',
@@ -798,7 +833,7 @@ function renderBwrapInvocation(
       'Sandbox profile contains a path with a NUL byte, which neither a command line nor a file of bwrap arguments can carry',
     )
   }
-  const inline = quote([bwrapBinary, ...bwrapArgs])
+  const inline = afterSteps(record, 'srt', [bwrapBinary, ...bwrapArgs])
   const inlineBytes = Buffer.byteLength(inline, 'utf8')
   const limit = maxArgStrlen() - 1
   if (inlineBytes <= limit - ARG_HEADROOM_BYTES) {
@@ -825,18 +860,23 @@ function renderBwrapInvocation(
   }
   // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
   // EOF and closes it before running the command.
-  const viaArgsFile = quote([
-    '/bin/sh',
-    '-c',
-    `exec ${BWRAP_ARGS_FD}<"$1" && shift && exec "$@"`,
+  const viaArgsFile = afterSteps(
+    [
+      ...record,
+      {
+        run: `exec ${BWRAP_ARGS_FD}<"$1"`,
+        file: bwrapArgsProfilePath(argsFd),
+      },
+    ],
     'srt-args',
-    bwrapArgsProfilePath(argsFd),
-    bwrapBinary,
-    ...bwrapArgs.slice(0, mounts.start),
-    '--args',
-    String(BWRAP_ARGS_FD),
-    ...bwrapArgs.slice(mounts.end),
-  ])
+    [
+      bwrapBinary,
+      ...bwrapArgs.slice(0, mounts.start),
+      '--args',
+      String(BWRAP_ARGS_FD),
+      ...bwrapArgs.slice(mounts.end),
+    ],
+  )
   const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
   if (viaArgsFileBytes > limit) {
     closeBwrapArgsProfile(argsFd)
@@ -897,11 +937,11 @@ function registerExitCleanupHandler(): void {
  *   once;
  * - with `force`: everything, because the process or session is ending.
  *
- * A mount point goes only when no running sandbox relies on it, which the
- * kernel answers (see bwrap-mount-manifests.ts). A call too many takes nothing
- * from a running sandbox, but counts for another wrap of this process, whose
- * command then refuses to start if it has not started by the time the count
- * reaches zero. Does nothing except on Linux.
+ * A mount point goes only when no running sandbox relies on it, which each
+ * sandbox's own process answers (see bwrap-mount-manifests.ts). A call too many
+ * takes nothing from a running sandbox, but counts for another wrap of this
+ * process, whose command is then refused its start if it has not started by the
+ * time the count reaches zero. Does nothing except on Linux.
  */
 export function cleanupBwrapMountPoints(opts?: {
   force?: boolean
@@ -1618,7 +1658,12 @@ async function generateFilesystemArgs(
   allowGitConfig = false,
   abortSignal?: AbortSignal,
   commandKey?: string,
-): Promise<{ args: string[]; manifest: MountPointManifest | undefined }> {
+): Promise<{
+  args: string[]
+  manifest: MountPointManifest | undefined
+  /** Where the manifest's started record is, as the binds spell its directory. */
+  started: string | undefined
+}> {
   const args: string[] = []
   // fs already imported
 
@@ -1912,12 +1957,15 @@ async function generateFilesystemArgs(
   // beneath the allow binds, or after them under a '/' write root that would
   // otherwise bury them (see ancestorPinArgs).
   let ancestorPinInsertAt: number
+  // Just past the bind of the root.
+  let afterRootBind: number
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
     const beneathAllowBinds = args.length
+    afterRootBind = beneathAllowBinds
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -2574,7 +2622,7 @@ async function generateFilesystemArgs(
     // specially. Nothing is ever restored for it: no read-deny tmpfs lands
     // at '/'.
     allowedWritePaths.push('/')
-    ancestorPinInsertAt = args.length
+    ancestorPinInsertAt = afterRootBind = args.length
   }
   // denyWriteArgs is emitted after the denyRead loop below.
 
@@ -2911,9 +2959,8 @@ async function generateFilesystemArgs(
     }
   }
 
-  // Name the mount points this wrap relies on before the sandbox can start, and
-  // have bwrap hold a lock on the manifest for as long as it runs. Mount points
-  // that could not be recorded are left on the host.
+  // Name the mount points this wrap relies on before the sandbox can start.
+  // Those that could be recorded nowhere are this process's to remove.
   //
   // INVARIANT: a manifest directory must never be writable from inside a
   // sandbox. A command that could delete a manifest could make a running
@@ -2933,17 +2980,20 @@ async function generateFilesystemArgs(
     emptySource === undefined ? [] : [emptySource],
     commandKey,
   )
+  let started: string | undefined
   if (manifest !== undefined) {
-    // This wrap needs the directory there: bubblewrap opens the manifest in
-    // it, after the mounts.
     const dir = canonicalForm(manifest.dir)
-    args.push(
-      '--ro-bind',
-      dir,
-      dir,
-      '--lock-file',
-      path.join(dir, path.basename(manifest.file)),
-    )
+    const file = path.join(dir, path.basename(manifest.file))
+    started = path.join(dir, path.basename(manifest.started))
+    // INVARIANT: the manifest is the first thing bound after the root. A
+    // command started once a clean-up has claimed its manifest then fails
+    // ("Can't find source path") before bubblewrap has made a mount point.
+    // Bound any later, a claim that lands while bubblewrap is at its mounts
+    // would leave on the host mount points that nothing names or removes.
+    args.splice(afterRootBind, 0, '--ro-bind', file, file)
+    args.push('--ro-bind', dir, dir)
+  }
+  if (mountPoints.length > 0 || emptySource !== undefined) {
     registerExitCleanupHandler()
   }
   if (writeConfig !== undefined) {
@@ -2985,7 +3035,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', dir, dir)
   }
 
-  return { args, manifest }
+  return { args, manifest, started }
 }
 
 /**
@@ -3029,7 +3079,8 @@ async function generateFilesystemArgs(
  * CALLER OBLIGATION: the euid and capability decisions behind the returned
  * string are made here, in the process that builds it, so the string must be
  * run by a process with the same euid and the same capability bounding and
- * inheritable sets.
+ * inheritable sets, and in the same PID namespace: a command that names mount
+ * points records its own pid, which a clean-up asks after from here.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -3373,6 +3424,7 @@ export async function wrapCommandWithSandboxLinux(
       bwrapPath ?? 'bwrap',
       bwrapArgs,
       mounts,
+      filesystem.started,
     )
 
     const restrictions = []
@@ -3388,8 +3440,8 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
-    // No command came of this wrap, so no sandbox runs under its manifest and
-    // the mount points it named are no one's.
+    // No command came of this wrap, so no sandbox starts under its manifest
+    // and the mount points it named are no one's.
     if (manifest !== undefined) {
       discardMountPointManifest(manifest.file)
     }

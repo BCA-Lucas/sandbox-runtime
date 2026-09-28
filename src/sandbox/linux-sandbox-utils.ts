@@ -1103,8 +1103,9 @@ export function checkLinuxDependencies(
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
 // Keyed by path, so a caller that passes an explicit bwrapPath is not
-// answered for another binary.
-const bwrapVersions = new Map<string, string | null>()
+// answered for another binary. Only an answer is kept: after a probe that
+// failed or timed out, the next call asks again.
+const bwrapVersions = new Map<string, string>()
 
 /** The version `bwrap --version` reports, or null when it could not be asked. */
 function probeBwrapVersion(bwrap: string): string | null {
@@ -1120,7 +1121,7 @@ function probeBwrapVersion(bwrap: string): string | null {
     probe.error === undefined && probe.status === 0
       ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
       : null
-  bwrapVersions.set(bwrap, version)
+  if (version !== null) bwrapVersions.set(bwrap, version)
   return version
 }
 

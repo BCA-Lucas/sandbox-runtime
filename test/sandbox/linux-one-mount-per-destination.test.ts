@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import {
   OLDEST_FULLY_SUPPORTED_BWRAP_VERSION,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 /**
  * One mount per destination.
@@ -286,6 +288,27 @@ describe.if(isLinux)('One mount per destination', () => {
     expect(offences).toEqual([])
   })
 
+  // The check above reads argument lists; whether bubblewrap takes them is
+  // settled only by starting it. From 0.5.0 on it starts on a doubled mask
+  // too, so this arm catches one only where the bubblewrap on PATH is older,
+  // as on CI's 0.4.1 leg.
+  it.skipIf(!bwrapCanNamespace())(
+    'starts on every configuration in the corpus (live bwrap)',
+    async () => {
+      const refused: string[] = []
+      for (const { what, wrapped } of corpus()) {
+        const { status, stderr } = spawnSync(await wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        if (status !== 0) refused.push(`${what} -> ${stderr.trim()}`)
+      }
+      expect(refused).toEqual([])
+    },
+    60_000,
+  )
+
   it('still masks a file denied under several spellings', async () => {
     const command = await wrap({
       denyRead: [SECRET, `${SECRET}/`, join(LINK, 'secret.txt')],
@@ -396,5 +419,18 @@ describe.if(isLinux)('Reporting an older bubblewrap', () => {
         warning.includes(OLDEST_FULLY_SUPPORTED_BWRAP_VERSION),
       ),
     ).toBe(false)
+  })
+
+  it('asks again after a probe that got no answer', () => {
+    const path = join(BASE, 'late')
+    writeFileSync(path, '#!/bin/sh\nexit 3\n', { mode: 0o755 })
+    const warnsOfOlder = (): boolean =>
+      checkLinuxDependencies({ bwrapPath: path }).warnings.some(warning =>
+        warning.includes(OLDEST_FULLY_SUPPORTED_BWRAP_VERSION),
+      )
+    expect(warnsOfOlder()).toBe(false)
+    // The same path now answers: the silence before was not remembered.
+    stubBwrap('late', '0.4.1')
+    expect(warnsOfOlder()).toBe(true)
   })
 })

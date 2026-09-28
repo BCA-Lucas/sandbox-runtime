@@ -215,12 +215,14 @@ jobs:
         run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
 
       # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
-      # current distribution use, and one of those refuses to start on a plan
-      # that mounts twice at one destination. Run the suites that build and
-      # run mount plans against 0.4.1 so such a plan is caught here rather
-      # than on a user's machine. Autotools, not meson, which that release
-      # predates. Pinned by commit, not by the v0.4.1 tag, which the upstream
-      # repository can move.
+      # current distribution use, and both refuse to start on a plan that
+      # masks again a file a read deny has masked: before 0.5.0 a file bind's
+      # mount point has to be a regular file, and that mask leaves /dev/null
+      # there. Run the suites that build and run mount plans against 0.4.1,
+      # the first of which starts bubblewrap on configurations that name one
+      # file twice, so such a plan is caught here rather than on a user's
+      # machine. Autotools, not meson, which that release predates. Pinned by
+      # commit, not by the v0.4.1 tag, which the upstream repository can move.
       - name: Build bubblewrap 0.4.1 (Linux)
         if: matrix.os == 'linux'
         run: |

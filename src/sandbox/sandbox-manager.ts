@@ -1,3 +1,11 @@
+import {
+  literalReadLists,
+  literalWriteLists,
+  reExposedBy,
+  samePathEntries,
+  spelledOf,
+  writeRootsOf,
+} from './path-entries.js'
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
@@ -30,6 +38,7 @@ import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
+  FilesystemPathEntry,
   SandboxRuntimeConfig,
   SeccompConfig,
 } from './sandbox-config.js'
@@ -699,7 +708,7 @@ async function initialize(
   if (enableLogMonitor && getPlatform() === 'linux') {
     // The monitor compares paths the kernel reported, so its lists are
     // expanded the way the wrapper expands them (getFsWriteConfig folds in
-    // the default write paths and drops the globs bwrap cannot take;
+    // the default write paths and drops the patterns, so only names are left;
     // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
     // plus the built-in write denies the wrapper always applies.
     // It does not reproduce the wrapper's existence and boundary-symlink
@@ -719,12 +728,15 @@ async function initialize(
         // out because it is read-denied sits under that deny's writable
         // tmpfs, so a write there is permitted and is not a violation.
         allowWritePaths: [
-          ...monitoredWrites.allowOnly,
+          ...writeRootsOf(monitoredWrites),
           ...(config.filesystem.disabled ? [] : getDefaultWritePaths()),
-        ].map(p => normalizePathForSandbox(p)),
+        ].map(p => normalizePathForSandbox(p, { literal: true })),
         denyWritePaths: [
           ...monitoredWrites.denyWithinAllow.map(p =>
-            normalizePathForSandbox(p),
+            normalizePathForSandbox(p, { literal: true }),
+          ),
+          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
+            normalizePathForSandbox(p, { literal: true }),
           ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
@@ -1230,8 +1242,8 @@ function defaultWritePathsUnder({
   allowRead,
   credentials,
 }: {
-  denyRead: readonly string[]
-  allowRead: readonly string[] | undefined
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
   return getDefaultWritePaths({
@@ -1258,6 +1270,8 @@ function unionDenyReadPaths(
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
  * concrete paths only). Other platforms match globs natively.
+ * Entries the caller marked literal are not in the result: they travel in
+ * the `literal…` lists.
  *
  * `literalPaths` are the ones the library resolved itself (a masked
  * credential file that degraded to deny) — each names one file on disk, so
@@ -1265,12 +1279,12 @@ function unionDenyReadPaths(
  * pattern, a name holding `[` matches nothing and the deny is lost.
  */
 function resolveReadPathEntries(
-  paths: readonly string[],
+  paths: readonly FilesystemPathEntry[],
   expandGlob: (pattern: string) => string[],
   literalPaths: readonly string[] = [],
 ): string[] {
   const literal = new Set(literalPaths)
-  return paths.flatMap(p => {
+  return spelledOf(paths).flatMap(p => {
     const stripped = removeTrailingGlobSuffix(p)
     return getPlatform() === 'linux' &&
       !literal.has(p) &&
@@ -1284,9 +1298,10 @@ function resolveReadPathEntries(
  * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
  * real paths. macOS subpath matching is recursive, so the strip is harmless
  * there and the filter never fires.
+ * Marked entries are not in the result, as in {@link resolveReadPathEntries}.
  */
-function stripWriteGlobs(paths: readonly string[]): string[] {
-  return paths
+function stripWriteGlobs(paths: readonly FilesystemPathEntry[]): string[] {
+  return spelledOf(paths)
     .map(p => removeTrailingGlobSuffix(p))
     .filter(p => {
       if (getPlatform() === 'linux' && containsGlobChars(p)) {
@@ -1308,9 +1323,10 @@ function expandAllowReadGlob(pattern: string): string[] {
 /**
  * The read policy of the initialized config, for inspection and display.
  * On Linux, denyRead globs are collapsed to covering directory mounts against
- * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
+ * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
- * to wrapCommandWithSandboxLinux with a different one.
+ * to wrapCommandWithSandboxLinux with a different one. Marked entries are
+ * in the `literal…` lists, as spelled: pass the object on whole.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1329,10 +1345,17 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     config.filesystem.allowRead ?? [],
     expandAllowReadGlob,
   )
-  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const reExposedPaths = reExposedBy(
+    allowPaths,
+    config.filesystem.allowRead,
+    getFsWriteConfig(),
+  )
   const unlistableDenyDirs = new Set<string>()
   const denyPaths = resolveReadPathEntries(
-    unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
+    unionDenyReadPaths(
+      spelledOf(config.filesystem.denyRead),
+      credentialRestrictions,
+    ),
     pattern =>
       expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
     credentialRestrictions.degradeToDenyPaths,
@@ -1342,6 +1365,10 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...literalReadLists(
+      config.filesystem.denyRead,
+      config.filesystem.allowRead,
+    ),
   }
 }
 
@@ -1369,6 +1396,10 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    ...literalWriteLists(
+      config.filesystem.allowWrite,
+      config.filesystem.denyWrite,
+    ),
   }
 }
 
@@ -1450,23 +1481,17 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   }
 }
 
-function setEq(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false
-  const s = new Set(a)
-  return b.every(x => s.has(x))
-}
-
 function sameRawWindowsFsInputs(
   a: ReturnType<typeof rawWindowsFsInputs>,
   b: ReturnType<typeof rawWindowsFsInputs>,
 ): boolean {
   return (
     a.disabled === b.disabled &&
-    setEq(a.denyRead, b.denyRead) &&
-    setEq(a.denyWrite, b.denyWrite) &&
-    setEq(a.allowRead, b.allowRead) &&
-    setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    samePathEntries(a.denyRead, b.denyRead) &&
+    samePathEntries(a.denyWrite, b.denyWrite) &&
+    samePathEntries(a.allowRead, b.allowRead) &&
+    samePathEntries(a.allowWrite, b.allowWrite) &&
+    samePathEntries(a.credFiles, b.credFiles)
   )
 }
 
@@ -1694,6 +1719,10 @@ async function wrapWithSandbox(
           config?.filesystem.denyWrite ??
           [],
       ),
+      ...literalWriteLists(
+        customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite,
+        customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite,
+      ),
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
@@ -1715,11 +1744,17 @@ async function wrapWithSandbox(
     if (javaAgentJarPath) {
       expandedAllowRead.push(javaAgentJarPath)
     }
-    const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
+    const reExposedPaths = reExposedBy(
+      expandedAllowRead,
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      writeConfig,
+    )
     const unlistableDenyDirs = new Set<string>()
     const expandedDenyRead = resolveReadPathEntries(
       unionDenyReadPaths(
-        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+        spelledOf(
+          customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        ),
         credentialRestrictions,
       ),
       pattern =>
@@ -1730,6 +1765,10 @@ async function wrapWithSandbox(
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
       unlistableDenyDirs: [...unlistableDenyDirs],
+      ...literalReadLists(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      ),
     }
   }
 
@@ -2361,6 +2400,7 @@ function annotateStderrWithSandboxFailures(
  * sandboxing is disabled.
  *
  * Patterns ending with /** are excluded since they work as subpaths.
+ * So are entries marked literal.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
@@ -2379,6 +2419,7 @@ function getLinuxGlobPatternWarnings(): string[] {
   ]
 
   for (const path of allPaths) {
+    if (typeof path !== 'string') continue
     // Strip trailing /** since that's just a subpath (directory and everything under it)
     const pathWithoutTrailingStar = removeTrailingGlobSuffix(path)
 
@@ -2396,6 +2437,7 @@ function getLinuxGlobPatternWarnings(): string[] {
     ...config.filesystem.denyRead,
     ...(config.filesystem.allowRead ?? []),
   ]) {
+    if (typeof path !== 'string') continue
     const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
     if (
       containsGlobChars(removeTrailingGlobSuffix(path)) &&

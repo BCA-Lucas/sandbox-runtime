@@ -9,6 +9,7 @@ import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
+import { readNamesOf, writeNamesOf } from './path-entries.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -1776,7 +1777,7 @@ async function generateFilesystemArgs(
   let readAllowPathsMemo: string[] | undefined
   const readAllowPaths = (): string[] =>
     (readAllowPathsMemo ??= (readConfig?.allowWithinDeny || []).map(p =>
-      normalizePathForSandbox(p),
+      normalizePathForSandbox(p, { literal: true }),
     ))
   // What the read section mounts for one denyRead entry: a tmpfs (directory)
   // or a /dev/null mask (anything else) on the entry itself; nothing when it
@@ -1872,7 +1873,7 @@ async function generateFilesystemArgs(
     if (!readConfig) return []
     const entries: string[] = []
     for (const p of readConfig.denyOnly || []) {
-      if (normalizePathForSandbox(p) !== '/') {
+      if (normalizePathForSandbox(p, { literal: true }) !== '/') {
         entries.push(p)
         continue
       }
@@ -1926,7 +1927,7 @@ async function generateFilesystemArgs(
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
-      .map(p => normalizePathForSandbox(p))
+      .map(p => normalizePathForSandbox(p, { literal: true }))
       .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
       .map(normalizedPath => {
         const mount = readDenyMountOf(normalizedPath)
@@ -1954,10 +1955,9 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      // normalizePathForSandbox already strips a trailing slash from every
-      // spelling it does not take for a glob; this strip covers the ones it
-      // exempts — a literal directory named with glob characters, spelled
-      // '<dir>/[id]/'. Allow paths are recorded slash-free because every
+      // Every path here is a name, and normalizePathForSandbox strips a
+      // name's trailing slash; the strip below stays as a guard. Allow paths
+      // are recorded slash-free because every
       // downstream comparison — the deny loop's within-allowlist gate,
       // findSymlinkInPath's mask scoping, the emission filter's re-expose
       // check, the denyRead re-bind and its allowRead skip, and the stub-skip
@@ -1967,7 +1967,7 @@ async function generateFilesystemArgs(
       // instead of per-predicate. ('/' itself is kept; the empty spelling an
       // empty $HOME expands '~' to is NOT the root, and falls out at the
       // existence check below.)
-      const normalized = normalizePathForSandbox(pathPattern)
+      const normalized = normalizePathForSandbox(pathPattern, { literal: true })
       const normalizedPath =
         normalized === '' ? '' : normalized.replace(/\/+$/, '') || '/'
 
@@ -2159,7 +2159,7 @@ async function generateFilesystemArgs(
     // directory (the re-check below); an emitted one missing from the record
     // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
       if (rawPath.startsWith('/dev/')) {
         continue
       }
@@ -2308,7 +2308,7 @@ async function generateFilesystemArgs(
       return covered
     }
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (rawPath.startsWith('/dev/')) {
@@ -2968,8 +2968,6 @@ export async function wrapCommandWithSandboxLinux(
     proxyAuthToken,
     caCertPath,
     javaAgentJarPath,
-    readConfig,
-    writeConfig,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
@@ -2987,6 +2985,12 @@ export async function wrapCommandWithSandboxLinux(
     observeSocketPath,
     abortSignal,
   } = params
+  // bubblewrap takes no patterns, so every path here is a name. The literal
+  // lists are folded into the lists they belong to, once, so that nothing
+  // below can read a list and miss them; a pattern in `allowOnly` that is no
+  // name is dropped by the fold (see writeNamesOf).
+  const readConfig = readNamesOf(params.readConfig)
+  const writeConfig = writeNamesOf(params.writeConfig)
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions

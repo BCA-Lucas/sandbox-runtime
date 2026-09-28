@@ -63,6 +63,16 @@ function runIndices(command: string, words: readonly string[]): number[] {
   return found
 }
 
+/**
+ * The manifest the wrap recorded its mount points in, by the started record
+ * the command's own shell is given, or `undefined` for a wrap that recorded
+ * none.
+ */
+export function manifestOf(command: string): string | undefined {
+  const id = / srt(?:-args)? (\S+)\.started /.exec(command)?.[1]
+  return id === undefined ? undefined : `${id}.json`
+}
+
 /** How many times that whole mount appears. */
 export function countMounts(command: string, ...words: MountWords): number {
   return runIndices(command, words).length

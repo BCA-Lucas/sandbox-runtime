@@ -24,7 +24,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
+import { countMounts, lastMountAt, manifestOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
@@ -158,7 +158,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
   /** The mount points the wrap named in its manifest, none without one. */
   function namedBy(command: string): string[] {
-    const file = /--lock-file (\S+)/.exec(command)?.[1]
+    const file = manifestOf(command)
     return file === undefined
       ? []
       : (JSON.parse(readFileSync(file, 'utf8')) as { paths: string[] }).paths

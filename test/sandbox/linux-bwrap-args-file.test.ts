@@ -59,9 +59,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   // the NUL, less the 4 KiB left for a prefix of the caller's own.
   const INLINE_MAX = MAX_ARG_STRLEN - 1 - 4096
   // The one rendered shape: the profile's path, then the options left before
-  // and the words left after `--args 9`.
+  // and the words left after `--args 9`. A wrap that named mount points has
+  // the same shell put itself on the manifest's record first.
   const VIA_ARGS_FILE =
-    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
+    /^\/bin\/sh -c '(?:read -r s <\/proc\/\$\$\/stat && printf "%s\\n" "\$s" >>"\$1" && shift && )?exec 9<"\$1" && shift && exec "\$@"' srt-args (?:\S+\.started )?(\S+) bwrap (.*?) ?--args 9 (.*)$/s
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',
@@ -549,6 +550,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       expect(argsPathOf(wrapped)).toMatch(
         new RegExp(`^/proc/${process.pid}/fd/\\d+$`),
       )
+      // This wrap names mount points, under the temp dir: one shell puts the
+      // command on record and opens the profile.
+      expect(wrapped).toMatch(
+        / srt-args \S+\/srt-mount-points\/\d+-[0-9a-f]{16}\.started \/proc\/\d+\/fd\/\d+ bwrap /,
+      )
+      expect(wrapped.match(/\/bin\/sh -c /g)).toHaveLength(1)
       const run = spawnSync(`timeout 60 ${wrapped} && echo AFTER`, {
         shell: true,
         encoding: 'utf8',

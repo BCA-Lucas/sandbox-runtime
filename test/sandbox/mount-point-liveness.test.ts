@@ -16,14 +16,18 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { liveMountPoints } from '../../src/index.js'
 import {
   cleanupBwrapMountPoints,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
-import { countMounts, indexOfMount } from '../helpers/bwrap-argv.js'
+import {
+  countMounts,
+  indexOfMount,
+  manifestOf as recordedBy,
+} from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux } from '../helpers/platform.js'
 import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
@@ -32,8 +36,10 @@ import { usePrivateManifestDirectory } from '../helpers/private-manifest-directo
  * A denyWrite path that does not exist is blocked by binding over a mount point
  * bwrap makes on the host. Unlinking one while a sandbox is bound over it
  * detaches the mount inside that sandbox, and the denied path can then be
- * created on the host. So whether a sandbox still runs is asked of the kernel:
- * every wrap names its mount points in a manifest that bwrap holds a lock on.
+ * created on the host. So every wrap names its mount points in a manifest, and
+ * the command it hands out puts the process it starts bubblewrap in on that
+ * manifest's record: a mount point goes only when no process on the record of
+ * a manifest that names it is running.
  */
 describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   // These tests list the manifests, attack them from inside a sandbox and
@@ -127,9 +133,9 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     return existsSync(file) ? readFileSync(file, 'utf8') : ''
   }
 
-  /** Where the wrap pointed bubblewrap's --lock-file. */
+  /** The manifest the wrap recorded its mount points in. */
   function manifestOf(command: string): string {
-    const file = /--lock-file (\S+)/.exec(command)?.[1]
+    const file = recordedBy(command)
     expect(file).toBeDefined()
     return file!
   }
@@ -268,8 +274,8 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
       const holderExited = new Promise(resolve => holder.on('exit', resolve))
       try {
         await waitFor(SIGNAL)
-        // Past the grace, so that only the sandbox's lock and its writer
-        // speak for the manifest.
+        // Past the grace, so that only the process on its record and its
+        // writer speak for the manifest.
         await sleep(600)
         expect([...liveMountPoints()]).toEqual([LOCK])
       } finally {
@@ -449,7 +455,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
         writeConfig: { allowOnly: [AREA, directory], denyWithinAllow: [] },
       })
       // The point of the case: this wrap relies on no mount point.
-      expect(command).not.toContain('--lock-file')
+      expect(recordedBy(command)).toBeUndefined()
 
       const result = spawnSync(command, {
         shell: true,
@@ -533,7 +539,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   )
 
   it.if(BWRAP_CAN_NAMESPACE)(
-    'refuses to start a command wrapped before a cleanup that has since let go of its manifest',
+    'refuses to start a command wrapped before a cleanup that has since let go of its manifest, and makes nothing for it',
     async () => {
       const command = await wrap(`echo pwned > ${LOCK}; echo rc=$?`)
       const manifest = manifestOf(command)
@@ -548,16 +554,40 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
         encoding: 'utf8',
         timeout: 60000,
       })
-      // bubblewrap sets the mounts up before it opens the lock file, so the
-      // mount point is back on the host; the command never runs.
+      // The manifest is the first thing bubblewrap binds, so it has made no
+      // mount point by then: nothing is on the host that no manifest names.
       expect(result.status).not.toBe(0)
       expect(`${result.stdout}${result.stderr}`).toContain(
-        'Unable to open lock file',
+        `Can't find source path ${manifest}`,
       )
-      expect(lstatSync(LOCK).size).toBe(0)
+      expect(existsSync(LOCK)).toBe(false)
+      // What the command line recorded of itself goes at the next clean-up.
+      expect(readdirSync(dirname(manifest))).toEqual([
+        basename(manifest).replace(/json$/, 'started'),
+      ])
+      cleanupBwrapMountPoints()
+      expect(readdirSync(dirname(manifest))).toEqual([])
     },
     90000,
   )
+
+  it('hands out a command that puts itself on record and then binds its manifest, before any other mount', async () => {
+    const command = await wrap('true')
+    const manifest = manifestOf(command)
+    const record = manifest.replace(/json$/, 'started')
+    // One shell, which bubblewrap takes the place of: the pid on record is
+    // bubblewrap's own, and the sandbox dies with it.
+    expect(command).toStartWith(
+      `/bin/sh -c 'read -r s </proc/$$/stat && printf "%s\\n" "$s" >>"$1" && shift && exec "$@"' srt ${record} bwrap --new-session --die-with-parent `,
+    )
+    expect(command).toContain(
+      ` --ro-bind / / --ro-bind ${manifest} ${manifest} --`,
+    )
+    // A wrap that names no mount point has nothing to vouch for.
+    expect(await wrap('true', [])).toStartWith(
+      'bwrap --new-session --die-with-parent ',
+    )
+  })
 
   // ---- two commands of one process in flight ----
   //
@@ -583,7 +613,6 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 
       const result = run(second)
       const said = `${result.stdout}${result.stderr}`
-      expect(said).not.toContain('Unable to open lock file')
       expect(said).not.toContain('bwrap:')
       expect(result.status).toBe(0)
       expect(result.stdout).toContain('second-ran')
@@ -596,64 +625,124 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     90000,
   )
 
-  it.if(BWRAP_CAN_NAMESPACE)(
-    'a sandbox that takes its lock while another command is being cleaned up after keeps its manifest and its deny',
-    async () => {
-      // The interleaving made certain: the collect reads /proc/locks while the
-      // second command's manifest is not yet locked, and that command's sandbox
-      // takes its lock before the collect goes on.
-      const first = await wrap('true')
-      const second = await wrap(heldCommand())
-      const manifest = manifestOf(second)
-      expect(spawnSync(first, { shell: true, timeout: 60000 }).status).toBe(0)
-
-      const readFile = fs.readFileSync
-      let started = false
-      const spy = spyOn(fs, 'readFileSync').mockImplementation(((
-        file: unknown,
-        options: unknown,
-      ) => {
-        const value = (readFile as (f: unknown, o: unknown) => unknown)(
-          file,
-          options,
-        )
-        if (file === '/proc/locks' && !started) {
-          started = true
-          // `{ ...; true; }` keeps a shell as bubblewrap's parent.
-          spawnSync('sh', ['-c', `{ ${second}; true; } > ${OUT} 2>&1 &`], {
-            stdio: 'ignore',
-          })
-          const deadline = Date.now() + 20000
-          while (!existsSync(SIGNAL)) {
-            if (Date.now() > deadline) throw new Error('sandbox never came up')
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5)
-          }
-        }
-        return value
-      }) as never)
-      try {
-        cleanupBwrapMountPoints() // after the first
-      } finally {
-        spy.mockRestore()
+  /**
+   * Runs `during` once in the next clean-up, when it has claimed the first
+   * manifest it takes for finished and before it goes on.
+   */
+  function duringTheNextCleanUp(during: () => void): { restore(): void } {
+    const rename = fs.renameSync
+    let done = false
+    const spy = spyOn(fs, 'renameSync').mockImplementation(((
+      from: string,
+      to: string,
+    ) => {
+      if (to.endsWith('.claimed') && !done) {
+        done = true
+        during()
       }
-      expect(started).toBe(true)
-      // The second is running, and what it relies on is still on record.
-      expect(existsSync(manifest)).toBe(true)
+      rename(from, to)
+    }) as never)
+    return { restore: () => spy.mockRestore() }
+  }
+
+  /**
+   * Waits to be told, then tries the denied write the hard way: a mount point
+   * that was removed and made again is an empty file without a write bit, which
+   * refuses a plain write by its mode alone, so the file is removed first. Only
+   * a bind still in place refuses that.
+   */
+  function heldCommandThatRemovesFirst(): string {
+    return `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done; rm -f ${LOCK}; echo pwned > ${LOCK}; echo rc=$?`
+  }
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'a sandbox that starts while a clean-up is about to claim its manifest keeps its manifest and its deny',
+    async () => {
+      // The interleaving made certain: the clean-up has read the manifest as
+      // finished, the command's sandbox then starts and binds over its mount
+      // point, and only then does the clean-up claim the manifest.
+      const command = await wrap(heldCommandThatRemovesFirst())
+      const manifest = manifestOf(command)
+      let inode: number | undefined
+      const pass = duringTheNextCleanUp(() => {
+        // `{ ...; true; }` keeps a shell as bubblewrap's parent.
+        spawnSync('sh', ['-c', `{ ${command}; true; } > ${OUT} 2>&1 &`], {
+          stdio: 'ignore',
+        })
+        const deadline = Date.now() + 20000
+        while (!existsSync(SIGNAL)) {
+          if (Date.now() > deadline) throw new Error('sandbox never came up')
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5)
+        }
+        inode = lstatSync(LOCK).ino
+      })
+      try {
+        // The one clean-up this wrap is owed, made too early: the command is
+        // taken for over, and nothing but a process on its record can speak
+        // for its manifest.
+        cleanupBwrapMountPoints()
+      } finally {
+        pass.restore()
+      }
+      expect(inode).toBeDefined()
+      // The claim was given back, and what the sandbox is bound over is what
+      // it was bound over.
+      expect(readdirSync(dirname(manifest)).sort()).toEqual([
+        basename(manifest),
+        basename(manifest).replace(/json$/, 'started'),
+      ])
+      expect(lstatSync(LOCK).ino).toBe(inode!)
 
       // A later command in the same repository names the same mount point.
       const third = await wrap('true')
       expect(spawnSync(third, { shell: true, timeout: 60000 }).status).toBe(0)
       cleanupBwrapMountPoints() // after the third
-      expect(existsSync(LOCK)).toBe(true)
+      expect(lstatSync(LOCK).ino).toBe(inode!)
 
       writeFileSync(GO, '')
       const deadline = Date.now() + 20000
       while (!/rc=\d/.test(contentAt(OUT))) {
-        if (Date.now() > deadline) throw new Error('the second never finished')
+        if (Date.now() > deadline) throw new Error('the command never finished')
         await sleep(25)
       }
       expect(contentAt(OUT)).toMatch(/rc=[1-9]/)
       expect(contentAt(LOCK)).toBe('')
+      expect(lstatSync(LOCK).ino).toBe(inode!)
+    },
+    90000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'a command started once a clean-up has claimed its manifest is refused, and nothing is removed or made under it',
+    async () => {
+      const command = await wrap(`echo pwned > ${LOCK}; echo rc=$?`)
+      let refused: { status: number | null; said: string } | undefined
+      const rename = fs.renameSync
+      const spy = spyOn(fs, 'renameSync').mockImplementation(((
+        from: string,
+        to: string,
+      ) => {
+        rename(from, to)
+        if (to.endsWith('.claimed') && refused === undefined) {
+          const run = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 60000,
+          })
+          refused = { status: run.status, said: `${run.stdout}${run.stderr}` }
+        }
+      }) as never)
+      try {
+        cleanupBwrapMountPoints() // too early, and the command starts under it
+      } finally {
+        spy.mockRestore()
+      }
+      expect(refused).toBeDefined()
+      expect(refused?.status).not.toBe(0)
+      expect(refused?.said).toContain("Can't find source path")
+      expect(refused?.said).not.toContain('rc=')
+      expect(existsSync(LOCK)).toBe(false)
+      expect(readdirSync(dirname(manifestOf(command)))).toEqual([])
     },
     90000,
   )
@@ -732,7 +821,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
     expect(second).not.toContain(`--ro-bind /dev/null ${LOCK}`)
     expect(second).toContain(`--ro-bind ${LOCK} ${LOCK}`)
     // Nor does the second wrap name it: it is not its to remove.
-    expect(second).not.toContain('--lock-file')
+    expect(recordedBy(second)).toBeUndefined()
   })
 
   it('takes for a mount point one that another sandbox makes while the wrap is looking at the path', async () => {
@@ -858,7 +947,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
         inThatPlace('nothing-to-record.ts', []).stdout,
       ) as { wrapped: string; status: number; made: string[] }
       expect(nothingToRecord.status).toBe(0)
-      expect(nothingToRecord.wrapped).not.toContain('--lock-file')
+      expect(recordedBy(nothingToRecord.wrapped)).toBeUndefined()
       expect(manifestDirectories(nothingToRecord.made)).toEqual([])
       expect(manifestDirectories(readdirSync(TMP))).toEqual([])
 
@@ -874,6 +963,69 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
       )
       expect(manifestDirectories(readdirSync(TMP))).toEqual([])
       expect(existsSync(LOCK)).toBe(false)
+    },
+    90000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && process.getuid?.() !== 0)(
+    'is removed by the process that made it, at its clean-up or as it ends, where it could be recorded nowhere',
+    async () => {
+      // No runtime directory, and nothing can be made under the temp dir: no
+      // other process can know of the mount point.
+      const TMP = join(BASE, 'read-only-tmp')
+      mkdirSync(TMP, { mode: 0o500 })
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        TMPDIR: TMP,
+      }
+      delete env.XDG_RUNTIME_DIR
+      const inThatPlace = (script: string, after: string) =>
+        spawnSync(
+          process.execPath,
+          [
+            writeScript(
+              script,
+              [
+                `import { spawnSync } from 'node:child_process'`,
+                `import { existsSync } from 'node:fs'`,
+                `import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${LIBRARY}`,
+                `const wrapped = await wrapCommandWithSandboxLinux({`,
+                `  command: ${JSON.stringify(`echo pwned > ${LOCK}; echo rc=$?`)},`,
+                `  needsNetworkRestriction: false,`,
+                `  readConfig: { denyOnly: [] },`,
+                `  writeConfig: { allowOnly: [${JSON.stringify(AREA)}], denyWithinAllow: [${JSON.stringify(LOCK)}] },`,
+                `})`,
+                `const r = spawnSync(wrapped, { shell: true, encoding: 'utf8', timeout: 60000 })`,
+                `const made = existsSync(${JSON.stringify(LOCK)})`,
+                after,
+                `console.log(JSON.stringify({ wrapped, said: String(r.stdout ?? '') + String(r.stderr ?? ''), made, left: existsSync(${JSON.stringify(LOCK)}) }))`,
+              ].join('\n'),
+            ),
+          ],
+          {
+            env: env as Record<string, string>,
+            encoding: 'utf8',
+            timeout: 60000,
+            // Outside every allowed write path, so no mount points for cwd.
+            cwd: import.meta.dir,
+          },
+        )
+      for (const [script, after, left] of [
+        ['cleans-up.ts', 'cleanupBwrapMountPoints()', false],
+        ['only-ends.ts', '', true],
+      ] as const) {
+        const ran = JSON.parse(inThatPlace(script, after).stdout) as {
+          wrapped: string
+          said: string
+          made: boolean
+          left: boolean
+        }
+        expect(recordedBy(ran.wrapped)).toBeUndefined()
+        expect(ran.wrapped).toStartWith('bwrap ')
+        expect(ran.said).toMatch(/rc=[1-9]/)
+        expect(ran).toMatchObject({ made: true, left })
+        expect(existsSync(LOCK)).toBe(false)
+      }
     },
     90000,
   )
@@ -927,10 +1079,9 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 })
 
 /**
- * The one case where nothing but the kernel's lock keeps a mount point: the
- * process that wrapped the command is gone and the sandbox it started is still
- * running. Every test above has the wrapping process alive, which alone keeps
- * the manifest live.
+ * The process that wrapped the command is gone and the sandbox it started is
+ * still running: nothing but the process on the manifest's record keeps the
+ * mount point.
  *
  * The wrap always asks for --die-with-parent, so a sandbox outlives its wrapper
  * only when something else is bubblewrap's parent: here a shell in a session of
@@ -944,8 +1095,7 @@ describe.if(isLinux)(
     const LIBRARY = JSON.stringify(
       join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
     )
-    // Comfortably past the grace a new manifest is given (500 ms): after this
-    // only the writer being alive, or the lock, can make the manifest live.
+    // Comfortably past the grace a new manifest is given (500 ms).
     const PAST_GRACE_MS = 1200
 
     let BASE: string
@@ -1058,7 +1208,7 @@ describe.if(isLinux)(
      * result, and then stays: the sandbox is still running when it is killed.
      */
     function heldCommand(): string {
-      return `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done; echo pwned > ${LOCK}; echo rc=$? > ${RESULT}; sleep 600`
+      return `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done; rm -f ${LOCK}; echo pwned > ${LOCK}; echo rc=$? > ${RESULT}; sleep 600`
     }
 
     /**
@@ -1199,7 +1349,7 @@ describe.if(isLinux)(
         `stays, and the deny holds, while other processes collect after its writer ${how}; goes once the sandbox is gone`,
         async () => {
           const info = await sandboxWhoseWriterHasGone(leave, signal)
-          const manifest = /--lock-file (\S+)/.exec(info.wrapped)?.[1]
+          const manifest = recordedBy(info.wrapped)
           expect(manifest).toBeDefined()
           // Still naming the deny path, and the process that is gone.
           const written = JSON.parse(readFileSync(manifest!, 'utf8')) as {
@@ -1243,7 +1393,8 @@ describe.if(isLinux)(
           // The sandbox is still there. Its denied write must fail inside, and
           // nothing may land on the host. (A mount point removed and made again
           // by the second wrap is on the host but is no longer what this
-          // sandbox is bound over, so only the write tells.)
+          // sandbox is bound over: the command removes the file before it
+          // writes, which only a bind still in place refuses.)
           expect(runningTree(info.launcher).length).toBeGreaterThan(1)
           expect({ stayed, ...(await theDeniedWrite()) }).toEqual({
             stayed: {
@@ -1262,8 +1413,8 @@ describe.if(isLinux)(
           expect(runScript('collector.ts', collectorScript())).toBe(0)
           expect(existsSync(LOCK)).toBe(true)
 
-          // Kill the sandbox. The kernel drops the lock, and the next collect
-          // by anyone removes the mount point and the manifest.
+          // Kill the sandbox. The next collect by anyone removes the mount
+          // point and the manifest.
           await killTree(info.launcher)
           launcher = undefined
           expect(runScript('collector.ts', collectorScript())).toBe(0)
@@ -1279,8 +1430,8 @@ describe.if(isLinux)(
       async () => {
         // A collector that never has a candidate proves nothing. Here the
         // writer is gone and the grace is over before the write is tried, so
-        // the lock is all that stands between the collector and the mount
-        // point.
+        // the process on record is all that stands between the collector and
+        // the mount point.
         const loopFile = join(BASE, 'collect-loop.ts')
         writeFileSync(
           loopFile,
@@ -1553,7 +1704,7 @@ describe.if(isLinux)(
 
     /** The mount points the wrap named in its manifest, none without one. */
     function namedBy(command: string): string[] {
-      const file = /--lock-file (\S+)/.exec(command)?.[1]
+      const file = recordedBy(command)
       return file === undefined
         ? []
         : (JSON.parse(readFileSync(file, 'utf8')) as { paths: string[] }).paths
@@ -1596,7 +1747,7 @@ describe.if(isLinux)(
       expect(readFileSync(join(DIRECTORY, 'settings.json'), 'utf8')).toBe('{}')
       // Nothing names it any more: it is the user's directory from here on.
       expect(existsSync(left)).toBe(false)
-      expect(existsSync(/--lock-file (\S+)/.exec(command)![1]!)).toBe(false)
+      expect(existsSync(recordedBy(command)!)).toBe(false)
       expect(namedBy(await wrap('true', [DIRECTORY]))).toEqual([])
     })
 
@@ -1818,7 +1969,7 @@ describe.if(isLinux)(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
         { XDG_RUNTIME_DIR: RUN },
       )
-      expect(command).toContain(`--lock-file ${RUN}/srt-mount-points/`)
+      expect(dirname(recordedBy(command)!)).toBe(`${RUN}/srt-mount-points`)
       expectPinned(command, RUN)
       expectPinned(command, join(HOME, 'run'))
     })
@@ -1831,8 +1982,8 @@ describe.if(isLinux)(
         { writeConfig: { allowOnly: [HOME], denyWithinAllow: [GUARD] } },
         { XDG_RUNTIME_DIR: undefined },
       )
-      expect(command).toMatch(
-        new RegExp(`--lock-file ${TMP}/srt-mount-points-[A-Za-z0-9]{6}/`),
+      expect(dirname(recordedBy(command)!)).toMatch(
+        new RegExp(`^${TMP}/srt-mount-points-[A-Za-z0-9]{6}$`),
       )
       expectPinned(command, TMP)
     })
@@ -2095,7 +2246,7 @@ describe.if(isLinux)(
 
         const recording = wrappedAndRun(through, 'true', [GUARD]).wrapped
         expect(countMounts(recording, '--ro-bind', kept, kept)).toBe(1)
-        expect(recording).toContain(`--lock-file ${kept}/`)
+        expect(dirname(recordedBy(recording)!)).toBe(kept)
         expect(recording).not.toContain(named)
 
         // A wrap with nothing to record keeps the command out of it as well.
@@ -2148,8 +2299,8 @@ describe.if(isLinux)(
           expect(recording.said).not.toContain('bwrap:')
           expect(recording.status).toBe(0)
           expect(recording.said).toContain('started')
-          // Its deny holds, under the lock on its manifest, and the manifest
-          // directory is out of its reach by either name.
+          // Its deny holds, and the manifest directory is out of its reach by
+          // either name.
           expect(recording.said).toMatch(/rc=[1-9]/)
           expect(recording.said).toMatch(/real=[1-9]/)
           expect(recording.said).toMatch(/through=[1-9]/)
@@ -2200,10 +2351,10 @@ describe.if(isLinux)(
 )
 
 /**
- * Both of a manifest's witnesses are relative to a PID namespace: /proc/PID,
- * and /proc/locks, which leaves out every lock whose holder has no pid there. A
- * process cleaning up from another PID namespace that shares the manifest
- * directory sees a running sandbox's manifest as it would see a dead process's.
+ * A manifest's witnesses are processes, and /proc/PID is relative to a PID
+ * namespace. A process cleaning up from another PID namespace that shares the
+ * manifest directory sees a running sandbox's manifest as it would see a dead
+ * process's.
  */
 describe.if(isLinux)(
   'A mount point a running sandbox relies on, seen from another PID namespace',
@@ -2268,7 +2419,7 @@ describe.if(isLinux)(
     }
 
     it.if(CAN)(
-      'survives a cleanup run where neither its writer nor its lock can be seen',
+      'survives a cleanup run where neither its writer nor the process on its record can be seen',
       async () => {
         const command = `echo up > ${SIGNAL}; while [ ! -e ${GO} ]; do sleep 0.05; done; echo pwned > ${LOCK}; echo rc=$?`
         const holder = spawn(
@@ -2296,12 +2447,10 @@ describe.if(isLinux)(
         let manifest: string
         try {
           await waitFor(SIGNAL)
-          manifest = /--lock-file (\S+)/.exec(
-            readFileSync(WRAPPED, 'utf8'),
-          )![1]!
+          manifest = recordedBy(readFileSync(WRAPPED, 'utf8'))!
           expect(existsSync(manifest)).toBe(true)
           expect(lstatSync(LOCK).size).toBe(0)
-          // Past the grace: only the writer's pid and the kernel's lock vouch
+          // Past the grace: only the writer and the process on record vouch
           // for the manifest now, and neither can be seen from over there.
           await new Promise(resolve => setTimeout(resolve, 800))
 
@@ -2311,12 +2460,12 @@ describe.if(isLinux)(
               ...IN_NEW_PID_NAMESPACE.slice(1),
               process.execPath,
               writeScript('collector.ts', [
-                `import { existsSync, readFileSync, statSync } from 'node:fs'`,
+                `import { existsSync, readFileSync } from 'node:fs'`,
                 `import { cleanupBwrapMountPoints } from ${LIBRARY}`,
-                // The premise: from here the kernel's list really does leave
-                // the sandbox's lock out, and the writer's pid is nobody's.
-                `const inode = statSync(${JSON.stringify(manifest)}).ino`,
-                `if (readFileSync('/proc/locks', 'utf8').includes(':' + inode + ' ')) process.exit(7)`,
+                // The premise: from here the pid on record and the writer's
+                // are nobody's.
+                `const record = readFileSync(${JSON.stringify(manifest.replace(/json$/, 'started'))}, 'utf8')`,
+                `if (existsSync('/proc/' + record.split(' ')[0])) process.exit(7)`,
                 `if (existsSync('/proc/${holder.pid}')) process.exit(8)`,
                 `cleanupBwrapMountPoints()`,
               ]),

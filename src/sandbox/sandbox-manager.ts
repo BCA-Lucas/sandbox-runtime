@@ -1623,10 +1623,12 @@ export type WrapWithSandboxOptions = {
    *
    * On Linux it is also the name under which the wrap records the mount
    * points its command relies on: pass the same value to
-   * `cleanupAfterCommand({ commandId })` to have them removed as soon as that
-   * command is over, whatever other commands are still in flight. Only a
-   * value passed here counts for that; the `command` default does not, since
-   * two wraps in flight may share their text.
+   * `cleanupAfterCommand({ commandId })` to let go of them at once when the
+   * command will never be started, whatever other commands are still in
+   * flight (a command that ran is let go of by any cleanup once it has
+   * ended). It has to be unique among the wraps in flight. Only a value passed
+   * here counts for that; the `command` default does not, since two wraps in
+   * flight may share their text.
    */
   commandId?: string
   /**
@@ -2077,12 +2079,13 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
- * Call it once for each wrapped command, when that command is over. With no
- * argument nothing this process made is removed until it has been called
- * once for every wrap handed out, because a call cannot tell which command
- * it is for. Pass the `commandId` the wrap was given
- * (`WrapWithSandboxOptions.commandId`) to have that command's mount points
- * removed at once, which matters when another command runs for a long time.
+ * Call it once for each wrapped command, when that command is over. Every
+ * call removes what commands that ran and have ended relied on, this
+ * process's and other processes'. A command that was wrapped and has not
+ * started is let go of only once it has been called for every wrap handed
+ * out, because a call cannot tell which command it is for; pass the
+ * `commandId` the wrap was given (`WrapWithSandboxOptions.commandId`) to let
+ * go of that one at once.
  *
  * Safe to call on any platform: it does nothing except on Linux.
  * Also called automatically by reset() and on process exit as safety nets.

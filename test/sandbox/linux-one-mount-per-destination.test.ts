@@ -21,16 +21,12 @@ import { isLinux } from '../helpers/platform.js'
  * One mount per destination.
  *
  * A file mask is a `--ro-bind` of something other than the destination
- * itself: the `/dev/null` a read deny puts over a file, the fake a
- * credential mask puts there, the `/dev/null` that covers an absent write
- * deny. Two of them at one destination, with nothing between that mounts at
- * or above it, is a mount whose only effect is to replace the one before it —
- * and bubblewrap before 0.5.0 refuses to start on it, because its
- * `ensure_file()` accepts only a regular file as the mount point for a file
- * bind and creates one over anything else, which on the read-only mount the
- * first mask just made fails with "Can't create file at <dest>: Permission
- * denied". Spellings of one path converge on one destination, so a corpus
- * that spells the same file several ways is where these appear.
+ * itself: the `/dev/null` of a read deny or an absent write deny, the fake
+ * of a credential mask. Two at one destination, with nothing between that
+ * mounts at or above it, only replace one another, and bubblewrap before
+ * 0.5.0 refuses to start on that ("Can't create file at <dest>: Permission
+ * denied"). Spellings of one path converge on one destination, so the corpus
+ * spells the same file several ways.
  *
  * A mask re-applied after a later bind re-exposed the real file is NOT one of
  * these: that bind sits between the two and puts a mount point back.
@@ -106,18 +102,14 @@ describe.if(isLinux)('One mount per destination', () => {
     root === '/' || candidate === root || candidate.startsWith(`${root}/`)
 
   /** A mask puts foreign content at the destination, so its source is not the
-   * destination. A bind of a path onto itself (an allowed write path, a write
-   * deny's read-only re-bind, the root) is not one, and neither is a tmpfs. */
+   * destination. A bind of a path onto itself is not one, nor is a tmpfs. */
   const isFileMask = (mount: Mount): boolean =>
     mount.flag === '--ro-bind' &&
     mount.source !== undefined &&
     mount.source !== mount.dest
 
-  /**
-   * Destinations given two file masks with nothing between them that mounts
-   * at or above the destination. Rendered as text so a failure names the
-   * mounts rather than reporting a count.
-   */
+  /** Destinations given two file masks with nothing between them that mounts
+   * at or above the destination, as text so a failure names the mounts. */
   function maskedTwiceOver(command: string): string[] {
     const mounts = mountsOf(command)
     const masksByDest = new Map<string, Mount[]>()
@@ -170,10 +162,9 @@ describe.if(isLinux)('One mount per destination', () => {
     })
   }
 
-  // Each entry spells one place more than once, through the routes a caller
-  // and the credentials block reach it by: a tilde is expanded before this
-  // function sees it, so the spellings that survive to here are the absolute
-  // ones, a doubled slash, a trailing slash and a symlinked directory.
+  // Each entry spells one place more than once. A tilde is expanded before
+  // this function sees it, so the spellings are the absolute ones: a doubled
+  // slash, a trailing slash and a symlinked directory.
   const corpus = (): Array<{ what: string; wrapped: Promise<string> }> => [
     {
       what: 'one file denied under two absolute spellings',
@@ -303,9 +294,8 @@ describe.if(isLinux)('One mount per destination', () => {
   })
 
   it('leaves a denied file to the credential mask that covers it', async () => {
-    // Both name one file. The mask is the mount bubblewrap leaves in force,
-    // and it hides the real bytes as the read deny asked; a /dev/null mask
-    // under it would only be replaced.
+    // Both name one file. The mask hides the real bytes as the read deny
+    // asked; a /dev/null mask under it would only be replaced.
     const command = await wrap({
       denyRead: [SECRET],
       maskedFileBinds: [{ realPath: SECRET, fakePath: join(FAKES, '0.fake') }],
@@ -315,8 +305,7 @@ describe.if(isLinux)('One mount per destination', () => {
   })
 
   it('keeps the last fake where two entries name one file', async () => {
-    // bwrap applies mounts in order, so the second of two masks at one
-    // destination was the one in force; that is the one kept.
+    // The last of two masks at one destination is the one left in force.
     const command = await wrap({
       maskedFileBinds: [
         { realPath: SECRET, fakePath: join(FAKES, '0.fake') },

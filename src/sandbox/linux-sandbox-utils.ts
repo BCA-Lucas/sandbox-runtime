@@ -1093,20 +1093,17 @@ export function checkLinuxDependencies(
 }
 
 /**
- * The oldest bubblewrap on which everything this library does holds. Every
- * mount plan it builds starts on 0.4.0 and later; two behaviours need 0.5.0,
- * both of them changes to how bubblewrap prepares the mount point for a file
- * bind. Before 0.5.0 `ensure_file()` takes only a regular file for one and
- * creates a file over anything else, so a mask on a fifo, socket or device
- * node blocks or fails instead of binding over it; and it creates that file
- * mode 0666 rather than 0444, so isStaleBwrapMountPoint does not recognise
- * what an interrupted sandbox left behind and leaves it on the host.
+ * The oldest bubblewrap on which everything this library does holds. Mount
+ * plans start on 0.4.0 and later, but before 0.5.0 `ensure_file()` takes
+ * only a regular file as a file bind's mount point, so a mask on a fifo,
+ * socket or device node blocks or fails; and it creates one mode 0666 rather
+ * than 0444, so isStaleBwrapMountPoint leaves what an interrupted sandbox
+ * left behind on the host.
  */
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
-// One version per bwrap binary: it is a property of the binary, not of the
-// moment. Keyed by path so a caller that passes an explicit bwrapPath is not
-// answered for another one.
+// Keyed by path, so a caller that passes an explicit bwrapPath is not
+// answered for another binary.
 const bwrapVersions = new Map<string, string | null>()
 
 /** The version `bwrap --version` reports, or null when it could not be asked. */
@@ -1128,8 +1125,7 @@ function probeBwrapVersion(bwrap: string): string | null {
 }
 
 /** Negative when `a` is the older version. A missing or unreadable component
- * counts as 0, so '0.5' and '0.5.0' compare equal and '0.5.0rc1' reads as
- * 0.5.0 rather than sorting arbitrarily. */
+ * counts as 0, so '0.5' and '0.5.0' compare equal. */
 function compareVersions(a: string, b: string): number {
   const partsOf = (version: string): number[] =>
     version.split('.').map(part => {
@@ -1146,11 +1142,10 @@ function compareVersions(a: string, b: string): number {
 }
 
 /**
- * A warning naming the bubblewrap version found, when it is older than
+ * A warning naming a bubblewrap older than
  * OLDEST_FULLY_SUPPORTED_BWRAP_VERSION, and what that costs. Not an error:
- * the sandbox starts and enforces on an older bubblewrap. A version that
- * could not be asked for is not reported — a bubblewrap that does not answer
- * `--version` is a different problem, and a guess would be noise on every run.
+ * the sandbox starts and enforces on it. A version that could not be asked
+ * for is not reported: a guess would be noise on every run.
  */
 function outdatedBwrapWarning(bwrap: string | null): string | null {
   if (bwrap === null) return null
@@ -2725,24 +2720,19 @@ async function generateFilesystemArgs(
   // those matches unmasked.
   const unlistableDenyDirs = new Set(readConfig?.unlistableDenyDirs ?? [])
 
-  // The credential masks, one fake per place they land. Two entries naming
-  // one file — '~/.netrc' and its absolute form, or a route through a
-  // symlinked directory — resolve to the same landing, and the last of them
-  // is the mask bubblewrap leaves in force there, so the last is the one
-  // kept. Keyed by landing, so the read-deny loop below can leave a
-  // destination a mask already covers to that mask.
+  // The credential masks, one fake per landing. Where two entries name one
+  // file ('~/.netrc' and its absolute form), the last is kept: it is the
+  // mask bubblewrap would leave in force there.
   const credentialMaskFakes = new Map<string, string>()
   for (const { realPath, fakePath } of maskedFileBinds ?? []) {
     credentialMaskFakes.set(canonicalForm(realPath), fakePath)
   }
   // Destinations a file mask has been placed at, or will be: one mount per
-  // destination. A second file mount lands on what the first one put there,
-  // which is a character device for a /dev/null mask, and bubblewrap before
-  // 0.5.0 refuses to start on that ("Can't create file at <dest>: Permission
-  // denied") because its ensure_file() only accepts a regular file as a
-  // mount point and creat()s anything else on a mount it has just made
-  // read-only. Seeded with the credential landings, which are emitted after
-  // this loop and win where both name one file.
+  // destination. A second file mount lands on what the first put there, a
+  // character device for a /dev/null mask, which bubblewrap before 0.5.0
+  // does not take as a mount point: it refuses to start ("Can't create file
+  // at <dest>: Permission denied"). Seeded with the credential landings,
+  // which are emitted after this loop and win where both name one file.
   const fileMaskLandings = new Set(credentialMaskFakes.keys())
 
   // Every location the read section hides, each one where its mount lands:
@@ -2841,10 +2831,8 @@ async function generateFilesystemArgs(
         )
         continue
       }
-      // One mask per destination. Spellings of one file converge here —
-      // '~/x' and its absolute form, a trailing slash, a route through a
-      // symlinked directory, the same path arriving again from
-      // credentials.files — and each would otherwise mount over the last.
+      // One mask per destination (see fileMaskLandings): spellings of one
+      // file converge here, and each would otherwise mount over the last.
       if (fileMaskLandings.has(landing)) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny at a destination a file mask already covers: ${normalizedPath} -> ${landing}`,

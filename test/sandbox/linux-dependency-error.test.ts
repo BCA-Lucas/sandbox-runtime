@@ -30,9 +30,8 @@ let spawnSyncSpy: ReturnType<typeof spyOn>
 const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
-// Every caller runs `bwrap --version`, so counting spawns alone no longer
-// answers "was this caller asked about capabilities". These are the spawns
-// that are not that version probe.
+// The spawns that are not the `bwrap --version` probe every caller runs:
+// the ones that ask about capabilities.
 const capabilityProbes = (): unknown[] =>
   spawnSyncSpy.mock.calls.filter(
     (call: unknown[]) =>

@@ -9,8 +9,8 @@
  * counting for itself.
  *
  * The sandbox vouches for itself. Each wrap writes a manifest, `<id>.json`, into
- * a per-user directory, naming its mount points and every directory mount point
- * of another sandbox that its own mounts lie in or bind from. The command line
+ * a per-user directory, naming its mount points and every mount point of
+ * another sandbox that its own mounts lie in or bind from. The command line
  * it hands out is a shell that appends its own /proc/self/stat line to
  * `<id>.started` and then execs bubblewrap: the process on record is bubblewrap,
  * recorded before it has made a mount, and the wrap always passes
@@ -25,6 +25,14 @@
  * one that got past it has its record on disk, which the pass reads after the
  * claim. Whatever cannot be read or asked (a manifest, a record, /proc) counts
  * as live: only "no such process" and a different start time end a sandbox.
+ *
+ * A reading in doubt refuses every wrap of this user that restricts writes, so
+ * NO LASTING STATE OF THE DIRECTORY REFUSES WRAPS FOR EVER. Every source of doubt
+ * is either a condition of this process that clears by itself (EMFILE, ENFILE,
+ * ENOMEM, EIO on a read), which the age of a file never ends, or a property of
+ * what is at a name, which has an end: an hour, or the process on its record.
+ * No sandboxed command can write the directory (see below), so what is there
+ * and should not be comes from an accident on the host.
  *
  * The manifest directories are bound read-only into every sandbox that
  * restricts writes, and the directories above them inside a write root are
@@ -47,7 +55,10 @@ import { z } from 'zod/v3'
 import { logForDebugging } from '../utils/debug.js'
 import { isAbsenceErrno } from './sandbox-utils.js'
 
-/** The only manifest layout this version writes and reads. */
+/**
+ * The manifest layout this version writes. It reads this one and any later one,
+ * by the fields it knows (see {@link ManifestSchema}).
+ */
 const MANIFEST_VERSION = 1
 const MANIFEST_SUFFIX = '.json'
 const STARTED_SUFFIX = '.started'
@@ -78,7 +89,7 @@ const LISTING_GOOD_FOR_MS = 0.25
  * How often a reading starts over because a listed manifest was gone when it
  * was opened (claimed, given back or collected meanwhile) before it gives up.
  */
-const LISTING_ATTEMPTS = 4
+const LISTING_ATTEMPTS = 8
 
 /**
  * What is at a manifest's name and is not one this version reads counts as
@@ -158,6 +169,11 @@ const ownManifests = new Map<
  * process's manifest names is kept, and on its own word where there is none.
  */
 const unrecorded = { paths: new Set<string>(), sources: new Set<string>() }
+
+/** Has `source` removed at this process's own clean-up if no manifest keeps it. */
+export function keepTrackOfMountSource(source: string): void {
+  unrecorded.sources.add(source)
+}
 
 /**
  * Which of this process's own manifests a collect may release. Only the caller
@@ -468,6 +484,23 @@ export function removePrivateManifestDirectory(): void {
 class NotOurs extends Error {}
 
 /**
+ * Whether `file` is what an open does not refuse for what it is: a regular file
+ * of the user's that its owner may read. What cannot be looked at may be.
+ */
+function isOwnReadableFile(file: string): boolean {
+  try {
+    const stat = fs.lstatSync(file)
+    return (
+      stat.isFile() &&
+      stat.uid === process.getuid?.() &&
+      (stat.mode & 0o400) !== 0
+    )
+  } catch {
+    return true
+  }
+}
+
+/**
  * What `file` holds, or `undefined` where nothing is there. Only a regular file
  * of the user's, no larger than `max`, is read, through a descriptor opened
  * without following a link and without blocking. Throws {@link NotOurs} for
@@ -481,10 +514,11 @@ function readOwnFile(file: string, max: number): string | undefined {
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
     )
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return undefined
-    // What O_NOFOLLOW says of a link.
-    throw code === 'ELOOP' ? new NotOurs(`${file} is a link`) : e
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    // A link, a socket, a file of mode 000: that lasts. Anything else passes.
+    throw isOwnReadableFile(file)
+      ? e
+      : new NotOurs(`${file} is not a readable regular file of this user's`)
   }
   try {
     const stat = fs.fstatSync(fd)
@@ -536,13 +570,17 @@ function readManifest(file: string): Manifest | undefined {
  * regular file, or holds a line that is no /proc/PID/stat line vouches: only a
  * process that is gone says its sandbox has ended.
  *
+ * Not so an `orphan`, which has no manifest that can be read: it names no path,
+ * so it protects none. Only a process that can be asked after vouches there, and
+ * an error that says nothing of the file.
+ *
  * What follows the last newline counts as not written, an empty record
  * included. The command line execs bubblewrap only once its whole line is
  * written, so no sandbox is behind it yet, and one that follows is refused its
  * start by a claim like any that has not put itself on record. Taking it for a
  * running sandbox would keep what a shell killed there named for ever.
  */
-function recordVouches(record: string): boolean | undefined {
+function recordVouches(record: string, orphan = false): boolean | undefined {
   let lines: string[]
   try {
     const text = readOwnFile(record, RECORD_MAX_BYTES)
@@ -550,8 +588,8 @@ function recordVouches(record: string): boolean | undefined {
       return undefined
     }
     lines = text.split('\n').slice(0, -1)
-  } catch {
-    return true
+  } catch (e) {
+    return !(orphan && e instanceof NotOurs)
   }
   if (lines.length === 0) {
     return undefined
@@ -559,9 +597,9 @@ function recordVouches(record: string): boolean | undefined {
   return lines.some(line => {
     const pid = /^(\d+) \(/.exec(line)?.[1]
     const start = startTimeFromProcStat(line)
-    return (
-      pid === undefined || start === undefined || isRunning(Number(pid), start)
-    )
+    return pid === undefined || start === undefined
+      ? !orphan
+      : isRunning(Number(pid), start)
   })
 }
 
@@ -778,12 +816,15 @@ export function publishMountPointManifest(
 }
 
 /**
- * Drop the manifest of a wrap that never produced a command. No sandbox can
- * start under it, so the mount points it named are no one's.
+ * Let go of the manifest of a wrap that produced no command: released, and
+ * collected by a pass like any other. Not unlinked: a pass elsewhere may have
+ * spared a path on its word and dropped the manifest that named the path till
+ * then, and what nothing names any more stays on the host for good.
  */
 export function discardMountPointManifest(file: string): void {
-  ownManifests.delete(file)
-  drop(file)
+  const own = ownManifests.get(file)
+  if (own !== undefined) own.over = true
+  collectMountPoints('none')
 }
 
 function drop(file: string): boolean {
@@ -807,6 +848,8 @@ type Reading = {
    * may: nothing may then be removed on it.
    */
   inDoubt?: string
+  /** All that doubt is, is that manifests kept moving while they were read. */
+  keptChanging?: boolean
   /** What is there and is of no use to anybody any more. */
   spent: string[]
 }
@@ -821,16 +864,16 @@ type Reading = {
  * when opened, and for a record with no manifest listed beside it whose manifest
  * is there when asked for by name.
  *
- * A record with no manifest at either name names no path and protects none: it
- * puts the reading in doubt only while a process on it runs, and one with no
- * whole line is dropped past {@link MANIFEST_GRACE_MS} (its shell may be about
- * to write to it).
+ * A record with no manifest at either name puts the reading in doubt only while
+ * a process on it runs (see {@link recordVouches}) and is spent otherwise, one
+ * with no whole line past {@link MANIFEST_GRACE_MS} (its shell may be about to
+ * write to it).
  *
  * Whatever is at a manifest's name and cannot be read puts the reading in doubt
- * too: always where that is an error (a sandboxed command can use up what this
- * user may open), and where it is not a manifest of this version, while a
- * process on its record runs or it is younger than {@link
- * UNREADABLE_MANIFEST_MAX_AGE_MS}.
+ * too: always where that is an error of the moment (a sandboxed command can use
+ * up what this user may open), and where it is what is there that cannot be
+ * read as a manifest, while a process on its record runs or it is younger than
+ * {@link UNREADABLE_MANIFEST_MAX_AGE_MS}.
  */
 function readManifests(dir: string): Reading {
   const olderThan = (file: string, ms: number): boolean => {
@@ -872,12 +915,13 @@ function readManifests(dir: string): Reading {
       } catch (e) {
         if (
           e instanceof NotOurs &&
-          recordVouches(`${idOf(file)}${STARTED_SUFFIX}`) !== true &&
+          recordVouches(`${idOf(file)}${STARTED_SUFFIX}`, true) !== true &&
           olderThan(file, UNREADABLE_MANIFEST_MAX_AGE_MS)
         ) {
           reading.spent.push(file)
         } else {
-          reading.inDoubt ??= `${file}: ${String(e)}`
+          const why = e instanceof Error ? e.message : String(e)
+          reading.inDoubt ??= why.includes(file) ? why : `${file}: ${why}`
         }
       }
     }
@@ -900,9 +944,9 @@ function readManifests(dir: string): Reading {
           moved = true
           continue
         }
-        const vouched = recordVouches(file)
+        const vouched = recordVouches(file, true)
         if (vouched === true) {
-          reading.inDoubt ??= `${file} has no manifest`
+          reading.inDoubt ??= `${file} has no manifest, and a process on it may be running`
         } else if (vouched === false || olderThan(file, MANIFEST_GRACE_MS)) {
           reading.spent.push(file)
         }
@@ -912,6 +956,7 @@ function readManifests(dir: string): Reading {
       continue
     }
     if (moved) {
+      reading.keptChanging = reading.inDoubt === undefined
       reading.inDoubt ??= `${dir} kept changing`
     }
     return reading
@@ -929,9 +974,11 @@ export type NamedMountPoints = {
  * (what only those name is a leftover the next pass removes), and what this
  * process could record nowhere. Makes nothing on the host.
  *
- * `undefined` where the reading is in doubt: a path it does not name may then be
- * a running sandbox's mount point all the same, and a wrap that took it for the
- * caller's own would not name it and would lose it under its own sandbox.
+ * `inDoubt`, which says what could not be read and why, where the reading is in
+ * doubt: a path it does not name may then be a running sandbox's mount point
+ * all the same, and a wrap that took it for the caller's own would not name it
+ * and would lose it under its own sandbox. With `keptChanging`, only because
+ * other processes are busy in the directory: the next reading may do.
  *
  * `earlier` is a reading this call may answer with. A manifest is never
  * rewritten, so it still holds when the directory lists nothing it did not,
@@ -940,7 +987,7 @@ export type NamedMountPoints = {
 export function namedMountPoints(
   earlier?: NamedMountPoints,
   own?: string,
-): NamedMountPoints | undefined {
+): NamedMountPoints | { inDoubt: string; keptChanging?: boolean } {
   try {
     const dir = onLinux() ? existingManifestDirectory() : undefined
     if (dir === undefined) {
@@ -955,19 +1002,20 @@ export function namedMountPoints(
       return earlier
     }
     const reading = readManifests(dir)
-    if (reading.inDoubt === undefined) {
-      return {
-        paths: new Set([
-          ...unrecorded.paths,
-          ...reading.manifests.flatMap(manifest => manifest.paths),
-        ]),
-        listed: new Set(reading.names),
-      }
+    if (reading.inDoubt !== undefined) {
+      return { inDoubt: reading.inDoubt, keptChanging: reading.keptChanging }
     }
-  } catch {
+    return {
+      paths: new Set([
+        ...unrecorded.paths,
+        ...reading.manifests.flatMap(manifest => manifest.paths),
+      ]),
+      listed: new Set(reading.names),
+    }
+  } catch (e) {
     // The directory cannot be looked at, or listed.
+    return { inDoubt: String(e) }
   }
-  return undefined
 }
 
 /**
@@ -1036,14 +1084,18 @@ export function liveMountPoints(): ReadonlySet<string> | undefined {
     const dir = existingManifestDirectory()
     const reading = dir === undefined ? undefined : readManifests(dir)
     if (reading?.inDoubt !== undefined) {
-      return undefined
+      throw new Error(reading.inDoubt)
     }
     for (const manifest of reading?.manifests ?? []) {
       if (isLive(manifest)) {
         for (const mountPoint of manifest.paths) named.add(mountPoint)
       }
     }
-  } catch {
+  } catch (e) {
+    logForDebugging(
+      `[Sandbox Linux] Which mount points are live cannot be told (${String(e)})`,
+      { level: 'warn' },
+    )
     return undefined
   }
   for (const mountPoint of named) {

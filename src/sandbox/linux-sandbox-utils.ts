@@ -11,6 +11,7 @@ import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
   discardMountPointManifest,
+  keepTrackOfMountSource,
   kindOfMountPoint,
   mountPointManifestDirectories,
   namedMountPoints,
@@ -460,6 +461,8 @@ function ensureEmptyMountSourceDir(): string {
   // directory lands on 0500. Set the mode here rather than let the check
   // above reject the directory this call has just made.
   fs.chmodSync(emptyMountSourceDir, 0o700)
+  // The wrap may throw before a manifest names it.
+  keepTrackOfMountSource(emptyMountSourceDir)
   return emptyMountSourceDir
 }
 
@@ -735,13 +738,16 @@ export type LinuxSandboxProfileErrorCode =
   | 'too_many_mount_points'
   /**
    * The mount point manifests cannot be read, so a path cannot be told from a
-   * mount point a running sandbox relies on. Passing where this process is out
-   * of descriptors; lasting while something that is no manifest sits among them.
+   * mount point a running sandbox relies on. It ends by itself: when this
+   * process has descriptors again, when what sits among them and is no manifest
+   * is an hour old, when the process on a record with no manifest has ended.
+   * `.cause` is the file and the reason, which the message holds too.
    */
   | 'mount_points_unreadable'
   /**
    * Other sandboxes' mount points kept being made or removed under what the
-   * profile relies on, each time the wrap planned it. Passing: wrap again.
+   * profile relies on, or their manifests kept moving while they were read,
+   * each time the wrap planned it. Passing: wrap again.
    */
   | 'mount_points_changed'
 
@@ -789,7 +795,8 @@ let stepShell: string[] | undefined
 
 /**
  * The shell the returned string runs its own steps in, before bubblewrap: found
- * once, bash at one of its two usual places, else /bin/sh.
+ * once, bash at one of its two usual places, else /bin/sh, which is bash too on
+ * some systems (NixOS, Guix).
  *
  * bash, because where /bin/sh is dash the environment is rebuilt from the
  * shell's variables, and every entry whose name is no identifier (`a.b`,
@@ -804,7 +811,16 @@ let stepShell: string[] | undefined
  */
 function shellForSteps(): string[] {
   if (stepShell === undefined) {
-    const bash = ['/bin/bash', '/usr/bin/bash'].find(isExecutable)
+    const isBash = (shell: string): boolean => {
+      try {
+        return path.basename(fs.realpathSync(shell)) === 'bash'
+      } catch {
+        return false
+      }
+    }
+    const bash =
+      ['/bin/bash', '/usr/bin/bash'].find(isExecutable) ??
+      ['/bin/sh'].find(isBash)
     stepShell = bash === undefined ? ['/bin/sh', '-c'] : [bash, '-p', '-c']
   }
   return stepShell
@@ -1699,10 +1715,14 @@ function pushReadDenyDirMounts(
  */
 const MOUNT_PLAN_ATTEMPTS = 3
 
+/** Thrown in a plan that cannot be finished and may be the next time. */
+class MountPlanFailed extends Error {}
+
 /**
- * Generate filesystem bind mount arguments for bwrap. `undefined`, with nothing
- * left published, when what the plan relied on on the host had changed by the
- * time its manifest was: the caller plans again.
+ * Generate filesystem bind mount arguments for bwrap. `undefined`, with its
+ * manifest let go of, when what the plan relied on on the host had changed by
+ * the time that was published: the caller plans again, as it does when this
+ * throws {@link MountPlanFailed}.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -1734,15 +1754,21 @@ async function generateFilesystemArgs(
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
   const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
-    named = namedMountPoints(named, ownManifest)
-    if (named === undefined) {
+    const now = namedMountPoints(named, ownManifest)
+    if ('inDoubt' in now) {
+      if (now.keptChanging) {
+        throw new MountPlanFailed(now.inDoubt)
+      }
       // Not "treat what is there as named": naming what may be the caller's
       // own makes it removable, from under a sandbox that bound it as that.
+      // The reason names the file: this refuses every wrap while it lasts.
       throw new LinuxSandboxProfileError(
         'mount_points_unreadable',
-        'The mount point manifests cannot be read, so what is at a denied path cannot be told from a mount point a running sandbox relies on',
+        `The mount point manifests cannot be read (${now.inDoubt}), so what is at a denied path cannot be told from a mount point a running sandbox relies on`,
+        now.inDoubt,
       )
     }
+    named = now
     return named.paths
   }
 
@@ -2225,8 +2251,8 @@ async function generateFilesystemArgs(
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
     // Placeholder destination -> the index of its source in denyWriteArgs, so
-    // a later deny reaching the same destination can upgrade a /dev/null
-    // placeholder to the directory form in place (see the emission below).
+    // a later deny at or under that destination can upgrade a /dev/null
+    // placeholder to the directory form in place.
     const placeholderSourceArgIndex = new Map<string, number>()
     // PRE-PASS (order-independent): record the directories the loop below
     // re-binds read-only, BEFORE any stub decision, so the read-only
@@ -2468,6 +2494,37 @@ async function generateFilesystemArgs(
         continue
       }
 
+      // INVARIANT: a plan agrees with itself. Each deny path takes its own look
+      // at the host, and another sandbox's bubblewrap can make `.claude` between
+      // two of them: the later deny would then get a mount point of its own
+      // inside the read-only directory this plan has put at `.claude`, which
+      // bubblewrap cannot make. So what lies at or under a placeholder of this
+      // plan is covered by it, whatever is on the host by now.
+      //
+      // One mount point per destination, too: two binds on one make bwrap refuse
+      // to start when they disagree about its kind ("Can't mkdir <dest>: Not a
+      // directory"). The directory form wins: an empty read-only directory
+      // blocks creating the destination and everything below it exactly as
+      // /dev/null does, and stays traversable for the deeper deny.
+      let placeholder = normalizedPath
+      while (
+        placeholder !== '/' &&
+        !placeholderSourceArgIndex.has(placeholder)
+      ) {
+        placeholder = path.dirname(placeholder)
+      }
+      const placeholderAt = placeholderSourceArgIndex.get(placeholder)
+      if (placeholderAt !== undefined) {
+        if (placeholder !== normalizedPath) {
+          denyWriteArgs[placeholderAt] = emptySource ??=
+            ensureEmptyMountSourceDir()
+        }
+        logForDebugging(
+          `[Sandbox Linux] Reusing the mount point at ${placeholder} to block creation of ${normalizedPath}`,
+        )
+        continue
+      }
+
       // A mount point another sandbox made is an absent deny path in all but
       // name: bound onto itself it would not be named in this wrap's manifest
       // and would go, with this sandbox still bound over it, when its maker is
@@ -2578,35 +2635,15 @@ async function generateFilesystemArgs(
             ? (emptySource ??= ensureEmptyMountSourceDir())
             : '/dev/null'
 
-          // One mount point per destination. Deny paths are deduplicated on
-          // the deny path, but a placeholder lands on the first MISSING
-          // component, so two denies sharing one arrive here with a single
-          // destination — denyWrite '<cwd>/.claude' together with the
-          // mandatory '<cwd>/.claude/commands', in a project with no
-          // `.claude/`. Two binds there make bwrap refuse to start when they
-          // disagree about the destination's kind ("Can't mkdir <dest>: Not a
-          // directory"). The directory form wins the disagreement: an empty
-          // read-only directory blocks creating the destination and everything
-          // below it exactly as /dev/null does, and stays traversable for the
-          // deeper deny that asked for a directory.
-          const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
-          if (placeholderAt !== undefined) {
-            if (isIntermediate) denyWriteArgs[placeholderAt] = source
-            logForDebugging(
-              `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
-            continue
-          }
           denyWriteArgs.push('--ro-bind', source, firstNonExistent)
           placeholderSourceArgIndex.set(
             firstNonExistent,
             denyWriteArgs.length - 2,
           )
-          // First writer wins for a destination several denies share (the
-          // reuse branch above returns before reaching this), and the record
-          // is purely additive: it only gives the tmpfs and mask comparisons
-          // below a second spelling to test, and `dest` itself is always
-          // tested.
+          // First writer wins for a destination several denies share (the later
+          // ones do not get this far), and the record is purely additive: it
+          // only gives the tmpfs and mask comparisons below a second spelling to
+          // test, and `dest` itself is always tested.
           denyWriteRawDests.set(firstNonExistent, rawPath)
           mountPoints.push(firstNonExistent)
           logForDebugging(
@@ -3026,6 +3063,8 @@ async function generateFilesystemArgs(
   }
   // Those of them, and the directories above them, that a manifest names:
   // another sandbox's mount points, which go when no live manifest names them.
+  // A file among them was made again after the deny loop took it for the
+  // caller's own.
   const mountPointsReliedOn = (ownManifest?: string): string[] => {
     const found = new Set<string>()
     const namedNow = boundFrom.size > 0 ? whatIsNamedNow(ownManifest) : found
@@ -3034,7 +3073,7 @@ async function generateFilesystemArgs(
         if (namedNow.has(dir)) found.add(dir)
       }
     }
-    return [...found].filter(dir => kindOfMountPoint(dir) === 'directory')
+    return [...found].filter(relied => kindOfMountPoint(relied) !== undefined)
   }
 
   // Name the mount points this wrap relies on before the sandbox can start.
@@ -3452,7 +3491,7 @@ export async function wrapCommandWithSandboxLinux(
       if (left === 0) {
         throw new LinuxSandboxProfileError(
           'mount_points_changed',
-          `What the sandbox profile relies on on the host changed under each of ${MOUNT_PLAN_ATTEMPTS} plans: other sandboxes' mount points are being made and removed there`,
+          `What the sandbox profile relies on on the host changed under each of ${MOUNT_PLAN_ATTEMPTS} plans: other sandboxes' mount points, or their manifests, are being made and removed there`,
         )
       }
       filesystem = await generateFilesystemArgs(
@@ -3467,7 +3506,10 @@ export async function wrapCommandWithSandboxLinux(
         // Only an id the caller chose: the attribution key falls back to the
         // command text, which two wraps in flight may share.
         commandId,
-      )
+      ).catch((error: unknown) => {
+        if (!(error instanceof MountPlanFailed)) throw error
+        return undefined
+      })
     }
     // Held for the catch below: a wrap that produces no command has to let go
     // of the mount points it named.
@@ -3576,8 +3618,7 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
-    // No command came of this wrap, so no sandbox starts under its manifest
-    // and the mount points it named are no one's.
+    // No command came of this wrap, so no sandbox starts under its manifest.
     if (manifest !== undefined) {
       discardMountPointManifest(manifest.file)
     }

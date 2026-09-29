@@ -1086,7 +1086,85 @@ export function checkLinuxDependencies(
   })
   if (uid0Error !== null) errors.push(uid0Error)
 
+  const outdated = outdatedBwrapWarning(usableBwrap)
+  if (outdated !== null) warnings.push(outdated)
+
   return { warnings, errors }
+}
+
+/**
+ * The oldest bubblewrap on which everything this library does holds. Mount
+ * plans start on 0.4.0 and later, but before 0.5.0 `ensure_file()` takes
+ * only a regular file as a file bind's mount point, so a mask on a fifo,
+ * socket or device node blocks or fails; and it creates one mode 0666 rather
+ * than 0444, so isStaleBwrapMountPoint leaves what an interrupted sandbox
+ * left behind on the host.
+ */
+export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
+
+// Keyed by path, so a caller that passes an explicit bwrapPath is not
+// answered for another binary. Only an answer is kept: after a probe that
+// failed or timed out, the next call asks again.
+const bwrapVersions = new Map<string, string>()
+
+/** The version `bwrap --version` reports, or null when it could not be asked. */
+function probeBwrapVersion(bwrap: string): string | null {
+  const cached = bwrapVersions.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const probe = spawnSync(bwrap, ['--version'], {
+    timeout: 5000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    encoding: 'utf8',
+  })
+  const version =
+    probe.error === undefined && probe.status === 0
+      ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
+      : null
+  if (version !== null) bwrapVersions.set(bwrap, version)
+  return version
+}
+
+/** Negative when `a` is the older version. A missing or unreadable component
+ * counts as 0, so '0.5' and '0.5.0' compare equal. */
+function compareVersions(a: string, b: string): number {
+  const partsOf = (version: string): number[] =>
+    version.split('.').map(part => {
+      const parsed = Number.parseInt(part, 10)
+      return Number.isNaN(parsed) ? 0 : parsed
+    })
+  const left = partsOf(a)
+  const right = partsOf(b)
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const difference = (left[i] ?? 0) - (right[i] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+/**
+ * A warning naming a bubblewrap older than
+ * OLDEST_FULLY_SUPPORTED_BWRAP_VERSION, and what that costs. Not an error:
+ * the sandbox starts and enforces on it. A version that could not be asked
+ * for is not reported: a guess would be noise on every run.
+ */
+function outdatedBwrapWarning(bwrap: string | null): string | null {
+  if (bwrap === null) return null
+  const version = probeBwrapVersion(bwrap)
+  if (
+    version === null ||
+    compareVersions(version, OLDEST_FULLY_SUPPORTED_BWRAP_VERSION) >= 0
+  ) {
+    return null
+  }
+  return (
+    `bubblewrap ${version} at ${bwrap} is older than ` +
+    `${OLDEST_FULLY_SUPPORTED_BWRAP_VERSION}: a denyRead entry or credential ` +
+    `mask naming a path that is not a regular file (a fifo, socket or device ` +
+    `node) cannot be applied on it, and a mount point an interrupted sandbox ` +
+    `left behind is not recognised as one and stays on the host. Everything ` +
+    `else is unaffected`
+  )
 }
 
 /**
@@ -2628,6 +2706,21 @@ async function generateFilesystemArgs(
   // those matches unmasked.
   const unlistableDenyDirs = new Set(readConfig?.unlistableDenyDirs ?? [])
 
+  // The credential masks, one fake per landing. Where two entries name one
+  // file ('~/.netrc' and its absolute form), the last is kept: it is the
+  // mask bubblewrap would leave in force there.
+  const credentialMaskFakes = new Map<string, string>()
+  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
+    credentialMaskFakes.set(canonicalForm(realPath), fakePath)
+  }
+  // Destinations a file mask has been placed at, or will be: one mount per
+  // destination. A second file mount lands on what the first put there, a
+  // character device for a /dev/null mask, which bubblewrap before 0.5.0
+  // does not take as a mount point: it refuses to start ("Can't create file
+  // at <dest>: Permission denied"). Seeded with the credential landings,
+  // which are emitted after this loop and win where both name one file.
+  const fileMaskLandings = new Set(credentialMaskFakes.keys())
+
   // Every location the read section hides, each one where its mount lands:
   // one per entry that mounts something — a directory's tmpfs, the stand-in
   // tmpfs of an entry that could not be inspected or that resolves to '/', a
@@ -2641,7 +2734,7 @@ async function generateFilesystemArgs(
     ...readDenyPlan().flatMap(({ mount, liftedFile }) =>
       mount === undefined || liftedFile ? [] : [mount.landing],
     ),
-    ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+    ...credentialMaskFakes.keys(),
   ]
   // What the read section hides at, inside, or around `target`, ignoring the
   // tmpfs landing at `landing` and every deny above it — those are what a
@@ -2724,6 +2817,15 @@ async function generateFilesystemArgs(
         )
         continue
       }
+      // One mask per destination (see fileMaskLandings): spellings of one
+      // file converge here, and each would otherwise mount over the last.
+      if (fileMaskLandings.has(landing)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny at a destination a file mask already covers: ${normalizedPath} -> ${landing}`,
+        )
+        continue
+      }
+      fileMaskLandings.add(landing)
       // For files, bind /dev/null instead of tmpfs, where the path resolves
       // like every other read-deny mount.
       args.push('--ro-bind', '/dev/null', landing)
@@ -2738,8 +2840,7 @@ async function generateFilesystemArgs(
   // (tilde-expanded, realpath'd) by the caller. The fake's parent dir is
   // explicitly ro-bound at the end of this function, so the bind source is
   // never writable from inside the sandbox.
-  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
-    const landing = canonicalForm(realPath)
+  for (const [landing, fakePath] of credentialMaskFakes) {
     args.push('--ro-bind', fakePath, landing)
     fileMasks.push({ source: fakePath, landing })
   }

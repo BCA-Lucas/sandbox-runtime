@@ -758,8 +758,10 @@ export type LinuxSandboxProfileErrorCode =
   /**
    * A program this library runs on the host (bubblewrap, socat, ripgrep) has
    * no copy on PATH outside the paths the command may write. The message
-   * names each copy passed over and why. Lifted by such a copy on PATH, or by
-   * naming the helper (`bwrapPath`, `socatPath`, `ripgrep.command`).
+   * names each copy passed over and why, and `.cause` holds the same:
+   * `{ helper, skipped: { path, reason, writePath? }[] }`. Lifted by such a
+   * copy on PATH, or by naming the helper (`bwrapPath`, `socatPath`,
+   * `ripgrep.command`).
    */
   | 'host_helper_unavailable'
 
@@ -812,6 +814,7 @@ function requireHostHelper(
     throw new LinuxSandboxProfileError(
       'host_helper_unavailable',
       describeUnavailableHostHelper(helper, search),
+      { helper, skipped: search.skipped },
     )
   }
   return search.path
@@ -1110,6 +1113,8 @@ export function checkLinuxDependencies(
 
   // Found as the wrap will find it (see `findHostHelper`). A copy passed over
   // is named, so the caller learns at start-up that it will not be run.
+  // INVARIANT: `notInstalled` is said of a helper that is nowhere on PATH and
+  // of nothing else, in the same words as ever: embedders match on them.
   const onPath = (helper: string, notInstalled: string): string | null => {
     const search = findHostHelper(helper, allowedWritePaths)
     if (search.path === null) {

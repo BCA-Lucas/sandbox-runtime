@@ -319,8 +319,9 @@ export function linuxGetCwdMandatoryDenyPaths(
 
 /**
  * The directories below `cwd`, down to `maxDepth`, that ripgrep said it could
- * not read and that this process cannot read either. What is in one is not
- * known, so the caller denies it whole. Exported for testing.
+ * not read, that this process cannot read either, and whose mode is this
+ * user's to change. What is in one is not known, so the caller denies it whole.
+ * Exported for testing.
  */
 export function unreadableDirectories(
   stderr: string,
@@ -328,35 +329,52 @@ export function unreadableDirectories(
   maxDepth: number,
 ): string[] {
   const found: string[] = []
+  const tried = new Set<string>()
   for (const line of stderr.split('\n')) {
-    const named = /^rg: (.+): .+ \(os error \d+\)$/.exec(line)?.[1]
-    if (named === undefined) continue
-    // What cannot be looked at, because what holds it cannot be searched, is
-    // stood in for by the nearest directory above it that can.
+    // How a message is worded depends on ripgrep's version and on how many
+    // threads it has, so what stands before each ": " is tried.
+    const said = line.startsWith('rg: ') ? line.slice(4) : line
     for (
-      let dir = path.resolve(cwd, named);
-      dir.startsWith(cwd + path.sep);
-      dir = path.dirname(dir)
+      let cut = said.indexOf(': ');
+      cut !== -1;
+      cut = said.indexOf(': ', cut + 1)
     ) {
-      try {
-        // THREAT: the text is only a hint. A name can hold a newline and a
-        // whole line of its own, and a bind of `link/x` would bring what the
-        // link leads to INTO the sandbox. So: a directory, with no link on the
-        // way to it, that cannot be read from here.
-        if (!fs.lstatSync(dir).isDirectory() || fs.realpathSync(dir) !== dir) {
+      for (
+        let dir = path.resolve(cwd, said.slice(0, cut));
+        dir.startsWith(cwd + path.sep) && !tried.has(dir);
+        dir = path.dirname(dir)
+      ) {
+        tried.add(dir)
+        try {
+          // THREAT: the text is only a hint. A name can hold a newline and a
+          // whole message of its own, and a bind of `link/x` would bring what
+          // the link leads to INTO the sandbox. So: a directory, with no link
+          // on the way to it, that cannot be read from here. And this user's:
+          // nobody else's mode can be given back from inside, and there can
+          // be thousands of those (`/home`), each of them a mount.
+          const stat = fs.lstatSync(dir)
+          if (
+            !stat.isDirectory() ||
+            stat.uid !== process.getuid?.() ||
+            fs.realpathSync(dir) !== dir
+          ) {
+            break
+          }
+        } catch (error) {
+          // What cannot be looked at, because what holds it cannot be
+          // searched, is stood in for by the directory above it.
+          if ((error as NodeJS.ErrnoException).code === 'EACCES') continue
           break
         }
-      } catch {
-        continue
-      }
-      try {
-        fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK)
-      } catch {
-        if (path.relative(cwd, dir).split(path.sep).length <= maxDepth) {
-          found.push(dir)
+        try {
+          fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK)
+        } catch {
+          if (path.relative(cwd, dir).split(path.sep).length <= maxDepth) {
+            found.push(dir)
+          }
         }
+        break
       }
-      break
     }
   }
   return found

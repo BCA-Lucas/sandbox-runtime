@@ -6,6 +6,7 @@ import {
   afterAll,
   beforeEach,
   afterEach,
+  spyOn,
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
@@ -132,6 +133,7 @@ describe.if(isSupportedPlatform)(
 
     async function runSandboxed(
       command: string,
+      ripgrepArgs: string[] = [],
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
 
@@ -155,6 +157,7 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          ripgrepConfig: { command: 'rg', args: ripgrepArgs },
         })
       }
 
@@ -362,33 +365,37 @@ describe.if(isSupportedPlatform)(
         // The other way about.
         ['locked', 0o111],
       ] as const) {
-        it(`blocks them all the same in locked/ when ${directory} has mode ${mode.toString(8)}`, async () => {
-          const names = [
-            '.bashrc',
-            '.git/config',
-            '.git/hooks/pre-commit',
-            `.claude/commands/${DIRECTORY_PROBE_FILE}`,
-          ]
-          populate('locked')
-          try {
-            for (const name of names) {
-              // Each time: a command that is not held gives the mode back.
-              chmodSync(join(TEST_DIR, directory), mode)
-              const result = await runSandboxed(
-                `chmod 755 locked '${directory}'; echo x > 'locked/${name}'`,
-              )
+        // With one thread, as on one CPU, ripgrep words what it says otherwise.
+        for (const threads of [[], ['-j1']]) {
+          it(`blocks them all the same in locked/ when ${directory} has mode ${mode.toString(8)} (rg ${threads.join()})`, async () => {
+            const names = [
+              '.bashrc',
+              '.git/config',
+              '.git/hooks/pre-commit',
+              `.claude/commands/${DIRECTORY_PROBE_FILE}`,
+            ]
+            populate('locked')
+            try {
+              for (const name of names) {
+                // Each time: a command that is not held gives the mode back.
+                chmodSync(join(TEST_DIR, directory), mode)
+                const result = await runSandboxed(
+                  `chmod 755 locked '${directory}'; echo x > 'locked/${name}'`,
+                  threads,
+                )
 
-              expect([name, result.success]).toEqual([name, false])
+                expect([name, result.success]).toEqual([name, false])
+              }
+            } finally {
+              chmodSync(join(TEST_DIR, directory), 0o755)
             }
-          } finally {
-            chmodSync(join(TEST_DIR, directory), 0o755)
-          }
-          for (const name of names) {
-            expect(readFileSync(`locked/${name}`, 'utf8')).toBe(
-              ORIGINAL_CONTENT,
-            )
-          }
-        })
+            for (const name of names) {
+              expect(readFileSync(`locked/${name}`, 'utf8')).toBe(
+                ORIGINAL_CONTENT,
+              )
+            }
+          })
+        }
       }
 
       // root reads a directory of any mode.
@@ -400,6 +407,11 @@ describe.if(isSupportedPlatform)(
           for (const directory of [
             join(project, 'is-readable'),
             join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
+            join(project, 'listed-only/child'),
+            join(project, 'entered-only'),
             join(project, 'a/b/c/too-deep'),
             join(outside, 'behind-a-link'),
           ]) {
@@ -408,6 +420,9 @@ describe.if(isSupportedPlatform)(
           symlinkSync(outside, join(project, 'link'))
           const locked = [
             join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
             join(project, 'a/b/c/too-deep'),
             join(outside, 'behind-a-link'),
           ]
@@ -419,8 +434,15 @@ describe.if(isSupportedPlatform)(
             'link/behind-a-link',
             '../hints-outside/behind-a-link',
             'not-there/at-all',
+            'entered-only/not-there',
+            'locked: too',
+            'listed-only/child',
           ].map(
             name => `rg: ${project}/${name}: Permission denied (os error 13)`,
+          )
+          said.push(
+            `rg: ${project}/one-thread: IO error for operation on ${project}/one-thread: Permission denied (os error 13)`,
+            `${project}/no-prefix: Permission denied (os error 13)`,
           )
           const standIn = join(TEST_DIR, 'says-it-could-not-read')
           const asked = join(TEST_DIR, 'was-asked')
@@ -436,6 +458,8 @@ describe.if(isSupportedPlatform)(
           )
           process.chdir(project)
           locked.forEach(directory => chmodSync(directory, 0o000))
+          chmodSync(join(project, 'listed-only'), 0o444)
+          chmodSync(join(project, 'entered-only'), 0o111)
           try {
             const wrapped = await wrapCommandWithSandboxLinux({
               command: 'true',
@@ -447,7 +471,21 @@ describe.if(isSupportedPlatform)(
 
             expect(unreadableDirectories(said.join('\n'), project, 3)).toEqual([
               join(project, 'really-locked'),
+              join(project, 'locked: too'),
+              join(project, 'listed-only'),
+              join(project, 'one-thread'),
+              join(project, 'no-prefix'),
             ])
+            // Nobody else's mode can be given back from inside.
+            const uid = process.getuid!()
+            const getuid = spyOn(process, 'getuid').mockReturnValue(uid + 1)
+            try {
+              expect(
+                unreadableDirectories(said.join('\n'), project, 3),
+              ).toEqual([])
+            } finally {
+              getuid.mockRestore()
+            }
             expect(wrapped).toContain('really-locked')
             expect(readFileSync(asked, 'utf8').split('\n')).toEqual(
               expect.arrayContaining([
@@ -457,7 +495,13 @@ describe.if(isSupportedPlatform)(
               ]),
             )
           } finally {
-            locked.forEach(directory => chmodSync(directory, 0o755))
+            for (const directory of [
+              ...locked,
+              join(project, 'listed-only'),
+              join(project, 'entered-only'),
+            ]) {
+              chmodSync(directory, 0o755)
+            }
           }
         },
       )

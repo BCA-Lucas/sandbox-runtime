@@ -787,7 +787,7 @@ With `allowWrite: ["/"]` the pins reach every ancestor, including any other allo
 
 A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and every other dangerous name of the same directories with it (`a/b/.git/hooks`, `a/b/.claude/commands`). A dangerous directory other than a repository's hooks is only seen if it holds a file directly. You can configure this with `mandatoryDenySearchDepth`:
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and every other dangerous name of the same directories with it (`a/b/.git/hooks`, `a/b/.claude/commands`). A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {

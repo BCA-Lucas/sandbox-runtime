@@ -2388,7 +2388,20 @@ describe.if(isWindows)(
 
     it('M11: reset() leaves the DACLs of the working directory and of .git as initialize() found them', async () => {
       const dir = mandatoryTree()
-      const both = () => dacl(dir) + dacl(join(dir, '.git'))
+      // Each ACE as `account:(rights)`, without the (I) mark. A directory made
+      // under %TEMP% has its parent's ACEs unmarked; the first DACL write puts
+      // it in auto-inherit form, which marks them and changes no right.
+      const aces = (p: string) =>
+        dacl(p)
+          .replace(p, '')
+          .split(/\r?\n/)
+          .map(l => l.trim().replace('(I)', ''))
+          .filter(l => /:\(/.test(l))
+      const both = () =>
+        JSON.stringify([aces(dir), aces(join(dir, '.git'))]).replace(
+          /[^"\\]+\\+/g,
+          '',
+        )
       try {
         const before = both()
         const held = await inSession(dir, { allowWrite: [dir] }, async () => {
@@ -2399,9 +2412,7 @@ describe.if(isWindows)(
         // `held` differing shows that there was something to undo.
         if (held === before || after !== before) {
           throw new Error(
-            `M11: before=${JSON.stringify(before)} ` +
-              `in the session=${JSON.stringify(held)} ` +
-              `after=${JSON.stringify(after)}`,
+            `M11: before=${before} in the session=${held} after=${after}`,
           )
         }
       } finally {

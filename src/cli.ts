@@ -426,6 +426,20 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
+          // Until there is a child to pass an interrupt on to, it stops the
+          // run. The library's own handlers, which initialize() installs, only
+          // clean up: left to them the command would be run all the same.
+          const interrupted = new AbortController()
+          const interrupt = (signal: NodeJS.Signals): void =>
+            interrupted.abort(new Error(`interrupted by ${signal}`))
+          process.once('SIGINT', interrupt)
+          process.once('SIGTERM', interrupt)
+          const aboutToSpawn = (): void => {
+            interrupted.signal.throwIfAborted()
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
+          }
+
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
@@ -515,28 +529,21 @@ async function main(): Promise<void> {
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
               env,
             })
           } else {
-            // There is no child yet to pass an interrupt on to, so it stops
-            // the wrap, which can take seconds over a large tree.
-            const interrupted = new AbortController()
-            const interrupt = (signal: NodeJS.Signals): void =>
-              interrupted.abort(new Error(`interrupted by ${signal}`))
-            process.once('SIGINT', interrupt)
-            process.once('SIGTERM', interrupt)
+            // The wrap can take seconds over a large tree.
             const sandboxedCommand = await SandboxManager.wrapWithSandbox(
               command,
               undefined,
               undefined,
               interrupted.signal,
             )
-            interrupted.signal.throwIfAborted()
-            process.off('SIGINT', interrupt)
-            process.off('SIGTERM', interrupt)
+            aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),

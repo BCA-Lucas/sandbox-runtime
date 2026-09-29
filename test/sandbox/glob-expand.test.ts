@@ -1411,26 +1411,47 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     })
   }
 
-  it('keeps to the configuration a wrap started with when that is replaced in a turn', async () => {
+  it('wraps by one configuration when that is replaced in a turn', async () => {
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-replaced-')))
-    for (let i = 0; i < 6; i++)
+    for (let i = 0; i < 6; i++) {
       mkdirSync(join(root, 'tree', `d${i}`), { recursive: true })
-    for (const name of ['first', 'second']) writeFileSync(join(root, name), '')
-    const configDenying = (name: string) => ({
-      network: { allowedDomains: [], deniedDomains: [] },
+    }
+    mkdirSync(join(root, '.git'))
+    for (const name of ['first', 'second', '.git/config']) {
+      writeFileSync(join(root, name), '')
+    }
+    // They differ in what the wrap reads before its first turn and after its
+    // last: put together, the first's write list and the second's
+    // allowGitConfig would leave .git/config writable, which neither does.
+    const network = { allowedDomains: [], deniedDomains: [] }
+    const allowRead = [join(root, 'tree', '**/*.pem')]
+    const first = {
+      network,
       filesystem: {
-        denyRead: [join(root, name)],
-        allowRead: [join(root, 'tree', '**/*.pem')],
-        allowWrite: [],
+        denyRead: [join(root, 'first')],
+        allowRead,
+        allowWrite: [root],
         denyWrite: [],
       },
-    })
+    }
+    const second = {
+      network,
+      filesystem: {
+        denyRead: [join(root, 'second')],
+        allowRead,
+        allowWrite: [],
+        denyWrite: [],
+        allowGitConfig: true,
+      },
+    }
 
+    const cwd = process.cwd()
+    process.chdir(root)
     await SandboxManager.reset()
-    await SandboxManager.initialize(configDenying('first'))
+    await SandboxManager.initialize(first)
 
     // Each listing takes longer than a turn; the configuration is replaced
     // while the allowRead pattern, the first to be walked, is under way.
@@ -1440,19 +1461,23 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       ...args: Parameters<typeof fs.readdirSync>
     ) => {
       if (String(args[0]).startsWith(root)) {
-        if (++listed === 2) SandboxManager.updateConfig(configDenying('second'))
+        if (++listed === 2) SandboxManager.updateConfig(second)
         const until = performance.now() + 15
         while (performance.now() < until);
       }
       return readdirSync(...args)
     }) as typeof fs.readdirSync)
     try {
-      const command = await SandboxManager.wrapWithSandbox('true')
+      const disturbed = await SandboxManager.wrapWithSandbox('true')
+      readdirSpy.mockRestore()
+
       expect(listed).toBeGreaterThan(2)
-      expect(command).toContain(join(root, 'first'))
-      expect(command).not.toContain(join(root, 'second'))
+      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(disturbed).toContain(join(root, 'second'))
+      expect(disturbed).not.toContain(join(root, 'first'))
     } finally {
       readdirSpy.mockRestore()
+      process.chdir(cwd)
       await SandboxManager.reset()
       rmSync(root, { recursive: true, force: true })
     }

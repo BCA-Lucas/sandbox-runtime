@@ -309,53 +309,61 @@ describe('CLI', () => {
   })
 
   describe.if(isLinux)('an interrupt before the command has started', () => {
-    test('stops the wrap, and the command is not run', async () => {
-      // Enough directories for the walk of the pattern to outlast the signal.
-      const root = mkdtempSync(join(tmpdir(), 'cli-interrupt-'))
-      try {
-        for (let i = 0; i < 200; i++) {
-          for (let j = 0; j < 100; j++) {
-            mkdirSync(join(root, 'tree', `d${i}`, `e${j}`), { recursive: true })
+    for (const [when, lastLine] of [
+      // The library's handlers are in place, and there is more to wait for.
+      ['the sandbox is being initialized', 'Starting HTTP bridge'],
+      // The last thing the CLI says before it wraps the command.
+      ['the command is being wrapped', 'Original command'],
+    ] as const) {
+      test(`stops the run while ${when}, and the command is not run`, async () => {
+        // Enough directories for the walk of the pattern to outlast the signal.
+        const root = mkdtempSync(join(tmpdir(), 'cli-interrupt-'))
+        try {
+          for (let i = 0; i < 200; i++) {
+            for (let j = 0; j < 100; j++) {
+              mkdirSync(join(root, 'tree', `d${i}`, `e${j}`), {
+                recursive: true,
+              })
+            }
           }
-        }
-        const settings = join(root, 'settings.json')
-        writeFileSync(
-          settings,
-          JSON.stringify({
-            network: { allowedDomains: [], deniedDomains: [] },
-            filesystem: {
-              denyRead: [join(root, 'tree', '**/*.pem')],
-              allowWrite: [],
-              denyWrite: [],
-            },
-          }),
-        )
-        const child = spawn(
-          'bun',
-          ['run', getCliPath(), '-s', settings, 'echo', 'RAN'],
-          { env: { ...process.env, SRT_DEBUG: 'true' } },
-        )
-        let stdout = ''
-        let stderr = ''
-        let signalled = false
-        child.stdout.on('data', (chunk: Buffer) => (stdout += String(chunk)))
-        child.stderr.on('data', (chunk: Buffer) => {
-          stderr += String(chunk)
-          // The last thing the CLI says before it wraps the command.
-          if (!signalled && stderr.includes('Original command')) {
-            signalled = true
-            child.kill('SIGINT')
-          }
-        })
-        const status = await new Promise(resolve => child.on('exit', resolve))
+          const settings = join(root, 'settings.json')
+          writeFileSync(
+            settings,
+            JSON.stringify({
+              network: { allowedDomains: [], deniedDomains: [] },
+              filesystem: {
+                denyRead: [join(root, 'tree', '**/*.pem')],
+                allowWrite: [],
+                denyWrite: [],
+              },
+            }),
+          )
+          const child = spawn(
+            'bun',
+            ['run', getCliPath(), '-s', settings, 'echo', 'RAN'],
+            { env: { ...process.env, SRT_DEBUG: 'true' } },
+          )
+          let stdout = ''
+          let stderr = ''
+          let signalled = false
+          child.stdout.on('data', (chunk: Buffer) => (stdout += String(chunk)))
+          child.stderr.on('data', (chunk: Buffer) => {
+            stderr += String(chunk)
+            if (!signalled && stderr.includes(lastLine)) {
+              signalled = true
+              child.kill('SIGINT')
+            }
+          })
+          const status = await new Promise(resolve => child.on('exit', resolve))
 
-        expect(signalled).toBe(true)
-        expect(stderr).toContain('interrupted by SIGINT')
-        expect(stdout).not.toContain('RAN')
-        expect(status).toBe(1)
-      } finally {
-        rmSync(root, { recursive: true, force: true })
-      }
-    }, 60_000)
+          expect(signalled).toBe(true)
+          expect(stderr).toContain('interrupted by SIGINT')
+          expect(stdout).not.toContain('RAN')
+          expect(status).toBe(1)
+        } finally {
+          rmSync(root, { recursive: true, force: true })
+        }
+      }, 60_000)
+    }
   })
 })

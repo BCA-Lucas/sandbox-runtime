@@ -1248,9 +1248,7 @@ export function checkLinuxDependencies(
  * The oldest bubblewrap on which everything this library does holds. Mount
  * plans start on 0.4.0 and later, but before 0.5.0 `ensure_file()` takes
  * only a regular file as a file bind's mount point, so a mask on a fifo,
- * socket or device node blocks or fails; and it creates one mode 0666 rather
- * than 0444, so isStaleBwrapMountPoint leaves what an interrupted sandbox
- * left behind on the host.
+ * socket or device node blocks or fails.
  */
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
@@ -1313,9 +1311,7 @@ function outdatedBwrapWarning(bwrap: string | null): string | null {
     `bubblewrap ${version} at ${bwrap} is older than ` +
     `${OLDEST_FULLY_SUPPORTED_BWRAP_VERSION}: a denyRead entry or credential ` +
     `mask naming a path that is not a regular file (a fifo, socket or device ` +
-    `node) cannot be applied on it, and a mount point an interrupted sandbox ` +
-    `left behind is not recognised as one and stays on the host. Everything ` +
-    `else is unaffected`
+    `node) cannot be applied on it. Everything else is unaffected`
   )
 }
 

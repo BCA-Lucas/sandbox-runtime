@@ -1137,6 +1137,10 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
+/** Successful listings, by real directory: a second position, or a second
+ *  pattern, reads the same entries. */
+export type GlobWalkListings = Map<string, fs.Dirent[]>
+
 /** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
 export interface GlobWalk {
   /** Where the walk started, with symlinks resolved (the spelling itself
@@ -1488,6 +1492,9 @@ export function walkGlobPattern(
   opts: ExpandGlobOptions & {
     withDirectoryForm?: boolean
     followSymlinkedDirectories?: boolean
+    /** Handed to every walk of one configuration, so that patterns with a
+     *  base in common list each directory once between them. */
+    listings?: GlobWalkListings
   } = {},
 ): GlobWalk {
   const walk: GlobWalk = {
@@ -1550,9 +1557,7 @@ export function walkGlobPattern(
   }
   /** The positions each real directory has been listed for. */
   const listedFor = new Map<string, Set<number>>()
-  /** Successful listings, by real directory: a second position reads the
-   *  same entries. */
-  const listings = new Map<string, fs.Dirent[]>()
+  const listings: GlobWalkListings = opts.listings ?? new Map()
   const pending: Frame[] = []
   /** A filesystem call on a real path, and on a shorter name for it when that
    *  fails. The real path crosses no link, so a long chain of them cannot
@@ -1636,6 +1641,17 @@ export function walkGlobPattern(
       continue
     }
     for (const entry of entries) {
+      // Nearly every entry of a large tree: a plain file the pattern does not
+      // match, which nothing below records. A pattern that splits is matched
+      // by name, so no path need be spelled to find that out.
+      if (
+        positions.splits &&
+        !entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        !positions.matches(fresh, entry.name, '')
+      ) {
+        continue
+      }
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
       const candidate = toForwardSlashes(fullPath)

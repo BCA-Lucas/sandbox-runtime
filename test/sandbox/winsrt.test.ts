@@ -54,6 +54,8 @@ import {
   wrapCommandWithSandboxWindows,
   stampWindowsAcl,
   restoreWindowsAcl,
+  grantWindowsAcl,
+  revokeWindowsAcl,
   parseWindowsBinShell,
   resolveSrtWin,
   buildGitConfigEnv,
@@ -157,6 +159,26 @@ async function runSandboxed(
 }
 
 type RunResult = { stdout: string; stderr: string; status: number | null }
+
+/** The paths whose DACL srt-win says it wrote while `f` ran, in order. */
+async function daclWrites(f: () => Promise<unknown>): Promise<string[]> {
+  const debug = process.env.SRT_DEBUG
+  process.env.SRT_DEBUG = '1'
+  const spy = spyOn(console, 'error').mockImplementation(() => {})
+  try {
+    await f()
+    return [
+      ...spy.mock.calls
+        .flat()
+        .join('\n')
+        .matchAll(/DACL written: '([^']+)'/g),
+    ].map(m => m[1])
+  } finally {
+    spy.mockRestore()
+    if (debug === undefined) delete process.env.SRT_DEBUG
+    else process.env.SRT_DEBUG = debug
+  }
+}
 
 /**
  * Run a sandboxed command up to `attempts` times until `ok` holds.
@@ -350,6 +372,36 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(
       wrapCommandWithSandboxWindows({ command: 'x', srtWin }).argv,
     ).not.toContain('--session-holder-pid')
+  })
+
+  it('one invocation at each end: grant takes the denies, revoke --with-denies', () => {
+    const spy = spyOn(child_process, 'spawnSync').mockImplementation((() => ({
+      status: 0,
+      stdout: '[]',
+      stderr: '',
+      error: null,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    })) as any)
+    try {
+      const to = {
+        sandboxUserSid: 'S-1-5-21-1',
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      }
+      grantWindowsAcl({ ...to, read: [], write: ['w'], denyWrite: ['d'] })
+      revokeWindowsAcl({ ...to, withDenies: true })
+      revokeWindowsAcl(to)
+      const [grant, both, revoke] = spy.mock.calls
+      expect(JSON.parse((grant[2] as { input: string }).input)).toEqual({
+        read: [],
+        write: ['w'],
+        denyRead: [],
+        denyWrite: ['d'],
+      })
+      expect(both[1]).toContain('--with-denies')
+      expect(revoke[1]).not.toContain('--with-denies')
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
@@ -1312,8 +1364,14 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
-    await SandboxManager.initialize(createTestConfig())
-    console.error('[winsrt beforeAll] done')
+    const t = Date.now()
+    const written = await daclWrites(() =>
+      SandboxManager.initialize(createTestConfig()),
+    )
+    console.error(
+      `[winsrt beforeAll] done: initialize() ${Date.now() - t} ms with no ` +
+        `grant in ${process.cwd()}, DACLs written: ${JSON.stringify(written)}`,
+    )
     // Install and uninstall each run an elevated srt-win that can outlast
     // bun's 5s default hook timeout; a hook that times out is killed
     // mid-run and fails the suite.
@@ -1956,7 +2014,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M1-M12: the mandatory write denies ──
+    // ── M1-M16: the mandatory write denies ──
     // Resolved at each wrap from the working directory, so each row
     // chdirs into its own tree first. Which paths are picked is in
     // test/sandbox/windows-per-exec-deny.test.ts; these rows are what
@@ -2019,8 +2077,9 @@ describe.if(isWindows)(
         .map(([what, ms]) => `${what} ${ms} ms`)
         .join(', ')
 
-    // 16,000 files, and 4,000 loose objects in `.git`. Shared by M6 and
-    // M8, which removes it: making it is most of either row's time.
+    // 16,000 files, and 4,000 loose objects in `.git`; no mandatory name
+    // yet. Shared by M6 and M8, which removes it: making it is most of
+    // either row's time.
     let big: string | undefined
     function bigTree(): string {
       if (big !== undefined) return big
@@ -2035,8 +2094,6 @@ describe.if(isWindows)(
       }
       fill(dir, 160)
       fill(join(dir, '.git', 'objects'), 40)
-      mkdirSync(join(dir, '.git', 'hooks'))
-      writeFileSync(join(dir, '.git', 'config'), 'x')
       return (big = dir)
     }
 
@@ -2232,22 +2289,34 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    it('M6: 20,000 files: initialize(), the first command and reset() under 30 s, later commands under 2 s', async () => {
+    it('M6: 20,000 files: initialize() and reset() within 1.3 times a session that only grants, later commands under 2 s', async () => {
       const dir = bigTree()
-      mkdirSync(join(dir, '.vscode'))
-      writeFileSync(join(dir, '.gitconfig'), 'x')
+      // allowWrite: a command cannot start in a directory it has no rights on.
+      const config = createFsTestConfig({ allowWrite: [dir] })
       const saved = process.cwd()
       process.chdir(dir)
       try {
+        // The baseline, in the same run on the same tree.
+        const base: Took = {}
+        try {
+          await timeInto(base, 'initialize()', () =>
+            SandboxManager.initialize(config),
+          )
+        } finally {
+          await timeInto(base, 'reset()', () => SandboxManager.reset())
+        }
+        mkdirSync(join(dir, '.git', 'hooks'))
+        writeFileSync(join(dir, '.git', 'config'), 'x')
+        mkdirSync(join(dir, '.vscode'))
+        writeFileSync(join(dir, '.gitconfig'), 'x')
         const took: Took = {}
         const ran: RunResult[] = []
+        let written: string[] = []
         let error: unknown
         try {
-          // allowWrite: a command cannot start in a directory it has no
-          // rights on.
-          await timeInto(took, 'initialize()', () =>
-            SandboxManager.initialize(
-              createFsTestConfig({ allowWrite: [dir] }),
+          written = await daclWrites(() =>
+            timeInto(took, 'initialize()', () =>
+              SandboxManager.initialize(config),
             ),
           )
           for (const nth of ['first', 'second', 'third']) {
@@ -2260,8 +2329,17 @@ describe.if(isWindows)(
         } catch (e) {
           error = e
         }
-        await timeInto(took, 'reset()', () => SandboxManager.reset())
-        console.log(`M6: ${inWords(took)}`)
+        const released = await daclWrites(() =>
+          timeInto(took, 'reset()', () => SandboxManager.reset()),
+        )
+        // `.` is the working directory.
+        const [added, removed] = [written, released].map(paths =>
+          paths.map(p => p.replace(/^.*srt-mandbig-[^\\]+/, '.')).join(', '),
+        )
+        const line =
+          `grants only: ${inWords(base)}; with the denies: ${inWords(took)}; ` +
+          `DACLs written by its initialize(): ${added}; by its reset(): ${removed}`
+        console.log(`M6: ${line}`)
         if (error !== undefined) throw error
         const bad = ran.find(
           r => r.status !== 0 || !r.stdout.includes('M6-RAN'),
@@ -2273,13 +2351,26 @@ describe.if(isWindows)(
               `stderr=${JSON.stringify(bad.stderr)}`,
           )
         }
-        const over = Object.keys(took).filter(
-          what => took[what] >= (/second|third/.test(what) ? 2_000 : 30_000),
-        )
+        if (added !== '.\\.git, .' || removed !== '., .\\.git') {
+          throw new Error(
+            `M6: ${line}: wanted each directory once, the grant root last ` +
+              `when adding and first when releasing`,
+          )
+        }
+        // 500 ms: so that noise on a fast leg does not fail the ratio.
+        const limit = (what: string) =>
+          /second|third/.test(what)
+            ? 2_000
+            : what in base
+              ? 1.3 * base[what] + 500
+              : 30_000
+        const over = Object.keys(took).filter(what => took[what] >= limit(what))
         if (over.length > 0) {
           throw new Error(
-            `M6: ${inWords(took)}: over its limit (2000 ms for the second ` +
-              `and third command, 30000 ms for the rest): ${over.join(', ')}`,
+            `M6: ${line}: over its limit (1.3 times the grants-only session's ` +
+              `plus 500 ms for initialize() and reset(), 2000 ms for the ` +
+              `second and third command, 30000 ms for the first): ` +
+              over.join(', '),
           )
         }
       } finally {
@@ -2457,6 +2548,59 @@ describe.if(isWindows)(
         rmSync(dir, { recursive: true, force: true })
       }
     }, 90_000)
+
+    // M4's attack on the directories above a nested target.
+    for (const [row, victim, fullControl] of [
+      ['M13', join('a', 'b'), false],
+      ['M14', 'a', false],
+      ['M15', join('a', 'b'), true],
+      ['M16', 'a', true],
+    ] as const) {
+      it(`${row}: renaming ${victim} aside and putting a copy in place does not get a hook written${fullControl ? ', with Users: Full control on the root' : ''}`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'srt-nest-'))
+        const hooks = join(dir, 'a', 'b', '.git', 'hooks')
+        const hook = join(hooks, 'pre-commit')
+        const app = join(dir, 'app.txt')
+        const at = join(dir, victim)
+        try {
+          mkdirSync(hooks, { recursive: true })
+          writeFileSync(hook, 'HOOK-V1')
+          writeFileSync(app, 'APP-V1')
+          if (fullControl) {
+            spawnSync('icacls', [dir, '/grant', '*S-1-5-32-545:(OI)(CI)(F)'], {
+              timeout: 10_000,
+            })
+          }
+          const r = await rexecIn(
+            dir,
+            `ren "${at}" aside & ` +
+              `robocopy "${join(at, '..', 'aside')}" "${at}" ` +
+              `/E /R:0 /W:0 /NFL /NDL /NJH /NJS & ` +
+              `echo POISON>"${hook}" & echo OK>"${app}"`,
+            { allowWrite: [dir], denyWrite: [hooks] },
+          )
+          const got = {
+            hook: existsSync(hook) ? readFileSync(hook, 'utf8') : null,
+            renamedAside: existsSync(join(at, '..', 'aside')),
+            app: readFileSync(app, 'utf8'),
+          }
+          if (
+            got.hook !== 'HOOK-V1' ||
+            got.renamedAside ||
+            !got.app.startsWith('OK')
+          ) {
+            throw new Error(
+              `${row}: wanted the hook kept, ${victim} in place and app.txt ` +
+                `written — ${JSON.stringify(got)} exit=${r.status} ` +
+                `stdout=${JSON.stringify(r.stdout)} ` +
+                `stderr=${JSON.stringify(r.stderr)}`,
+            )
+          }
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      }, 90_000)
+    }
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

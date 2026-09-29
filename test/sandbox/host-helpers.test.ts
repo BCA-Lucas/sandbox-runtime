@@ -36,6 +36,7 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { whichSync } from '../../src/utils/which.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { bwrapOf } from '../helpers/bwrap-argv.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
@@ -375,8 +376,6 @@ describe('programs run on the host are found outside the allowed write paths', (
       process.chdir(project)
     })
 
-    const firstWord = (wrapped: string): string => wrapped.split(' ')[0]!
-
     it('names the real bubblewrap by its absolute path and scans with the real ripgrep', async () => {
       process.env.PATH = `${projectBin}:${savedPath}`
 
@@ -387,8 +386,8 @@ describe('programs run on the host are found outside the allowed write paths', (
         writeConfig: { allowOnly: [project], denyWithinAllow: [] },
       })
 
-      expect(firstWord(wrapped)).toBe(realBwrap)
-      expect(isAbsolute(firstWord(wrapped))).toBe(true)
+      expect(bwrapOf(wrapped)).toBe(realBwrap)
+      expect(isAbsolute(bwrapOf(wrapped) ?? '')).toBe(true)
       expect(wrapped).not.toContain(projectBin)
       // Only the scan finds the nested file: the real ripgrep ran.
       expect(wrapped).toContain(join(project, 'nested', '.bashrc'))
@@ -420,7 +419,7 @@ describe('programs run on the host are found outside the allowed write paths', (
 
       expect(wrapped).toContain(`--bind ${project} ${project}`)
       expect(wrapped).not.toContain(`--bind ${dist}`)
-      expect(firstWord(wrapped)).toBe(realBwrap)
+      expect(bwrapOf(wrapped)).toBe(realBwrap)
       expect(existsSync(marker)).toBe(false)
     })
 
@@ -442,7 +441,7 @@ describe('programs run on the host are found outside the allowed write paths', (
           writeConfig: { allowOnly: [project], denyWithinAllow: [] },
           ...options,
         })
-        expect(firstWord(wrapped)).toBe(realBwrap)
+        expect(bwrapOf(wrapped)).toBe(realBwrap)
         expect(existsSync(marker)).toBe(false)
       }
     })
@@ -539,7 +538,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         ripgrepConfig: { command: realRg },
       })
 
-      expect(firstWord(wrapped)).toBe(join(projectBin, 'bwrap'))
+      expect(bwrapOf(wrapped)).toBe(join(projectBin, 'bwrap'))
       expect(wrapped).toContain(`${join(projectBin, 'socat')} TCP-LISTEN:3128`)
       expect(existsSync(marker)).toBe(false)
     })
@@ -555,7 +554,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
       })
 
-      expect(firstWord(wrapped)).toBe(join(safe, 'bwrap'))
+      expect(bwrapOf(wrapped)).toBe(join(safe, 'bwrap'))
     })
   })
 

@@ -28,7 +28,8 @@ function repo(dir: string, withConfig = true) {
 }
 
 beforeEach(() => {
-  root = realpathSync(mkdtempSync(join(tmpdir(), 'win-deny-')))
+  // `.native` also expands an 8.3 name, as the code under test does.
+  root = realpathSync.native(mkdtempSync(join(tmpdir(), 'win-deny-')))
 })
 afterEach(() => {
   rmSync(root, { recursive: true, force: true })

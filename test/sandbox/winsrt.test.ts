@@ -2953,7 +2953,7 @@ describe.if(isWindows)(
     /** Who owns each of `paths`, as `DOMAIN\\name`. */
     const owners = (paths: string[]) =>
       spawnSync(
-        'powershell',
+        'pwsh',
         [
           '-NoProfile',
           '-Command',

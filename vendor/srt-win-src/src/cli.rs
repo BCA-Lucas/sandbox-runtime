@@ -423,6 +423,7 @@ struct AceTargets {
 /// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
+/// [`SbAce::DenyPin`]: srt_win::acl::SbAce::DenyPin
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
@@ -539,10 +540,26 @@ fn canonicalize_ace_targets(
             }
         }
     }
+    keep_read_denies(&mut targets);
     Ok(AceTargets {
         targets,
         bad_inputs,
     })
+}
+
+/// Drop each `WriteDeny` whose path `targets` also read-denies.
+/// `ensure_ace` records the LAST mask a holder asks of a path, and one
+/// path can arrive twice: a sandboxed command can plant a junction
+/// under a mandatory write-deny name that resolves to a read-denied
+/// directory, which would otherwise end up readable.
+fn keep_read_denies(targets: &mut Vec<(String, srt_win::acl::SbAce)>) {
+    use srt_win::acl::{DenyMask, SbAce};
+    let read: Vec<String> = targets
+        .iter()
+        .filter(|(_, a)| *a == SbAce::Deny(DenyMask::ReadDeny))
+        .map(|(c, _)| c.clone())
+        .collect();
+    targets.retain(|(c, a)| *a != SbAce::Deny(DenyMask::WriteDeny) || !read.contains(c));
 }
 
 /// Build the `user status` JSON object (sandbox-user provisioning
@@ -1442,16 +1459,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // direct connect). Standalone `srt-win exec` callers
             // should run `srt-win wfp verify` once per session.
 
-            // Per-exec file deny — `--deny-read`/`--deny-write`. The
-            // session-level stamp (under `--holder-pid`) is applied
-            // once at the host's `initialize()`; these flags add
-            // PER-EXEC paths via the same additive DENY-ACE path as
-            // session `acl stamp`, under THIS exec process's own
-            // PID as a DISTINCT holder. Release downgrades the mask
-            // from the remaining holders' MAX(want_mask). Any stamp
-            // error (glob, canon-fail, apply-fail) FAILS the exec
-            // rather than running the child with an incomplete deny
-            // set.
+            // Per-exec file deny — `--deny-read`/`--deny-write`: the
+            // host's whole deny set, recomputed for each command, via
+            // the same additive DENY-ACE path as `acl stamp`, under
+            // THIS exec process's own PID as a DISTINCT holder.
+            // Release downgrades the mask from the remaining holders'
+            // MAX(want_mask). Any stamp error (glob, canon-fail,
+            // apply-fail) FAILS the exec rather than running the
+            // child with an incomplete deny set.
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
                 None
             } else {
@@ -1819,5 +1834,28 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    #[test]
+    fn a_path_denied_both_ways_keeps_its_read_deny() {
+        use srt_win::acl::{DenyMask, SbAce};
+        let read = SbAce::Deny(DenyMask::ReadDeny);
+        let write = SbAce::Deny(DenyMask::WriteDeny);
+        let at = |p: &str, a| (p.to_string(), a);
+        let mut targets = vec![
+            at(r"\\?\C:\w\secrets", read),
+            at(r"\\?\C:\w\.bashrc", write),
+            at(r"\\?\C:\w\secrets", write),
+            at(r"\\?\C:\w\secrets", SbAce::DenyPin),
+        ];
+        keep_read_denies(&mut targets);
+        assert_eq!(
+            targets,
+            [
+                at(r"\\?\C:\w\secrets", read),
+                at(r"\\?\C:\w\.bashrc", write),
+                at(r"\\?\C:\w\secrets", SbAce::DenyPin),
+            ]
+        );
     }
 }

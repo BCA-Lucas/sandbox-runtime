@@ -836,7 +836,7 @@ async function initialize(
         )
       }
     }
-    // Filesystem grants/denies — additive sandbox-user ACEs.
+    // Filesystem grants — additive sandbox-user ACEs.
     try {
       const acc = computeWindowsFsAccessSet(runtimeConfig)
       // The trust bundle the CA-trust env vars point at
@@ -1379,6 +1379,11 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  * credential files, and the mandatory set under `cwd`. Applied via
  * `srt-win exec --deny-*` under the exec's PID, so a `.git` the host
  * creates or rewrites between commands is covered by the next one.
+ *
+ * A grant of the same path or of one above it does not lift a deny:
+ * srt-win writes a path's deny ahead of its allow. A grant BENEATH a
+ * denied directory does lift it there: the explicit allow is read
+ * before the inherited deny.
  */
 export function computeWindowsPerExecDenySet(
   c: SandboxRuntimeConfig | undefined,

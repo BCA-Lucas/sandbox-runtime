@@ -1668,8 +1668,8 @@ export function uninstallWindowsSandbox(
  * Resolve any Windows filesystem-config path list — `allowRead`/
  * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
  * concrete paths via the single platform-aware
- * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
- * point-in-time expansion at session initialize, not per-exec).
+ * {@link normalizePathForSandbox} chokepoint (point-in-time: grants
+ * at session initialize, denies at each wrap).
  * Glob patterns are expanded; non-glob paths are normalized and
  * returned 1:1. Directory targets are accepted — the additive
  * sandbox-user ACE carries `(OI)(CI)` so it covers the subtree.
@@ -1728,73 +1728,36 @@ export function expandWindowsFsPaths(
 }
 
 /**
- * The mandatory write denies that follow from the working directory alone: the
- * dangerous files and directories resolved against it, plus `.git/hooks` and
- * (unless the caller allows git config) `.git/config`, from the definitions
- * the Linux and macOS backends read.
+ * The mandatory write denies for a command run in `cwd`: the dangerous files
+ * and directories, `.git\hooks` and (unless `allowGitConfig`) `.git\config`,
+ * from the definitions the Linux and macOS backends read. `cwd`'s own are
+ * taken whatever the depth, as on Linux; below it a path counts when it is at
+ * most `maxDepth` components down, like `rg --max-depth`.
  *
- * Only paths that ARE THERE are returned. `srt-win acl stamp` answers a
- * missing deny target by materializing a placeholder to carry the ACE, and a
- * placeholder is permanent: right for a `filesystem.denyWrite` entry someone
- * asked for, but here it would leave an empty `.mcp.json` or `.vscode\` in
- * every working directory ever sandboxed. So a name that appears later in the
- * session is NOT covered. Where `.git` is a pointer file (a linked worktree
- * or a submodule checkout) nothing exists beneath it, so no git deny results.
- *
- * Nested repositories are not searched for: a Windows deny is one ACE per
- * path with no pattern form.
- */
-export function windowsGetCwdMandatoryDenyPaths(
-  allowGitConfig = false,
-): string[] {
-  const cwd = process.cwd()
-  const names = [
-    ...DANGEROUS_FILES,
-    ...getDangerousDirectories(),
-    '.git/hooks',
-    ...(allowGitConfig ? [] : ['.git/config']),
-  ]
-  return names.map(name => path.resolve(cwd, name)).filter(isThere)
-}
-
-/**
- * Whether `p` names something to stamp. Only absence drops the path: any
- * other error means something is there that could not be looked at, which is
- * no reason to leave it writable. srt-win reports it if it is a bad input.
- */
-function isThere(p: string): boolean {
-  try {
-    fs.statSync(p)
-    return true
-  } catch (err) {
-    return !isAbsenceErrno(err)
-  }
-}
-
-/**
- * Mandatory write-deny paths under `cwd` (dangerous files/dirs,
- * `.git\\hooks`, `.git\\config` unless `allowGitConfig`). Existing
- * paths only; `maxDepth` counts a path's components below `cwd`,
- * like `rg --max-depth`. Cheap enough to rerun per exec.
+ * Only paths that ARE THERE are returned: srt-win answers a missing deny
+ * target with a permanent placeholder, which would leave an empty `.mcp.json`
+ * or `.vscode\` in every directory ever sandboxed. Where `.git` is a pointer
+ * file (a linked worktree, a submodule) nothing exists beneath it, so no git
+ * deny results.
  */
 export function windowsGetMandatoryDenyPaths(
   cwd: string,
   opts: { maxDepth?: number; allowGitConfig?: boolean } = {},
 ): string[] {
+  cwd = path.resolve(cwd)
   const maxDepth = opts.maxDepth ?? 3
+  const gitLeaves = opts.allowGitConfig ? ['hooks'] : ['hooks', 'config']
   const files = new Set(DANGEROUS_FILES.map(normalizeCaseForComparison))
   const dirs = getDangerousDirectories().map(d =>
     normalizeCaseForComparison(d.split('/').join(path.sep)),
   )
-  const out: string[] = []
-  const gitDir = (dir: string) => {
-    for (const leaf of opts.allowGitConfig ? ['hooks'] : ['hooks', 'config']) {
-      const p = path.join(dir, leaf)
-      if (fs.statSync(p, { throwIfNoEntry: false })) out.push(p)
-    }
-  }
-  const depthOk = (p: string) =>
-    path.relative(cwd, p).split(path.sep).length <= maxDepth
+  const out = [
+    ...DANGEROUS_FILES,
+    ...getDangerousDirectories(),
+    ...gitLeaves.map(leaf => `.git/${leaf}`),
+  ]
+    .map(name => path.resolve(cwd, name))
+    .filter(isThere)
   const walk = (dir: string, depth: number) => {
     let entries: fs.Dirent[]
     try {
@@ -1811,22 +1774,36 @@ export function windowsGetMandatoryDenyPaths(
       }
       if (name === 'node_modules') continue
       if (name === '.git') {
-        if (depth < maxDepth) gitDir(full)
+        if (depth < maxDepth) {
+          out.push(...gitLeaves.map(l => path.join(full, l)).filter(isThere))
+        }
         continue
       }
       const rel = normalizeCaseForComparison(path.relative(cwd, full))
       if (dirs.some(d => rel === d || rel.endsWith(path.sep + d))) {
-        // rg only sees a dir through a file inside it (one level
-        // deeper); cwd-level dirs are added unconditionally on Linux.
-        if (depth === 1 || depth < maxDepth) out.push(full)
+        // rg only sees a dir through a file inside it (one level deeper).
+        if (depth < maxDepth) out.push(full)
         continue
       }
       if (depth < maxDepth) walk(full, depth + 1)
     }
   }
-  cwd = path.resolve(cwd)
   walk(cwd, 1)
-  return [...new Set(out)].filter(depthOk)
+  return [...new Set(out)]
+}
+
+/**
+ * Whether `p` names something to stamp. Only absence drops the path: any
+ * other error means something is there that could not be looked at, which is
+ * no reason to leave it writable. srt-win reports it if it is a bad input.
+ */
+function isThere(p: string): boolean {
+  try {
+    fs.statSync(p)
+    return true
+  } catch (err) {
+    return !isAbsenceErrno(err)
+  }
 }
 
 /**

@@ -17,6 +17,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1239,7 +1240,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     await SandboxManager.reset()
   })
 
-  it('initialize() with filesystem.denyRead applies the DENY ACE', async () => {
+  it('initialize() with filesystem.denyRead round-trips through reset()', async () => {
     // Re-provision so the not-provisioned gate doesn't fire first.
     installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
@@ -1253,9 +1254,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const cfg = createTestConfig()
       cfg.filesystem.denyRead = [f]
       await SandboxManager.initialize(cfg)
-      // The DENY-ACE mechanism is now wired (no longer throws); the
-      // actual deny enforcement is covered by H6. Here we just
-      // assert the lifecycle (initialize → reset) round-trips.
+      // The deny itself is applied per command and covered by H6.
       await SandboxManager.reset()
     } finally {
       rmSync(scratch, { recursive: true, force: true })
@@ -1852,8 +1851,8 @@ describe.if(isWindows)(
 
     // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
     // The G-rows in smoke-exec.ps1 exercise the srt-win primitives
-    // directly; these check the SandboxManager.initialize() →
-    // grant + stamp → reset() → revoke + restore plumbing.
+    // directly; these check the SandboxManager plumbing: initialize()
+    // grants, each wrapped command carries its denies, reset() revokes.
     let hScratch: string
     let hSecret: string
     let hSibling: string
@@ -1939,11 +1938,11 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M1-M6: the mandatory write denies ──
-    // Resolved from the working directory `initialize()` runs in, so
-    // each row chdirs into its own tree first. Which paths are picked
-    // is in test/sandbox/windows-mandatory-denies.test.ts; these rows
-    // are what the stamp costs a sandboxed write.
+    // ── M1-M7: the mandatory write denies ──
+    // Resolved at each wrap from the working directory, so each row
+    // chdirs into its own tree first. Which paths are picked is in
+    // test/sandbox/windows-per-exec-deny.test.ts; these rows are what
+    // the stamp costs a sandboxed write.
 
     /** A working directory carrying the mandatory names, all of them there. */
     function mandatoryTree(): string {
@@ -2126,7 +2125,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    it('M6: initialize() and reset() take under 30 s each in a 20,000-file working directory', async () => {
+    it('M6: initialize(), one command and reset() take under 30 s each in a 20,000-file working directory', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'srt-mandbig-'))
       const saved = process.cwd()
       try {
@@ -2139,21 +2138,42 @@ describe.if(isWindows)(
           }
         }
         process.chdir(dir)
-        // No allowWrite: the time is the two mandatory stamps' alone.
-        let initError: unknown
+        // allowWrite: a command cannot start in a directory it has no
+        // rights on. So initialize() and reset() time the grant, and the
+        // command the two mandatory stamps and their release.
+        let error: unknown
+        let echo: Awaited<ReturnType<typeof spawnAsync>> | undefined
         const t0 = Date.now()
+        let t1 = t0
         try {
-          await SandboxManager.initialize(createFsTestConfig({}))
+          await SandboxManager.initialize(
+            createFsTestConfig({ allowWrite: [dir] }),
+          )
+          t1 = Date.now()
+          const w = await SandboxManager.wrapWithSandboxArgv('echo M6-RAN')
+          echo = await spawnAsync(w.argv[0], w.argv.slice(1), {
+            env: w.env,
+            timeout: 120_000,
+          })
         } catch (e) {
-          initError = e
+          error = e
         }
-        const t1 = Date.now()
-        await SandboxManager.reset()
         const t2 = Date.now()
-        const took = `initialize() ${t1 - t0} ms, reset() ${t2 - t1} ms`
+        await SandboxManager.reset()
+        const t3 = Date.now()
+        const took =
+          `initialize() ${t1 - t0} ms, one command ${t2 - t1} ms, ` +
+          `reset() ${t3 - t2} ms`
         console.log(`M6: ${took}`)
-        if (initError !== undefined) throw initError
-        if (t1 - t0 >= 30_000 || t2 - t1 >= 30_000) {
+        if (error !== undefined) throw error
+        if (echo?.status !== 0 || !echo.stdout.includes('M6-RAN')) {
+          throw new Error(
+            `M6: the timed command did not run — exit=${echo?.status} ` +
+              `stdout=${JSON.stringify(echo?.stdout)} ` +
+              `stderr=${JSON.stringify(echo?.stderr)}`,
+          )
+        }
+        if (Math.max(t1 - t0, t2 - t1, t3 - t2) >= 30_000) {
           throw new Error(`M6: ${took}, over the 30000 ms allowed each`)
         }
       } finally {
@@ -2161,6 +2181,33 @@ describe.if(isWindows)(
         rmSync(dir, { recursive: true, force: true })
       }
     }, 600_000)
+
+    it('M7: a junction under a mandatory name does not lift the read deny on its target', async () => {
+      const dir = mandatoryTree()
+      const secrets = join(dir, 'secrets')
+      const key = join(secrets, 'key.txt')
+      try {
+        mkdirSync(secrets)
+        writeFileSync(key, 'SECRET-V1')
+        // What an earlier sandboxed command can leave behind.
+        symlinkSync(secrets, join(dir, '.vscode'), 'junction')
+        // app.txt shows that the command ran at all.
+        const r = await rexecIn(
+          dir,
+          `type "${key}" & type "${join(dir, 'app.txt')}"`,
+          { allowWrite: [dir], denyRead: [secrets] },
+        )
+        if (r.stdout.includes('SECRET-V1') || !r.stdout.includes('APP-V1')) {
+          throw new Error(
+            `M7: wanted APP-V1 and no SECRET-V1 — exit=${r.status} ` +
+              `stdout=${JSON.stringify(r.stdout)} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

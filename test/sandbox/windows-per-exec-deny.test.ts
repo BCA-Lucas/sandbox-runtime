@@ -6,10 +6,18 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import {
+  DANGEROUS_FILES,
+  getDangerousDirectories,
+} from '../../src/sandbox/sandbox-utils.js'
 import { windowsGetMandatoryDenyPaths } from '../../src/sandbox/windows-sandbox-utils.js'
 import { computeWindowsPerExecDenySet } from '../../src/sandbox/sandbox-manager.js'
+
+// Which paths a Windows command is denied: plain path computations, so these
+// run on every platform. What a deny costs a sandboxed write is M1-M7 of
+// test/sandbox/winsrt.test.ts.
 
 let root: string
 
@@ -52,6 +60,26 @@ describe('windowsGetMandatoryDenyPaths', () => {
     expect(got.has(join(root, '.claude'))).toBe(false)
   })
 
+  it('takes every name of the shared definitions that is there, and nothing else', () => {
+    const names = [
+      ...DANGEROUS_FILES.filter(n => n !== '.profile'),
+      ...getDangerousDirectories().filter(n => n !== '.idea'),
+      '.git/hooks',
+      '.git/config',
+    ]
+    repo(root)
+    for (const n of DANGEROUS_FILES) {
+      if (names.includes(n)) writeFileSync(join(root, n), '')
+    }
+    for (const n of getDangerousDirectories()) {
+      if (names.includes(n)) mkdirSync(join(root, n), { recursive: true })
+    }
+    writeFileSync(join(root, 'app.js'), '')
+    expect(windowsGetMandatoryDenyPaths(root).sort()).toEqual(
+      names.map(n => resolve(root, n)).sort(),
+    )
+  })
+
   it('returns only existing paths', () => {
     mkdirSync(join(root, '.git'))
     expect(windowsGetMandatoryDenyPaths(root)).toEqual([])
@@ -74,6 +102,23 @@ describe('windowsGetMandatoryDenyPaths', () => {
       ]),
     )
     expect(d2.some(p => p.startsWith(join(root, 'a')))).toBe(false)
+  })
+
+  it("takes the working directory's own names whatever the depth", () => {
+    repo(root)
+    mkdirSync(join(root, '.claude', 'agents'), { recursive: true })
+    repo(join(root, 'a'))
+    expect(windowsGetMandatoryDenyPaths(root, { maxDepth: 1 }).sort()).toEqual([
+      join(root, '.claude', 'agents'),
+      join(root, '.git', 'config'),
+      join(root, '.git', 'hooks'),
+    ])
+  })
+
+  it('a `.git` pointer file yields no git denies and does not throw', () => {
+    writeFileSync(join(root, '.git'), 'gitdir: elsewhere\n')
+    writeFileSync(join(root, '.bashrc'), '')
+    expect(windowsGetMandatoryDenyPaths(root)).toEqual([join(root, '.bashrc')])
   })
 
   it('allowGitConfig leaves .git/config out', () => {

@@ -10,6 +10,7 @@ import {
 import { spawn, spawnSync } from 'node:child_process'
 import {
   mkdirSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -288,6 +289,61 @@ describe.if(isSupportedPlatform)(
           ).toBe(true)
         })
       }
+
+      for (const [file, line] of [
+        ['.gitignore', 'sub/'],
+        ['.ignore', '*'],
+      ] as const) {
+        it(`blocks them all the same when ${file} holds ${line}`, async () => {
+          writeFileSync(join(TEST_DIR, file), `${line}\n`)
+          try {
+            for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+              const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+              expect([name, result.success]).toEqual([name, false])
+              expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+            }
+          } finally {
+            rmSync(join(TEST_DIR, file))
+          }
+        })
+      }
+
+      it.if(isLinux)(
+        "blocks them all the same whatever ripgrep's configuration file says",
+        async () => {
+          const configuration = join(TEST_DIR, 'ripgrep-configuration')
+          writeFileSync(configuration, '--glob=!sub\n')
+          process.env.RIPGREP_CONFIG_PATH = configuration
+          try {
+            const result = await runSandboxedWrite(
+              'sub/.bashrc',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('sub/.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
+          } finally {
+            delete process.env.RIPGREP_CONFIG_PATH
+            rmSync(configuration)
+          }
+        },
+      )
+
+      it('blocks them all the same beside a directory that cannot be read', async () => {
+        const unreadable = join(TEST_DIR, 'unreadable')
+        mkdirSync(unreadable, { mode: 0o000 })
+        try {
+          for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+            const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+            expect([name, result.success]).toEqual([name, false])
+            expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+          }
+        } finally {
+          rmdirSync(unreadable)
+        }
+      })
 
       it.if(isLinux)(
         'takes no directory above the working directory for one of the names',

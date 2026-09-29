@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
+import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -366,6 +366,11 @@ async function linuxGetMandatoryDenyPaths(
       [
         '--files',
         '--hidden',
+        // INVARIANT: what is listed depends on the names alone. An ignore file
+        // that names a directory hides all beneath it, and a configuration
+        // file can add any flag; both are files in or above the tree.
+        '--no-ignore',
+        '--no-config',
         '--max-depth',
         String(maxDepth + 2),
         ...iglobArgs,
@@ -377,7 +382,13 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
+    // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 as
+    // soon as one directory cannot be read, and is killed after ten seconds,
+    // with all it had found by then on its output.
+    if (error instanceof RipgrepError) matches = error.listed
+    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`, {
+      level: 'warn',
+    })
   }
 
   // The names a match can lie under, by path component.
@@ -405,8 +416,8 @@ async function linuxGetMandatoryDenyPaths(
         }
       }
     }
-    // INVARIANT: every dangerous name of one directory is denied or none is.
-    // `at` is how deep that directory lies.
+    // The depth is that of the directory holding the name, `at`, so that the
+    // names the scan saw in one directory are treated alike.
     if (at > maxDepth - 1) continue
     const found = segments.slice(0, at + length)
     if (lower[at] === '.git' && lower[at + 1] === 'head')

@@ -1,5 +1,4 @@
 [test]
-# Directories of the run's own stand in for the ones the mount point manifests
-# are kept in, before any test file is loaded: see
-# test/helpers/private-manifest-directory.ts.
+# Gives the run directories of its own for the mount point manifests, before any
+# test file is loaded: see test/preload.ts.
 preload = ["./test/preload.ts"]

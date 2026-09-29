@@ -8,111 +8,124 @@
  * only when no running sandbox relies on it, and no process can decide that by
  * counting for itself.
  *
- * The kernel is asked instead. Each wrap writes a manifest naming its mount
- * points into a per-user directory and passes `--lock-file <manifest>` to
- * bwrap, whose sandbox init process holds a read lock on it for the sandbox's
- * lifetime; the kernel drops it however the sandbox ends. /proc/locks then
- * tells any process whether a sandbox that named a mount point is running, so
- * cleanup is a garbage collect any process may run at any time.
+ * The sandbox vouches for itself. Each wrap writes a manifest, `<id>.json`, into
+ * a per-user directory, naming its mount points and every mount point of
+ * another sandbox that its own mounts lie in or bind from. The command line
+ * it hands out is a shell that appends its own /proc/self/stat line to
+ * `<id>.started` and then execs bubblewrap: the process on record is bubblewrap,
+ * recorded before it has made a mount, and the wrap always passes
+ * --die-with-parent, so the sandbox dies with it. A manifest with a record is
+ * live exactly while a process with a recorded pid and start time exists, which
+ * any process can ask, so cleanup is a garbage collect any process may run at
+ * any time.
  *
- * Two processes of one user keep each other's mount points only when each reads
- * what the other writes, so where the manifests go is worked out from the user
- * id and the file system before the environment, which differs between a login
- * shell and what a service, an IDE or cron starts (see {@link
- * manifestDirectoryCandidates}). A process writes to the first of those
- * directories it can use and believes what it finds in the ones that come from
- * the user id, or, where it can use none of those, in the ones its environment
- * names (see {@link believedManifestDirectories}).
+ * bubblewrap binds the manifest before it makes a mount point, and a pass
+ * claims a finished manifest, renaming it to `<id>.claimed`, before it removes
+ * what that names. A command started after the claim fails having made nothing;
+ * one that got past it has its record on disk, which the pass reads after the
+ * claim. Whatever cannot be read or asked (a manifest, a record, /proc) counts
+ * as live: only "no such process" and a different start time end a sandbox.
  *
- * Every one of them is bound read-only into every sandbox that restricts
- * writes, and is made first if it is missing, and the directories above it
- * inside a write root are pinned, so a sandboxed command can neither rewrite a
- * manifest nor make or swap the directory (see {@link
- * mountPointManifestDirectories}). Not covered: a sandbox this library did not
- * start, the sandbox of a process with another environment where a process has
- * to keep its manifests under a name its own environment gives, and a directory
- * whose name, or a name above it, is a link inside a write root or whose parent
- * is not there yet.
+ * A reading in doubt refuses every wrap of this user that restricts writes, so
+ * NO LASTING STATE OF THE DIRECTORY REFUSES WRAPS FOR EVER. Every source of doubt
+ * is either a condition of this process that clears by itself (EMFILE, ENFILE,
+ * ENOMEM, EIO on a read), which the age of a file never ends, or a property of
+ * what is at a name, which has an end: an hour, or the process on its record.
+ * No sandboxed command can write the directory (see below), so what is there
+ * and should not be comes from an accident on the host.
  *
- * /proc/locks and /proc/PID are relative to a PID namespace, so a manifest
- * records the namespace that wrote it and only a process in that namespace
- * judges it; to any other it is live.
+ * The manifest directories are bound read-only into every sandbox that
+ * restricts writes, and the directories above them inside a write root are
+ * pinned, so a sandboxed command can neither rewrite a manifest nor swap the
+ * directory (see {@link mountPointManifestDirectories}). Not covered: a sandbox
+ * this library did not start, a process that looks for its runtime or temp
+ * directory elsewhere, and a runtime or temp directory that is a link inside a
+ * write root or not there yet.
+ *
+ * /proc/PID is relative to a PID namespace, so a manifest records the namespace
+ * that wrote it and only a process in that namespace judges it; to any other it
+ * is live.
  */
 
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { logForDebugging } from '../utils/debug.js'
 import { isAbsenceErrno } from './sandbox-utils.js'
 
-/** The only manifest layout this version writes and reads. */
+/**
+ * The manifest layout this version writes. It reads this one and any later one,
+ * by the fields it knows (see {@link ManifestSchema}).
+ */
 const MANIFEST_VERSION = 1
 const MANIFEST_SUFFIX = '.json'
+const STARTED_SUFFIX = '.started'
+const CLAIMED_SUFFIX = '.claimed'
 
 /**
- * A manifest this young counts as live with no lock on it. bubblewrap takes the
- * lock a few milliseconds after the wrap returns; a wrapping process killed in
- * between must not leave a starting sandbox's mount point unclaimed.
+ * A manifest this young counts as live with no started record yet, so that a
+ * command is not refused its start because the process that wrapped it was
+ * killed a moment before.
  */
 const MANIFEST_GRACE_MS = 500
 
-/** How long a collect or a publish waits for the directory lock. */
-const DIRECTORY_LOCK_WAIT_MS = 2_000
-
-/** Between attempts at the directory lock. */
-const DIRECTORY_LOCK_RETRY_MS = 25
-
 /**
- * A directory lock this old is broken whoever holds it: the only way out for a
- * holder that cannot be asked after (another PID namespace, unreadable
- * content). A holder that is gone is broken at once.
+ * A pass with no more candidates than this lists the manifest directory again
+ * before every removal, so each is judged on a listing a few microseconds old.
+ * An ordinary pass is a handful of paths.
  */
-const DIRECTORY_LOCK_STALE_MS = 60_000
+const LISTS_BEFORE_EACH_REMOVAL_UP_TO = 64
 
 /**
- * How many mount points a pass removes on one read of /proc/locks, and for how
- * long one read is good. A sandbox needs several milliseconds from its manifest
- * being published to its binds being in place, so both stay under that; one
- * read per removal would make a pass on a busy host outlast the directory lock
- * wait.
- */
-const REMOVALS_PER_LOOK = 64
-const LOCKS_GOOD_FOR_MS = 2
-
-/**
- * For how long one listing of the manifest directory is good: well under the
- * time a starting sandbox needs to reach its binds, and a time rather than
- * "before every removal" so a directory of thousands is not listed thousands of
- * times.
+ * For how long one listing is good in a larger pass: well under the time a
+ * starting sandbox needs to reach its binds, and a time so a directory of
+ * thousands is not listed thousands of times.
  */
 const LISTING_GOOD_FOR_MS = 0.25
 
 /**
- * An unreadable manifest with no lock on it is dropped once it is this old:
- * long enough for another version of this library to keep its own format.
+ * How often a reading starts over because a listed manifest was gone when it
+ * was opened (claimed, given back or collected meanwhile) before it gives up.
+ */
+const LISTING_ATTEMPTS = 8
+
+/**
+ * What is at a manifest's name and is not one this version reads counts as
+ * live until it is this old, and is dropped then: long enough for another
+ * version of this library to keep its own format.
  */
 const UNREADABLE_MANIFEST_MAX_AGE_MS = 60 * 60 * 1000
 
 /** The largest file read as a manifest; a real one is a few kilobytes. */
 const MANIFEST_MAX_BYTES = 1024 * 1024
 
+/** The largest started record read: a line of some 300 bytes for each run. */
+const RECORD_MAX_BYTES = 64 * 1024
+
 /**
- * Suffix of a manifest or directory lock before it is moved into place. One
- * left by a killed process is removed at {@link
- * UNREADABLE_MANIFEST_MAX_AGE_MS}.
+ * Suffix of a manifest before it is moved into place. One left by a killed
+ * process is removed at {@link UNREADABLE_MANIFEST_MAX_AGE_MS}.
  */
 const TEMPORARY_SUFFIX = '.tmp'
 
 const ManifestSchema = z.object({
-  version: z.literal(MANIFEST_VERSION),
+  /**
+   * INVARIANT for every later version: it may add fields, and keeps these, the
+   * three file names and what they mean, so a reader takes a later version by
+   * the fields it knows. A manifest that is not read puts everything in doubt,
+   * which would refuse every wrap of an older process for as long as a newer
+   * one is at work beside it. A change that cannot keep to this takes another
+   * directory name.
+   */
+  version: z.number().int().min(MANIFEST_VERSION),
   /** The process that wrapped, and its start time, to tell a recycled pid. */
   pid: z.number().int().nonnegative(),
   start: z.string(),
   /**
-   * The writer's PID namespace (`readlink /proc/self/ns/pid`): `pid` and the
-   * lock can only be asked after from there. Absent in older manifests.
+   * The writer's PID namespace (`readlink /proc/self/ns/pid`): a pid can only
+   * be asked after from there. Absent where it could not be read.
    */
   ns: z.string().optional(),
   /** When the manifest was written, for {@link MANIFEST_GRACE_MS}. */
@@ -128,26 +141,39 @@ const ManifestSchema = z.object({
 })
 
 type Manifest = z.infer<typeof ManifestSchema> & {
+  /** Where it is: at its own name, `<id>.json`, or at a claim's. */
   file: string
-  /** The inode /proc/locks reports a lock on, and the device it is on. */
-  inode: string
-  device: string
-  /**
-   * This process wrote it, the caller says the command is over, and nothing
-   * held the lock when the pass began: only a lock can still make it live.
-   */
+  claimed: boolean
+  /** Its started record, `<id>.started`. */
+  record: string
+  /** This process wrote it and the caller says its command is over. */
   released: boolean
 }
 
 /**
- * Manifests this process wrote that are still on disk, with the command key the
- * caller gave and whether that command is over. Remembered rather than acted on
- * at once: a manifest must stay on disk until a pass removes what it names.
+ * Manifests this process wrote that are still on disk, by their own name, with
+ * the command key the caller gave and whether that command is over. Remembered
+ * rather than acted on at once: a manifest must stay on disk until a pass
+ * removes what it names.
  */
 const ownManifests = new Map<
   string,
   { commandKey: string | undefined; over: boolean }
 >()
+
+/**
+ * The mount points, and the directories they bind from, of wraps that could
+ * record them nowhere. No other process knows of them, so they are this
+ * process's to remove once none of its wraps is outstanding: in a pass like
+ * any other where there is a directory by then, so that a path another
+ * process's manifest names is kept, and on its own word where there is none.
+ */
+const unrecorded = { paths: new Set<string>(), sources: new Set<string>() }
+
+/** Has `source` removed at this process's own clean-up if no manifest keeps it. */
+export function keepTrackOfMountSource(source: string): void {
+  unrecorded.sources.add(source)
+}
 
 /**
  * Which of this process's own manifests a collect may release. Only the caller
@@ -158,9 +184,8 @@ const ownManifests = new Map<
  *   processes have finished with is collected;
  * - one command: that command is over, whatever else is running.
  *
- * Never release the manifest of a wrap whose command has not started:
- * bubblewrap opens the manifest to lock it, and the command would refuse to
- * start or run with nothing on disk naming its mount points.
+ * A released manifest whose command has not started is collected, and the
+ * command is then refused its start.
  */
 export type OwnManifestRelease = 'all' | 'none' | { commandKey: string }
 
@@ -176,37 +201,57 @@ let manifestDirectoryUnavailable = false
 const onLinux = (): boolean => process.platform === 'linux'
 
 /**
- * Field 22 of /proc/PID/stat, the start time in clock ticks, counted from the
- * last ')' because the comm field can hold spaces and parentheses.
+ * Field 22 of a /proc/PID/stat line, the start time in clock ticks, counted
+ * from the last ')' because the comm field can hold spaces and parentheses.
+ * `undefined` for a line that is cut short or is not one.
  */
 function startTimeFromProcStat(stat: string): string | undefined {
-  return stat
-    .slice(stat.lastIndexOf(')') + 1)
+  const comm = stat.lastIndexOf(')')
+  const start = stat
+    .slice(comm + 1)
     .trim()
     .split(' ')[19]
-}
-
-function processStartTime(pid: number): string | undefined {
-  try {
-    return startTimeFromProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'))
-  } catch {
-    return undefined
-  }
+  return comm > 0 && start !== undefined && /^\d+$/.test(start)
+    ? start
+    : undefined
 }
 
 /**
- * Whether the process a manifest names is still running. An unreadable /proc
- * answers yes: it must not make a live sandbox's manifest collectable.
+ * This process as the /proc it sees numbers it, which is what a pass will ask
+ * after. `process.pid` is another number where the process has a PID namespace
+ * of its own under an outer /proc (a nested sandbox): nobody's there, or an
+ * unrelated process's.
  */
-function writerIsRunning(pid: number, start: string): boolean {
+function ownProcess(): { pid: number; start: string } {
   try {
-    return (
-      startTimeFromProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')) ===
-      start
-    )
-  } catch (e) {
-    return !isAbsenceErrno(e)
+    const stat = fs.readFileSync('/proc/self/stat', 'utf8')
+    const pid = /^\d+/.exec(stat)?.[0]
+    if (pid !== undefined) {
+      return { pid: Number(pid), start: startTimeFromProcStat(stat) ?? '' }
+    }
+  } catch {
+    // No /proc: every manifest counts as live then (see isLive).
   }
+  return { pid: process.pid, start: '' }
+}
+
+/**
+ * Whether the process with that pid and start time is running. Only "no such
+ * process" and a start time that differs say no: a sandboxed command can use up
+ * what this user may open, and a /proc that cannot be read must not make a live
+ * sandbox's mount points collectable. An unknown `start` leaves the pid alone
+ * to go by.
+ */
+function isRunning(pid: number, start: string): boolean {
+  let stat: string
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    return code !== 'ENOENT' && code !== 'ESRCH'
+  }
+  const found = startTimeFromProcStat(stat)
+  return found === undefined || !/^\d+$/.test(start) || found === start
 }
 
 let pidNamespace: string | undefined | null = null
@@ -223,99 +268,12 @@ function ownPidNamespace(): string | undefined {
   return pidNamespace
 }
 
-/** `major:minor` in decimal, as /proc/locks prints a device. */
-function deviceOf(dev: bigint): string {
-  const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn)
-  const minor = (dev & 0xffn) | ((dev >> 12n) & ~0xffn)
-  return `${major}:${minor}`
-}
-
 /**
- * Filesystems on which stat reports the device /proc/locks prints. Elsewhere (a
- * btrfs subvolume, some overlays) only the inode number can be compared.
+ * Whether `dir` is a directory of ours that nobody else can write, and we can.
+ * With `orThrow`, an error that says neither "not there" nor "not to be written
+ * from here" is thrown, for a caller that must not take it for a no.
  */
-const FILESYSTEMS_WITH_ONE_DEVICE = new Set([
-  0x01021994, // tmpfs, which is what /run/user/UID is
-  0xef53, // ext2, ext3, ext4
-  0x58465342, // xfs
-])
-
-function reportsTheLockedDevice(dir: string): boolean {
-  try {
-    return FILESYSTEMS_WITH_ONE_DEVICE.has(Number(fs.statfsSync(dir).type))
-  } catch {
-    return false
-  }
-}
-
-/** The locks /proc/locks lists, of any kind, by what they are on. */
-type Locks = {
-  /** Every inode number with a lock on it, whatever filesystem it is on. */
-  inodes: Set<string>
-  /** The same locks as `major:minor:inode`, in decimal. */
-  files: Set<string>
-  /** The directories whose manifests' device can be held against `files`. */
-  comparesDevices: Set<string>
-}
-
-/**
- * Whether /proc/locks lists a lock on this file; nothing but bubblewrap's
- * sandbox init locks a manifest. The device is compared where it can be: inode
- * numbers are per filesystem, and an unrelated locked file with the same number
- * would otherwise keep a manifest live. Where it cannot, the inode alone
- * decides, which errs towards "locked".
- */
-function holdsLock(
-  locks: Locks,
-  file: { file: string; inode: string; device: string },
-): boolean {
-  return locks.comparesDevices.has(path.dirname(file.file))
-    ? locks.files.has(`${file.device}:${file.inode}`)
-    : locks.inodes.has(file.inode)
-}
-
-/**
- * What /proc/locks lists. Only locks whose holder has a pid in this PID
- * namespace appear. `undefined` when it cannot be read, which every caller
- * treats as "every manifest is locked".
- */
-function readLocks(dirs: readonly string[]): Locks | undefined {
-  let text: string
-  try {
-    text = fs.readFileSync('/proc/locks', 'utf8')
-  } catch (e) {
-    logForDebugging(
-      `[Sandbox Linux] /proc/locks could not be read (${String(e)}) - leaving every mount point where it is`,
-      { level: 'warn' },
-    )
-    return undefined
-  }
-  const inodes = new Set<string>()
-  const files = new Set<string>()
-  for (const line of text.split('\n')) {
-    // The major:minor:inode word, which sits one field later on the lines that
-    // describe a blocked request ("2: -> POSIX ADVISORY WRITE ...").
-    for (const word of line.split(/\s+/)) {
-      const match = /^([0-9a-f]+):([0-9a-f]+):(\d+)$/.exec(word)
-      if (match !== null) {
-        const inode = String(BigInt(match[3]!))
-        inodes.add(inode)
-        files.add(
-          `${parseInt(match[1]!, 16)}:${parseInt(match[2]!, 16)}:${inode}`,
-        )
-        break
-      }
-    }
-  }
-  return {
-    inodes,
-    files,
-    comparesDevices: new Set(dirs.filter(reportsTheLockedDevice)),
-  }
-}
-
-/** Whether `dir` is a directory of ours that nobody else can write, and we can. */
-function isOurPrivateDirectory(dir: string): boolean {
+function isOurPrivateDirectory(dir: string, orThrow = false): boolean {
   try {
     const stat = fs.lstatSync(dir)
     if (
@@ -329,7 +287,16 @@ function isOurPrivateDirectory(dir: string): boolean {
     // binds read-only reads as ours in every other respect.
     fs.accessSync(dir, fs.constants.W_OK | fs.constants.X_OK)
     return true
-  } catch {
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (
+      orThrow &&
+      !isAbsenceErrno(e) &&
+      code !== 'EACCES' &&
+      code !== 'EROFS'
+    ) {
+      throw e
+    }
     return false
   }
 }
@@ -382,133 +349,26 @@ function isBuriedBySandboxMounts(dir: string): boolean {
 }
 
 /**
- * The places the manifest directories are looked for in. The first two are the
- * same for every process of a user; the last two are what this process's
- * environment says.
+ * Where processes of this user keep manifests that others can find, in the
+ * order tried: under $XDG_RUNTIME_DIR, then under the system temp dir.
  */
-export type ManifestDirectoryPlaces = {
-  /** The user's runtime directory where the system keeps one: /run/user/UID. */
-  runtimeDir: string
-  /** The temp dir every process can name: /tmp. */
-  tempDir: string
-  /** $XDG_RUNTIME_DIR, where it is set. */
-  environmentRuntimeDir: string | undefined
-  /** The system temp dir as this process sees it, which is $TMPDIR's. */
-  environmentTempDir: string
-}
-
-// What a test has put in the place of some of those, and nothing else has.
-let placesForTesting: Partial<ManifestDirectoryPlaces> | undefined
-
-function manifestDirectoryPlaces(): ManifestDirectoryPlaces {
-  return {
-    runtimeDir: `/run/user/${process.getuid?.() ?? 0}`,
-    tempDir: '/tmp',
-    environmentRuntimeDir: process.env['XDG_RUNTIME_DIR'],
-    environmentTempDir: tmpdir(),
-    ...placesForTesting,
-  }
-}
-
-/**
- * Whether `dir` is a runtime directory of this user's as the system makes one:
- * a real directory, not a link, the user's, and closed to everyone else.
- */
-function isTheUsersRuntimeDirectory(dir: string): boolean {
-  try {
-    const stat = fs.lstatSync(dir)
-    return (
-      stat.isDirectory() &&
-      stat.uid === process.getuid?.() &&
-      (stat.mode & 0o077) === 0
-    )
-  } catch {
-    return false
-  }
-}
-
-/**
- * Where the directory `name` names really is, as far as can be told before it
- * is made: its parent with links resolved, plus its own last component.
- */
-function whereItReallyIs(name: string): string {
-  try {
-    return path.join(fs.realpathSync(path.dirname(name)), path.basename(name))
-  } catch {
-    return path.resolve(name)
-  }
-}
-
-/**
- * The names under which processes of this user keep manifests that others can
- * find, in the order tried for writing:
- *
- * - `/run/user/UID/srt-mount-points`, where `/run/user/UID` is a runtime
- *   directory of the user's (see {@link isTheUsersRuntimeDirectory});
- * - `/tmp/srt-mount-points-UID`;
- * - `$XDG_RUNTIME_DIR/srt-mount-points`, where that is set;
- * - `srt-mount-points-UID` under the system temp dir, which is `$TMPDIR`'s.
- *
- * The user id and the file system come first because they are the same for
- * every process of the user. The environment is not: two processes that each
- * wrote where their own environment said would never read each other's
- * manifests, and one would remove the other's mount point from under its
- * sandbox. The names from the environment stay, last, for a process that can
- * use neither of the first two. Two names for one directory count once, and one
- * that a sandbox's own mounts would bury is left out.
- */
-function manifestDirectoryCandidates(): {
-  name: string
-  fromTheEnvironment: boolean
-}[] {
-  const places = manifestDirectoryPlaces()
-  const perUser = `srt-mount-points-${process.getuid?.() ?? 0}`
-  const names: { name: string; fromTheEnvironment: boolean }[] = []
-  if (isTheUsersRuntimeDirectory(places.runtimeDir)) {
-    names.push({
-      name: path.join(places.runtimeDir, 'srt-mount-points'),
-      fromTheEnvironment: false,
-    })
-  }
-  names.push({
-    name: path.join(places.tempDir, perUser),
-    fromTheEnvironment: false,
-  })
-  if (
-    places.environmentRuntimeDir !== undefined &&
-    path.isAbsolute(places.environmentRuntimeDir)
-  ) {
-    names.push({
-      name: path.join(places.environmentRuntimeDir, 'srt-mount-points'),
-      fromTheEnvironment: true,
-    })
-  }
-  names.push({
-    name: path.join(places.environmentTempDir, perUser),
-    fromTheEnvironment: true,
-  })
-  const found = new Set<string>()
-  return names.filter(candidate => {
-    const where = whereItReallyIs(candidate.name)
-    if (isBuriedBySandboxMounts(candidate.name) || found.has(where)) {
-      return false
-    }
-    found.add(where)
-    return true
-  })
-}
-
-/** The names of {@link manifestDirectoryCandidates}, in their order. */
 function sharedManifestDirectoryNames(): string[] {
-  return manifestDirectoryCandidates().map(candidate => candidate.name)
+  const runtimeDir = process.env['XDG_RUNTIME_DIR']
+  const shared =
+    runtimeDir !== undefined && path.isAbsolute(runtimeDir)
+      ? [path.join(runtimeDir, 'srt-mount-points')]
+      : []
+  shared.push(
+    path.join(tmpdir(), `srt-mount-points-${process.getuid?.() ?? 0}`),
+  )
+  return shared.filter(candidate => !isBuriedBySandboxMounts(candidate))
 }
 
 /**
- * The directory this process writes its manifests to: the first shared name
- * (see {@link sharedManifestDirectoryNames}) that can be made ours alone, else
- * a private directory only this process knows, which keeps the guarantee within
- * this process. Revalidated on every use, because a directory swapped for a
- * symlink between two wraps would send manifests elsewhere.
+ * The directory manifests live in: the first shared name that can be made ours
+ * alone, else a private directory only this process knows, which keeps the
+ * guarantee within this process. Revalidated on every use, because a directory
+ * swapped for a symlink between two wraps would send manifests elsewhere.
  */
 function ensureManifestDirectory(): string | undefined {
   if (
@@ -525,14 +385,11 @@ function ensureManifestDirectory(): string | undefined {
     }
   }
   manifestDirectory = undefined
-  const systemTempDir = manifestDirectoryPlaces().environmentTempDir
-  if (manifestDirectoryUnavailable || isBuriedBySandboxMounts(systemTempDir)) {
+  if (manifestDirectoryUnavailable || isBuriedBySandboxMounts(tmpdir())) {
     return undefined
   }
   try {
-    const private_ = fs.mkdtempSync(
-      path.join(systemTempDir, 'srt-mount-points-'),
-    )
+    const private_ = fs.mkdtempSync(path.join(tmpdir(), 'srt-mount-points-'))
     if (!makeOurPrivateDirectory(private_)) {
       // A temp dir that keeps no modes or ownership: nothing made in it can be
       // told from somebody else's, now or on the next call.
@@ -555,7 +412,7 @@ function ensureManifestDirectory(): string | undefined {
     if (!directoryFailureLogged) {
       directoryFailureLogged = true
       logForDebugging(
-        `[Sandbox Linux] No directory for mount point manifests (${String(e)}) - the mount points this process makes are left on the host`,
+        `[Sandbox Linux] No directory for mount point manifests (${String(e)}) - the mount points this process makes are kept in memory and removed at its own clean-up`,
         { level: 'warn' },
       )
     }
@@ -574,55 +431,16 @@ function isOurDirectory(dir: string): boolean {
 }
 
 /**
- * Every directory whose manifests this process believes, for a wrap, a clean-up
- * and {@link liveMountPoints} to read:
- *
- * - each name that comes from the user id that is there and is a directory of
- *   ours alone that we can write;
- * - the names the environment gives, held to the same, only where none of the
- *   first kind will do;
- * - the one this process has settled on.
- *
- * What the environment names is kept out of a sandboxed command's reach only by
- * processes whose environment names it; a command of a process with another
- * temp dir may write there. A manifest planted that way must not keep or remove
- * a path, so such a directory is believed only by a process that has nowhere
- * else to keep its own. One that is a link, somebody else's, open to others or
- * not writable is passed over. Nothing is made.
- */
-function believedManifestDirectories(): string[] {
-  const usable = manifestDirectoryCandidates().filter(candidate =>
-    isOurPrivateDirectory(candidate.name),
-  )
-  const fromTheUserId = usable.filter(
-    candidate => !candidate.fromTheEnvironment,
-  )
-  const dirs = (fromTheUserId.length > 0 ? fromTheUserId : usable).map(
-    candidate => candidate.name,
-  )
-  if (
-    manifestDirectory !== undefined &&
-    !dirs.includes(manifestDirectory) &&
-    isOurPrivateDirectory(manifestDirectory)
-  ) {
-    dirs.push(manifestDirectory)
-  }
-  return dirs
-}
-
-/**
  * Every directory a wrap must bind read-only because some process of this user
- * keeps manifests in it and a collect believes what it finds there: every
- * shared name, plus the one this process settled on.
+ * keeps manifests in it and a collect believes what it finds there: both shared
+ * names, plus the one this process settled on.
  *
- * Every name, not only the one this process writes to: a sandbox with the temp
- * dir writable could otherwise forge manifests in the directory under it while
- * its own process writes under the runtime directory. Each is made if it can
- * be, so a sandboxed command cannot make and fill it first: the command runs as
- * the user, so what it makes passes every check of owner and mode. One that is
- * there and the user's is listed even when it cannot be written from here. With
- * `recording`, the directory this wrap's manifest will go to is settled first,
- * so the wrap can pin what lies above it before it publishes.
+ * Both names, because a process started without $XDG_RUNTIME_DIR (cron, plain
+ * ssh, a service) uses the second, and a sandbox of the first kind with the
+ * temp dir writable could otherwise forge its manifests. Each is made if it can
+ * be, so a sandboxed command cannot make and fill it first. With `recording`,
+ * the directory this wrap's manifest will go to is settled first, so the wrap
+ * can pin what lies above it before it publishes.
  */
 export function mountPointManifestDirectories(recording = false): string[] {
   if (!onLinux()) {
@@ -662,260 +480,173 @@ export function removePrivateManifestDirectory(): void {
   manifestDirectoryIsPrivate = false
 }
 
-/** Block this thread, the only sleep available to a synchronous cleanup. */
-function sleep(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-}
-
-/** What the directory lock holds: who took it, and in which PID namespace. */
-function directoryLockContent(): string {
-  return `${process.pid} ${processStartTime(process.pid) ?? '?'} ${ownPidNamespace() ?? '?'}\n`
-}
+/** What is at a name and is not what this library keeps there. */
+class NotOurs extends Error {}
 
 /**
- * Take the directory lock: returns what it now holds, `held` when the name is
- * taken, or `unavailable` when this process cannot make one there. The content
- * is written under another name and hard-linked into place, so a waiter never
- * reads a lock that is still empty and takes it for abandoned.
+ * Whether `file` is what an open does not refuse for what it is: a regular file
+ * of the user's that its owner may read. What cannot be looked at may be.
  */
-function takeDirectoryLock(
-  dir: string,
-  lockFile: string,
-): { content: string } | 'held' | 'unavailable' {
-  const content = directoryLockContent()
-  const temporary = path.join(
-    dir,
-    `directory.lock.${process.pid}.${randomBytes(8).toString('hex')}${TEMPORARY_SUFFIX}`,
-  )
+function isOwnReadableFile(file: string): boolean {
   try {
-    fs.writeFileSync(temporary, content, { mode: 0o600, flag: 'wx' })
-  } catch {
-    return 'unavailable'
-  }
-  try {
-    fs.linkSync(temporary, lockFile)
-    return { content }
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EEXIST'
-      ? 'held'
-      : 'unavailable'
-  } finally {
-    try {
-      fs.unlinkSync(temporary)
-    } catch {
-      // Gone with the directory.
-    }
-  }
-}
-
-/**
- * Give the directory lock up if it is still this process's. One broken for its
- * age meanwhile belongs to whoever took it next.
- */
-function releaseDirectoryLock(lockFile: string, content: string): void {
-  try {
-    if (fs.readFileSync(lockFile, 'utf8') === content) {
-      fs.unlinkSync(lockFile)
-    }
-  } catch {
-    // Broken by another process while we held it: nothing to undo.
-  }
-}
-
-/**
- * What stands at the directory lock's name once taking it has failed:
- *
- * - `free`: nothing, or the lock of a holder that is gone, now removed;
- * - `held`: somebody's lock, to be waited for;
- * - `stuck`: something this process can neither read as a lock nor remove.
- *
- * Breaking a lock is read, ask, unlink, not one step, so a slow waiter's unlink
- * can land on a lock a third process has taken since. Nothing prevents that,
- * which is why nothing rests on this lock (see {@link withDirectoryLock}).
- */
-function examineDirectoryLock(lockFile: string): 'free' | 'held' | 'stuck' {
-  let holder: string
-  let age: number
-  try {
-    // Opened without blocking or following a link: opening a FIFO waits for a
-    // writer, and only a regular file is a lock this library made.
-    if (!fs.lstatSync(lockFile).isFile()) {
-      return 'stuck'
-    }
-    const fd = fs.openSync(
-      lockFile,
-      fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW,
+    const stat = fs.lstatSync(file)
+    return (
+      stat.isFile() &&
+      stat.uid === process.getuid?.() &&
+      (stat.mode & 0o400) !== 0
     )
-    try {
-      const stat = fs.fstatSync(fd)
-      if (!stat.isFile()) {
-        return 'stuck'
-      }
-      age = Date.now() - stat.mtimeMs
-      holder = fs.readFileSync(fd, 'utf8')
-    } finally {
-      fs.closeSync(fd)
-    }
-  } catch (e) {
-    // Gone meanwhile: the next attempt takes it. Anything else cannot be read.
-    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'free' : 'stuck'
-  }
-  // A holder can be asked after only in its own PID namespace. One that cannot
-  // be, or that did not say who it is, is believed until the lock is stale.
-  const who = /^(\d+) (\d+) (\S+)\n$/.exec(holder)
-  const held =
-    age < DIRECTORY_LOCK_STALE_MS &&
-    (who === null ||
-      who[3] !== ownPidNamespace() ||
-      writerIsRunning(Number(who[1]), who[2]!))
-  if (held) {
-    return 'held'
-  }
-  try {
-    fs.unlinkSync(lockFile)
-  } catch (e) {
-    // Another process broke it first, or it cannot be removed from here.
-    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'free' : 'stuck'
-  }
-  return 'free'
-}
-
-/**
- * Run `body` while holding the manifest directory's lock, and report whether it
- * ran and, if not, whether the lock was `held` throughout. Gives up after
- * {@link DIRECTORY_LOCK_WAIT_MS}, and at once when what is at the lock's name
- * can never be taken: the wait blocks the wrap, the clean-up after every
- * command and the exit handler.
- *
- * The lock keeps srt processes out of each other's way; it does not exclude,
- * and nothing may rest on it. Its holder can outlive the age at which it is
- * broken, the break is not atomic, and a publish that cannot have the lock goes
- * ahead without it. What makes a mount point safe to remove is looked at again
- * immediately before the removals and during them (see {@link
- * collectUnderLock}).
- */
-function withDirectoryLock<T>(
-  dir: string,
-  body: () => T,
-): { ran: true; value: T } | { ran: false; held: boolean } {
-  const lockFile = path.join(dir, 'directory.lock')
-  const deadline = Date.now() + DIRECTORY_LOCK_WAIT_MS
-  for (;;) {
-    const taken = takeDirectoryLock(dir, lockFile)
-    if (taken === 'unavailable') {
-      return { ran: false, held: false }
-    }
-    if (taken !== 'held') {
-      try {
-        return { ran: true, value: body() }
-      } finally {
-        releaseDirectoryLock(lockFile, taken.content)
-      }
-    }
-    if (examineDirectoryLock(lockFile) === 'stuck') {
-      logForDebugging(
-        `[Sandbox Linux] ${lockFile} is not a lock this process can take or break - going on without it`,
-        { level: 'warn' },
-      )
-      return { ran: false, held: false }
-    }
-    // On every round: a lock that others keep breaking and retaking is as good
-    // as held.
-    if (Date.now() >= deadline) {
-      return { ran: false, held: true }
-    }
-    sleep(DIRECTORY_LOCK_RETRY_MS)
+  } catch {
+    return true
   }
 }
 
 /**
- * What is at a manifest's name, read as one, or `undefined` when it is not a
- * manifest this version can read. Only a regular file of the user's, no larger
- * than {@link MANIFEST_MAX_BYTES}, is read, through a descriptor opened without
- * following a link and without blocking.
+ * What `file` holds, or `undefined` where nothing is there. Only a regular file
+ * of the user's, no larger than `max`, is read, through a descriptor opened
+ * without following a link and without blocking. Throws {@link NotOurs} for
+ * anything else that is there, and the error itself where that cannot be told.
  */
-function readManifest(file: string): Manifest | undefined {
-  let inode: string
-  let device: string
-  let text: string
+function readOwnFile(file: string, max: number): string | undefined {
+  let fd: number
   try {
-    const fd = fs.openSync(
+    fd = fs.openSync(
       file,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
     )
-    try {
-      const stat = fs.fstatSync(fd, { bigint: true })
-      if (
-        !stat.isFile() ||
-        Number(stat.uid) !== process.getuid?.() ||
-        stat.size > MANIFEST_MAX_BYTES
-      ) {
-        return undefined
-      }
-      inode = String(stat.ino)
-      device = deviceOf(stat.dev)
-      text = fs.readFileSync(fd, 'utf8')
-    } finally {
-      fs.closeSync(fd)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    // A link, a socket, a file of mode 000: that lasts. Anything else passes.
+    throw isOwnReadableFile(file)
+      ? e
+      : new NotOurs(`${file} is not a readable regular file of this user's`)
+  }
+  try {
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.size > max) {
+      throw new NotOurs(`${file} is not a small regular file of this user's`)
     }
-  } catch {
+    return fs.readFileSync(fd, 'utf8')
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/** `<directory>/<id>` of a manifest, its claim or its started record. */
+const idOf = (file: string): string => file.slice(0, file.lastIndexOf('.'))
+
+/**
+ * The manifest at `file`, which is its own name or its claim's, or `undefined`
+ * where nothing is there. Throws like {@link readOwnFile}, and {@link NotOurs}
+ * for what does not hold a manifest's fields.
+ */
+function readManifest(file: string): Manifest | undefined {
+  const text = readOwnFile(file, MANIFEST_MAX_BYTES)
+  if (text === undefined) {
     return undefined
   }
   let json: unknown
   try {
     json = JSON.parse(text)
   } catch {
-    return undefined
+    throw new NotOurs(`${file} is not JSON`)
   }
   const parsed = ManifestSchema.safeParse(json)
-  return parsed.success
-    ? { ...parsed.data, file, inode, device, released: false }
-    : undefined
+  if (!parsed.success) {
+    throw new NotOurs(`${file} is not a manifest this version can read`)
+  }
+  const id = idOf(file)
+  return {
+    ...parsed.data,
+    file,
+    claimed: file.endsWith(CLAIMED_SUFFIX),
+    record: `${id}${STARTED_SUFFIX}`,
+    released: ownManifests.get(`${id}${MANIFEST_SUFFIX}`)?.over === true,
+  }
 }
 
 /**
- * Whether a sandbox that named this manifest may still be running, as far as
- * this process can tell. It can tell only for a manifest written in its own PID
- * namespace; one from another namespace is always live here and is collected by
- * a process in the namespace that wrote it. One that names no namespace is live
- * while its writer can be seen, and otherwise until {@link
- * UNREADABLE_MANIFEST_MAX_AGE_MS}.
+ * Whether a process on the started record is running, or `undefined` with no
+ * whole line on record. A record that cannot be read, is not the user's small
+ * regular file, or holds a line that is no /proc/PID/stat line vouches: only a
+ * process that is gone says its sandbox has ended.
+ *
+ * Not so an `orphan`, which has no manifest that can be read: it names no path,
+ * so it protects none. Only a process that can be asked after vouches there, and
+ * an error that says nothing of the file.
+ *
+ * What follows the last newline counts as not written, an empty record
+ * included. The command line execs bubblewrap only once its whole line is
+ * written, so no sandbox is behind it yet, and one that follows is refused its
+ * start by a claim like any that has not put itself on record. Taking it for a
+ * running sandbox would keep what a shell killed there named for ever.
  */
-function isLive(manifest: Manifest, locks: Locks): boolean {
-  if (holdsLock(locks, manifest)) {
-    return true
+function recordVouches(record: string, orphan = false): boolean | undefined {
+  let lines: string[]
+  try {
+    const text = readOwnFile(record, RECORD_MAX_BYTES)
+    if (text === undefined) {
+      return undefined
+    }
+    lines = text.split('\n').slice(0, -1)
+  } catch (e) {
+    return !(orphan && e instanceof NotOurs)
   }
-  if (manifest.released) {
-    return false
+  if (lines.length === 0) {
+    return undefined
   }
+  return lines.some(line => {
+    const pid = /^(\d+) \(/.exec(line)?.[1]
+    const start = startTimeFromProcStat(line)
+    return pid === undefined || start === undefined
+      ? !orphan
+      : isRunning(Number(pid), start)
+  })
+}
+
+/**
+ * Whether a sandbox that named this manifest may be running, or may yet start.
+ * Only a process in the PID namespace that wrote it can tell; to any other it
+ * is live, and is collected by a process in its own. With a started record, the
+ * record alone says. With none, no sandbox has got past a claim, and one the
+ * caller has not released is live while it is young or its writer runs.
+ */
+function isLive(manifest: Manifest): boolean {
   const here = ownPidNamespace()
-  if (manifest.ns === undefined || here === undefined) {
-    return (
-      writerIsRunning(manifest.pid, manifest.start) ||
-      Date.now() - manifest.created < UNREADABLE_MANIFEST_MAX_AGE_MS
-    )
-  }
-  if (manifest.ns !== here) {
+  if (here === undefined || manifest.ns !== here) {
     return true
+  }
+  const vouched = recordVouches(manifest.record)
+  if (vouched !== undefined) {
+    return vouched
   }
   return (
-    Date.now() - manifest.created < MANIFEST_GRACE_MS ||
-    writerIsRunning(manifest.pid, manifest.start)
+    !manifest.claimed &&
+    !manifest.released &&
+    (Date.now() - manifest.created < MANIFEST_GRACE_MS ||
+      isRunning(manifest.pid, manifest.start))
   )
 }
 
 /**
  * What became of a path a pass set out to remove: `left` when it is gone or no
- * longer what bubblewrap or this library made, `failed` when it is still that
- * and could not be removed from here.
+ * longer what bubblewrap or this library made, `occupied` when it is a directory
+ * with something in it, `failed` when it is still a mount point and could not be
+ * removed from here.
  */
-type Removal = 'removed' | 'left' | 'failed'
+type Removal = 'removed' | 'left' | 'occupied' | 'failed'
 
-/** Whether a failed removal means the path is no longer ours to remove. */
-function meansNothingToRemove(e: unknown): boolean {
+/** What a removal that threw says of the path. */
+function afterFailedRemoval(e: unknown, what: string): Removal {
   const code = (e as NodeJS.ErrnoException | undefined)?.code
-  // Not empty after all: something was written into it meanwhile.
-  return isAbsenceErrno(e) || code === 'ENOTEMPTY' || code === 'EEXIST'
+  // Not empty after all: something was put into it meanwhile.
+  if (code === 'ENOTEMPTY' || code === 'EEXIST') {
+    return 'occupied'
+  }
+  if (isAbsenceErrno(e)) {
+    return 'left'
+  }
+  logForDebugging(`[Sandbox Linux] Could not remove ${what} (${String(e)})`)
+  return 'failed'
 }
 
 /**
@@ -943,48 +674,38 @@ function removeMountSource(source: string): Removal {
     )
     return 'removed'
   } catch (e) {
-    if (meansNothingToRemove(e)) {
-      return 'left'
-    }
-    logForDebugging(
-      `[Sandbox Linux] Could not remove the empty-directory mount source (${String(e)}): ${source}`,
-    )
-    return 'failed'
+    return afterFailedRemoval(e, `the empty-directory mount source ${source}`)
   }
 }
 
-/**
- * Whether `p` still has the shape of a file bubblewrap made to bind onto: a
- * regular file (not a link), empty, with no write bit, under one name, and
- * ours. A manifest is only a claim about a path, so nothing is removed on its
- * word that does not also look like what bubblewrap leaves.
- */
-export function isBwrapFileMountPoint(p: string): boolean {
-  try {
-    const stat = fs.lstatSync(p)
-    return (
-      stat.isFile() &&
-      stat.size === 0 &&
-      (stat.mode & 0o222) === 0 &&
-      stat.nlink === 1 &&
-      stat.uid === process.getuid?.()
-    )
-  } catch {
-    return false
+/** {@link kindOfMountPoint}, throwing what the look at `p` throws. */
+function shapeOf(p: string): 'file' | 'directory' | undefined {
+  const stat = fs.lstatSync(p)
+  if (stat.uid !== process.getuid?.()) {
+    return undefined
   }
+  if (stat.isDirectory()) {
+    return 'directory'
+  }
+  return stat.isFile() && stat.size === 0 && stat.nlink === 1
+    ? 'file'
+    : undefined
 }
 
 /**
- * What kind of mount point the path a live manifest names still is, by what is
- * there now: an empty regular file, a directory, or neither any more.
+ * What kind of mount point `p` can still be, by what is there now: an empty
+ * regular file (not a link) under one name, or a directory, and the user's;
+ * `undefined` for anything else. A manifest is only a claim about a path, so
+ * nothing is covered, spared or removed on its word that does not look like
+ * what bubblewrap leaves; and the look proves nothing without a manifest.
+ *
+ * Not by its mode: bubblewrap makes the file 0444 from 0.5.0 and 0666 less the
+ * umask before, and one taken for the user's own on its write bits is never
+ * removed.
  */
 export function kindOfMountPoint(p: string): 'file' | 'directory' | undefined {
   try {
-    const stat = fs.lstatSync(p)
-    if (stat.isFile() && stat.size === 0) {
-      return 'file'
-    }
-    return stat.isDirectory() ? 'directory' : undefined
+    return shapeOf(p)
   } catch {
     return undefined
   }
@@ -996,41 +717,29 @@ export function kindOfMountPoint(p: string): 'file' | 'directory' | undefined {
  */
 function removeMountPoint(mountPoint: string): Removal {
   try {
-    if (isBwrapFileMountPoint(mountPoint)) {
-      fs.unlinkSync(mountPoint)
+    const kind = shapeOf(mountPoint)
+    if (kind === undefined) {
       logForDebugging(
-        `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+        `[Sandbox Linux] Left a path a manifest names where it is, it no longer looks like a bwrap mount point: ${mountPoint}`,
       )
-      return 'removed'
+      return 'left'
     }
-    const stat = fs.lstatSync(mountPoint)
-    if (stat.isDirectory() && stat.uid === process.getuid?.()) {
+    if (kind === 'file') {
+      fs.unlinkSync(mountPoint)
+    } else {
       if (fs.readdirSync(mountPoint).length > 0) {
-        logForDebugging(
-          `[Sandbox Linux] Left a bwrap mount point directory behind, something has written into it: ${mountPoint}`,
-        )
-        return 'left'
+        return 'occupied'
       }
       // rmdir, not a recursive remove: it neither follows a symlink nor
       // descends, so a path that is no longer ours is left exactly as found.
       fs.rmdirSync(mountPoint)
-      logForDebugging(
-        `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
-      )
-      return 'removed'
     }
     logForDebugging(
-      `[Sandbox Linux] Left a path a manifest names where it is, it no longer looks like a bwrap mount point: ${mountPoint}`,
+      `[Sandbox Linux] Cleaned up bwrap mount point (${kind}): ${mountPoint}`,
     )
-    return 'left'
+    return 'removed'
   } catch (e) {
-    if (meansNothingToRemove(e)) {
-      return 'left'
-    }
-    logForDebugging(
-      `[Sandbox Linux] Could not remove a bwrap mount point (${String(e)}): ${mountPoint}`,
-    )
-    return 'failed'
+    return afterFailedRemoval(e, `the bwrap mount point ${mountPoint}`)
   }
 }
 
@@ -1038,150 +747,300 @@ function removeMountPoint(mountPoint: string): Removal {
 export type MountPointManifest = {
   /** The directory to bind read-only inside the sandbox. */
   dir: string
-  /** The manifest, for bubblewrap's --lock-file. */
+  /** The manifest, for bubblewrap to bind before it makes a mount point. */
   file: string
+  /** Its started record, for the command line to append to before bubblewrap. */
+  started: string
 }
 
 /**
  * Record the mount points this wrap relies on, and the empty directories they
- * bind from, before the sandbox can start, and say where to point bubblewrap's
- * --lock-file.
+ * bind from, before the sandbox can start.
  *
  * `undefined` when there is nothing to record or no manifest could be written.
- * The caller must then not track those mount points: what this process cannot
- * record it does not remove, and nobody else will.
+ * What could not be recorded is kept in memory and removed at this process's
+ * own clean-up, since no other process will know of it. `too-large`, with
+ * nothing written or kept, for one its own reader would refuse: every pass of
+ * every process would turn back at it.
  */
 export function publishMountPointManifest(
   mountPoints: readonly string[],
   sources: readonly string[],
   commandKey?: string,
-): MountPointManifest | undefined {
+): MountPointManifest | 'too-large' | undefined {
   if (!onLinux() || (mountPoints.length === 0 && sources.length === 0)) {
     return undefined
   }
   const dir = ensureManifestDirectory()
-  if (dir === undefined) {
-    return undefined
-  }
-  const file = path.join(
-    dir,
-    `${process.pid}-${randomBytes(8).toString('hex')}${MANIFEST_SUFFIX}`,
-  )
-  const temporary = `${file}${TEMPORARY_SUFFIX}`
-  const body: z.infer<typeof ManifestSchema> = {
-    version: MANIFEST_VERSION,
-    pid: process.pid,
-    start: processStartTime(process.pid) ?? '',
-    ns: ownPidNamespace(),
-    created: Date.now(),
-    paths: [...new Set(mountPoints)],
-    sources: [...new Set(sources)],
-  }
-  // Written beside the manifest and renamed onto it, so a collect reads it
-  // whole or not at all. Under the directory lock where that can be had; a wrap
-  // is not refused for want of one, because every pass lists the directory
-  // again before it removes anything (see collectUnderLock).
-  try {
-    fs.writeFileSync(temporary, JSON.stringify(body), { mode: 0o600 })
-    const publish = (): void => fs.renameSync(temporary, file)
-    if (!withDirectoryLock(dir, publish).ran) {
-      publish()
-    }
-  } catch (e) {
-    try {
-      fs.unlinkSync(temporary)
-    } catch {
-      // Never made.
-    }
-    logForDebugging(
-      `[Sandbox Linux] Could not record the mount points this command relies on (${String(e)}) - they are left on the host`,
-      { level: 'warn' },
+  if (dir !== undefined) {
+    const id = path.join(
+      dir,
+      `${process.pid}-${randomBytes(8).toString('hex')}`,
     )
-    return undefined
+    const file = `${id}${MANIFEST_SUFFIX}`
+    const temporary = `${file}${TEMPORARY_SUFFIX}`
+    const body: z.infer<typeof ManifestSchema> = {
+      version: MANIFEST_VERSION,
+      ...ownProcess(),
+      ns: ownPidNamespace(),
+      created: Date.now(),
+      paths: [...new Set(mountPoints)],
+      sources: [...new Set(sources)],
+    }
+    const text = JSON.stringify(body)
+    if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES) {
+      return 'too-large'
+    }
+    // Written beside the manifest and renamed onto it, so that it is read whole
+    // or not at all.
+    try {
+      fs.writeFileSync(temporary, text, { mode: 0o600 })
+      fs.renameSync(temporary, file)
+      ownManifests.set(file, { commandKey, over: false })
+      return { dir, file, started: `${id}${STARTED_SUFFIX}` }
+    } catch (e) {
+      try {
+        fs.unlinkSync(temporary)
+      } catch {
+        // Never made.
+      }
+      logForDebugging(
+        `[Sandbox Linux] Could not record the mount points this command relies on (${String(e)}) - they are kept in memory and removed at this process's own clean-up`,
+        { level: 'warn' },
+      )
+    }
   }
-  ownManifests.set(file, { commandKey, over: false })
-  return { dir, file }
+  for (const mountPoint of mountPoints) unrecorded.paths.add(mountPoint)
+  for (const source of sources) unrecorded.sources.add(source)
+  return undefined
 }
 
 /**
- * Drop the manifest of a wrap that never produced a command. No sandbox can
- * hold its lock, so the mount points it named are no one's.
+ * Let go of the manifest of a wrap that produced no command: released, and
+ * collected by a pass like any other. Not unlinked: a pass elsewhere may have
+ * spared a path on its word and dropped the manifest that named the path till
+ * then, and what nothing names any more stays on the host for good.
  */
 export function discardMountPointManifest(file: string): void {
-  ownManifests.delete(file)
+  const own = ownManifests.get(file)
+  if (own !== undefined) own.over = true
+  collectMountPoints('none')
+}
+
+function drop(file: string): boolean {
   try {
     fs.unlinkSync(file)
+    return true
   } catch {
-    // Collected already.
+    // Gone already, or not a file.
+    return false
   }
 }
 
-/**
- * The path of every file in `dirs`. A directory that cannot be listed adds
- * nothing.
- */
-function filesIn(dirs: readonly string[]): string[] {
-  return dirs.flatMap(dir => {
-    try {
-      return fs.readdirSync(dir).map(name => path.join(dir, name))
-    } catch {
-      return []
-    }
-  })
+/** One reading of a manifest directory. */
+type Reading = {
+  /** Every name in it. */
+  names: string[]
+  /** The manifests that could be read, claimed ones among them. */
+  manifests: Manifest[]
+  /**
+   * Why a sandbox may be running on paths that this reading cannot list, if one
+   * may: nothing may then be removed on it.
+   */
+  inDoubt?: string
+  /** All that doubt is, is that manifests kept moving while they were read. */
+  keptChanging?: boolean
+  /** What is there and is of no use to anybody any more. */
+  spent: string[]
 }
 
 /**
- * The mount points the manifests name, on one reading of every directory this
- * process believes (see {@link believedManifestDirectories}): `live` by a
- * manifest whose sandbox may still be running, `named` by any manifest. What
- * only a finished manifest names is a leftover the next pass removes.
+ * Reads the manifests in `dir`, every one that the listing showed.
  *
- * `live` is empty when /proc/locks cannot be read, and a directory that cannot
- * be listed adds to neither: a wrap takes a path for a mount point on a
- * manifest's word only, so with none to read it takes every existing path for
- * the caller's own.
+ * A pass renames a manifest to claim it and to give it back, which can hide it
+ * from a listing under way and from the open that follows one, and one published
+ * while the directory is listed can be missed with its record shown. A record is
+ * never renamed. So the reading starts over for a listed manifest that is gone
+ * when opened, and for a record with no manifest listed beside it whose manifest
+ * is there when asked for by name.
+ *
+ * A record with no manifest at either name puts the reading in doubt only while
+ * a process on it runs (see {@link recordVouches}) and is spent otherwise, one
+ * with no whole line past {@link MANIFEST_GRACE_MS} (its shell may be about to
+ * write to it).
+ *
+ * Whatever is at a manifest's name and cannot be read puts the reading in doubt
+ * too: always where that is an error of the moment (a sandboxed command can use
+ * up what this user may open), and where it is what is there that cannot be
+ * read as a manifest, while a process on its record runs or it is younger than
+ * {@link UNREADABLE_MANIFEST_MAX_AGE_MS}.
  */
-export function namedMountPoints(): { live: Set<string>; named: Set<string> } {
-  const live = new Set<string>()
-  const named = new Set<string>()
-  if (!onLinux()) {
-    return { live, named }
+function readManifests(dir: string): Reading {
+  const olderThan = (file: string, ms: number): boolean => {
+    try {
+      return Date.now() - fs.lstatSync(file).mtimeMs > ms
+    } catch {
+      return false
+    }
   }
-  ensureManifestDirectory()
-  const dirs = believedManifestDirectories()
-  const locks = dirs.length > 0 ? readLocks(dirs) : undefined
-  for (const file of filesIn(dirs)) {
-    if (!file.endsWith(MANIFEST_SUFFIX)) continue
-    const manifest = readManifest(file)
-    if (manifest === undefined) continue
-    const isLiveOne = locks !== undefined && isLive(manifest, locks)
-    for (const mountPoint of manifest.paths) {
-      named.add(mountPoint)
-      if (isLiveOne) {
-        live.add(mountPoint)
+  // What cannot be asked after counts as there.
+  const isThere = (file: string): boolean => {
+    try {
+      fs.lstatSync(file)
+      return true
+    } catch (e) {
+      return !isAbsenceErrno(e)
+    }
+  }
+  for (let attempt = 1; ; attempt++) {
+    let names: string[]
+    try {
+      names = fs.readdirSync(dir)
+    } catch (e) {
+      return { names: [], manifests: [], spent: [], inDoubt: String(e) }
+    }
+    const reading: Reading = { names, manifests: [], spent: [] }
+    const listed = new Set<string>()
+    let moved = false
+    for (const name of names) {
+      if (!name.endsWith(MANIFEST_SUFFIX) && !name.endsWith(CLAIMED_SUFFIX)) {
+        continue
+      }
+      const file = path.join(dir, name)
+      listed.add(idOf(file))
+      try {
+        const manifest = readManifest(file)
+        if (manifest !== undefined) reading.manifests.push(manifest)
+        else moved = true
+      } catch (e) {
+        if (
+          e instanceof NotOurs &&
+          recordVouches(`${idOf(file)}${STARTED_SUFFIX}`, true) !== true &&
+          olderThan(file, UNREADABLE_MANIFEST_MAX_AGE_MS)
+        ) {
+          reading.spent.push(file)
+        } else {
+          const why = e instanceof Error ? e.message : String(e)
+          reading.inDoubt ??= why.includes(file) ? why : `${file}: ${why}`
+        }
       }
     }
+    for (const name of names) {
+      const file = path.join(dir, name)
+      if (name.endsWith(TEMPORARY_SUFFIX)) {
+        // Left by a process killed between writing and moving into place.
+        if (olderThan(file, UNREADABLE_MANIFEST_MAX_AGE_MS)) {
+          reading.spent.push(file)
+        }
+      } else if (name.endsWith(STARTED_SUFFIX) && !listed.has(idOf(file))) {
+        // Asked for at its own name first, and the record read last. Only a
+        // claim given back can then pass between the two names unseen, and a
+        // pass gives back only once it has found a process on the record,
+        // which the read below finds too.
+        if (
+          isThere(`${idOf(file)}${MANIFEST_SUFFIX}`) ||
+          isThere(`${idOf(file)}${CLAIMED_SUFFIX}`)
+        ) {
+          moved = true
+          continue
+        }
+        const vouched = recordVouches(file, true)
+        if (vouched === true) {
+          reading.inDoubt ??= `${file} has no manifest, and a process on it may be running`
+        } else if (vouched === false || olderThan(file, MANIFEST_GRACE_MS)) {
+          reading.spent.push(file)
+        }
+      }
+    }
+    if (moved && attempt < LISTING_ATTEMPTS) {
+      continue
+    }
+    if (moved) {
+      reading.keptChanging = reading.inDoubt === undefined
+      reading.inDoubt ??= `${dir} kept changing`
+    }
+    return reading
   }
-  return { live, named }
+}
+
+/** What the manifests name, on one reading, and what that reading listed. */
+export type NamedMountPoints = {
+  paths: ReadonlySet<string>
+  listed: ReadonlySet<string>
+}
+
+/**
+ * The mount points that any manifest names, a finished or claimed one included
+ * (what only those name is a leftover the next pass removes), and what this
+ * process could record nowhere. Makes nothing on the host.
+ *
+ * `inDoubt`, which says what could not be read and why, where the reading is in
+ * doubt: a path it does not name may then be a running sandbox's mount point
+ * all the same, and a wrap that took it for the caller's own would not name it
+ * and would lose it under its own sandbox. With `keptChanging`, only because
+ * other processes are busy in the directory: the next reading may do.
+ *
+ * `earlier` is a reading this call may answer with. A manifest is never
+ * rewritten, so it still holds when the directory lists nothing it did not,
+ * `own` (a manifest the caller has published since) apart.
+ */
+export function namedMountPoints(
+  earlier?: NamedMountPoints,
+  own?: string,
+): NamedMountPoints | { inDoubt: string; keptChanging?: boolean } {
+  try {
+    const dir = onLinux() ? existingManifestDirectory() : undefined
+    if (dir === undefined) {
+      return { paths: new Set(unrecorded.paths), listed: new Set() }
+    }
+    if (
+      earlier !== undefined &&
+      fs
+        .readdirSync(dir)
+        .every(n => earlier.listed.has(n) || path.join(dir, n) === own)
+    ) {
+      return earlier
+    }
+    const reading = readManifests(dir)
+    if (reading.inDoubt !== undefined) {
+      return { inDoubt: reading.inDoubt, keptChanging: reading.keptChanging }
+    }
+    return {
+      paths: new Set([
+        ...unrecorded.paths,
+        ...reading.manifests.flatMap(manifest => manifest.paths),
+      ]),
+      listed: new Set(reading.names),
+    }
+  } catch (e) {
+    // The directory cannot be looked at, or listed.
+    return { inDoubt: String(e) }
+  }
+}
+
+/**
+ * The directory this process keeps its manifests in, if it exists already.
+ * Makes and settles nothing: for a look that must leave the host as found.
+ * Throws where it cannot tell.
+ */
+function existingManifestDirectory(): string | undefined {
+  return [manifestDirectory, ...sharedManifestDirectoryNames()].find(
+    dir => dir !== undefined && isOurPrivateDirectory(dir, true),
+  )
 }
 
 /**
  * Whether `p` is still something a clean-up would remove on a manifest's word:
- * the empty file bubblewrap made, or an empty directory of the user's.
+ * an empty file or an empty directory. One that cannot be looked at may be.
  */
 function isEmptyMountPoint(p: string): boolean {
-  if (isBwrapFileMountPoint(p)) {
-    return true
-  }
   try {
-    const stat = fs.lstatSync(p)
-    return (
-      stat.isDirectory() &&
-      stat.uid === process.getuid?.() &&
-      fs.readdirSync(p).length === 0
-    )
-  } catch {
-    return false
+    const kind = shapeOf(p)
+    return kind === 'directory'
+      ? fs.readdirSync(p).length === 0
+      : kind === 'file'
+  } catch (e) {
+    return !isAbsenceErrno(e)
   }
 }
 
@@ -1191,66 +1050,55 @@ function isEmptyMountPoint(p: string): boolean {
  * its own accord after a command: removing a mount point from under a running
  * sandbox lifts the deny there.
  *
- * A snapshot, taken without a lock, that may be out of date by the time the
- * caller acts. Its only safe use is to SKIP a removal; a path not being in it
- * never means the path is free to write.
+ * `undefined` when it cannot tell: the manifest directory, its listing, a
+ * manifest or a record without a manifest cannot be read or accounted for, so a
+ * sandbox may be running on paths that cannot be listed. The caller must then
+ * skip every removal of an empty file or an empty directory. It does not throw.
+ *
+ * A snapshot that may be out of date by the time the caller acts. Its only safe
+ * use is to SKIP a removal; a path not being in it never means the path is free
+ * to write.
  *
  * A path is in the set only when both hold:
  *
- * - a manifest names it, and that manifest is live by the clean-up's rule or
- *   its liveness cannot be told (/proc/locks unreadable, or an unreadable
- *   manifest that is locked or new), in which case every named path counts;
- * - what is at the path now is still an empty placeholder: an empty regular
- *   file with no write bit and one link, or an empty directory, and the user's.
- *   So a stale or forged manifest never makes a caller spare a file with
- *   content.
+ * - a manifest names it that is live by the clean-up's rule, or this process
+ *   could record it nowhere;
+ * - what is at the path now is still an empty placeholder, or cannot be looked
+ *   at: an empty regular file of any mode with one link, or an empty directory,
+ *   and the user's. So a stale or forged manifest never makes a caller spare a
+ *   file with content.
  *
  * Paths are as the wraps recorded them: absolute, links above the last
- * component resolved. It answers for every manifest directory this process
- * believes (see {@link believedManifestDirectories}), so a sandbox whose
- * process keeps manifests elsewhere is not seen. Makes nothing on the host.
- * Empty off Linux and where no manifest directory exists.
+ * component resolved. It answers for one manifest directory, the one this
+ * process uses or, before its first wrap, the first shared name that exists, so
+ * a sandbox whose process keeps manifests elsewhere is not seen. Makes nothing
+ * on the host. Empty off Linux.
  */
-export function liveMountPoints(): ReadonlySet<string> {
+export function liveMountPoints(): ReadonlySet<string> | undefined {
   const spared = new Set<string>()
-  const dirs = onLinux() ? believedManifestDirectories() : []
-  if (dirs.length === 0) {
+  if (!onLinux()) {
     return spared
   }
-  const locks = readLocks(dirs)
-  const live = new Set<string>()
-  const named = new Set<string>()
-  let cannotTell = locks === undefined
-  for (const file of filesIn(dirs)) {
-    if (!file.endsWith(MANIFEST_SUFFIX)) continue
-    const manifest = readManifest(file)
-    if (manifest === undefined) {
-      // Gone since the listing, or not to be read: held to what the clean-up
-      // holds it to.
-      try {
-        const stat = fs.statSync(file, { bigint: true })
-        cannotTell ||=
-          locks === undefined ||
-          holdsLock(locks, {
-            file,
-            inode: String(stat.ino),
-            device: deviceOf(stat.dev),
-          }) ||
-          Date.now() - Number(stat.mtimeMs) < MANIFEST_GRACE_MS
-      } catch {
-        // Gone.
-      }
-      continue
+  const named = new Set(unrecorded.paths)
+  try {
+    const dir = existingManifestDirectory()
+    const reading = dir === undefined ? undefined : readManifests(dir)
+    if (reading?.inDoubt !== undefined) {
+      throw new Error(reading.inDoubt)
     }
-    const isLiveOne = locks !== undefined && isLive(manifest, locks)
-    for (const mountPoint of manifest.paths) {
-      named.add(mountPoint)
-      if (isLiveOne) {
-        live.add(mountPoint)
+    for (const manifest of reading?.manifests ?? []) {
+      if (isLive(manifest)) {
+        for (const mountPoint of manifest.paths) named.add(mountPoint)
       }
     }
+  } catch (e) {
+    logForDebugging(
+      `[Sandbox Linux] Which mount points are live cannot be told (${String(e)})`,
+      { level: 'warn' },
+    )
+    return undefined
   }
-  for (const mountPoint of cannotTell ? named : live) {
+  for (const mountPoint of named) {
     if (isEmptyMountPoint(mountPoint)) {
       spared.add(mountPoint)
     }
@@ -1263,10 +1111,6 @@ export function liveMountPoints(): ReadonlySet<string> {
  * over, and remove every mount point no live manifest names, from any process,
  * at any time, any number of times. Returns the mount points removed. Does
  * nothing anywhere but on Linux.
- *
- * One pass for each directory this process believes, under that directory's
- * lock: a pass removes what the finished manifests of its own directory name,
- * and goes by the manifests of every directory for what is still relied on.
  */
 export function collectMountPoints(
   release: OwnManifestRelease = 'all',
@@ -1284,300 +1128,208 @@ export function collectMountPoints(
       own.over = true
     }
   }
-  ensureManifestDirectory()
-  const dirs = believedManifestDirectories()
+  const dir = ensureManifestDirectory()
+  if (dir !== undefined) {
+    return collect(dir, release === 'all')
+  }
   const removed: string[] = []
-  for (const dir of dirs) {
-    const collected = withDirectoryLock(dir, () => collectUnderLock(dir, dirs))
-    if (collected.ran) {
-      removed.push(...collected.value)
-      continue
+  if (release === 'all') {
+    for (const mountPoint of childrenFirst(unrecorded.paths)) {
+      if (removeMountPoint(mountPoint) === 'removed') removed.push(mountPoint)
     }
-    logForDebugging(
-      collected.held
-        ? `[Sandbox Linux] The lock on the mount point directory could not be had, leaving this pass to whoever has it: ${dir}`
-        : `[Sandbox Linux] No lock can be taken on the mount point directory from here, so nothing is collected from it until that is put right: ${dir}`,
-    )
+    for (const source of unrecorded.sources) {
+      if (removeMountSource(source) === 'removed') removed.push(source)
+    }
+    unrecorded.paths.clear()
+    unrecorded.sources.clear()
   }
   return removed
 }
 
+/** A path sorts after the directories it is in: a directory goes empty. */
+const childrenFirst = (paths: Iterable<string>): string[] =>
+  [...paths].sort().reverse()
+
 /**
- * One pass over `dir`, made under that directory's lock where the caller could
- * take it. `dirs` is every directory this process believes, `dir` among them: a
- * mount point stays while a live manifest in any of them names it, and what is
- * removed is what the finished manifests of `dir` name.
+ * One pass over a manifest directory. It takes no lock and waits for nothing;
+ * any number may run at once, over the same claims.
  *
- * A manifest is all that names its mount points, so it is removed last, and
- * only when every path it names is gone or is no longer a mount point: a pass
- * that turns back, or a removal that is refused, leaves it for a later pass.
- * Manifests the caller has said are over are judged as if their writer were
- * gone.
+ * INVARIANT: a path is removed only when every manifest that names it is
+ * claimed and has no process on its record, by a reading made after the claims.
+ * bubblewrap binds the manifest before it makes a mount point, so a start under
+ * a claimed manifest is refused, and a sandbox that got past the claim wrote
+ * its record first: every reading after the claim finds it. A manifest at its
+ * own name keeps what it names, live or not, since a start under it can succeed
+ * at any moment. Acting on a reading made before the claims would remove a
+ * mount point from under a sandbox that started in between.
  *
- * The lock does not exclude (see {@link withDirectoryLock}), so before the
- * first removal, and again at {@link LISTING_GOOD_FOR_MS}, the pass lists every
- * directory again: a manifest that was not there at first keeps everything it
- * names, which is how a sandbox about to start on the same path shows. And
- * every {@link REMOVALS_PER_LOOK} removals or {@link LOCKS_GOOD_FOR_MS} it
- * reads /proc/locks again: a manifest locked since keeps what it names. What
- * remains is a pass held up between a look and the removal for longer than a
- * sandbox takes to reach its binds; it then removes that sandbox's mount point.
+ * A pass gives back the claims it made itself, and only when that reading finds
+ * a process on the record. So what remains is a manifest that comes to its own
+ * name after the reading, published or given back, whose sandbox reaches its
+ * bind on a path a claimed manifest names too. The directory is listed again
+ * before every removal (in a pass of over {@link
+ * LISTS_BEFORE_EACH_REMOVAL_UP_TO} candidates, whenever the listing is {@link
+ * LISTING_GOOD_FOR_MS} old), and what has come to its name keeps what it names,
+ * so the pass would have to be held up between a listing and the removal that
+ * follows it for as long as a sandbox takes to start (for a directory a wrap
+ * only relies on: until that wrap, having published, has looked at it again,
+ * and its command is then refused its start).
+ *
+ * A manifest is all that names its mount points, so its claim is dropped last,
+ * and stays, for a later pass, when the pass turns back, a removal is refused,
+ * or a directory holds what another manifest names. Only content that no
+ * manifest names makes a directory nobody's.
  */
-function collectUnderLock(dir: string, dirs: readonly string[]): string[] {
-  // Every file in every directory, or nothing: a directory that is believed
-  // and cannot be listed may hold the manifest of a running sandbox.
-  const listEveryDirectory = (): string[] =>
-    dirs.flatMap(each =>
-      fs.readdirSync(each).map(name => path.join(each, name)),
-    )
-  const isHere = (file: string): boolean => path.dirname(file) === dir
-  let files: string[]
-  try {
-    files = listEveryDirectory()
-  } catch (e) {
+function collect(dir: string, unrecordedToo: boolean): string[] {
+  const before = readManifests(dir)
+  before.spent.forEach(drop)
+  const own = new Set<string>()
+  let claims = false
+  if (before.inDoubt === undefined) {
+    // Forget own manifests that something else has removed.
+    const there = new Set(before.names.map(name => idOf(path.join(dir, name))))
+    for (const file of ownManifests.keys()) {
+      if (path.dirname(file) === dir && !there.has(idOf(file))) {
+        ownManifests.delete(file)
+      }
+    }
+    for (const manifest of before.manifests) {
+      if (!manifest.claimed && !isLive(manifest)) {
+        const claim = `${idOf(manifest.file)}${CLAIMED_SUFFIX}`
+        try {
+          fs.renameSync(manifest.file, claim)
+          own.add(claim)
+        } catch {
+          // Another pass has it.
+        }
+      }
+      claims ||= manifest.claimed || own.size > 0
+    }
+  }
+  const reading = claims ? readManifests(dir) : before
+  if (reading.inDoubt !== undefined) {
     logForDebugging(
-      `[Sandbox Linux] The mount point manifests could not be listed (${String(e)}) - nothing removed`,
+      `[Sandbox Linux] A sandbox may be running on mount points that cannot be listed - leaving every mount point where it is (${reading.inDoubt})`,
       { level: 'warn' },
     )
     return []
   }
-  const manifests: Manifest[] = []
-  const unreadable: string[] = []
-  for (const file of files) {
-    if (!file.endsWith(MANIFEST_SUFFIX)) continue
-    const manifest = readManifest(file)
-    if (manifest === undefined) {
-      unreadable.push(file)
-    } else {
-      manifests.push(manifest)
-    }
-  }
-  const locks = readLocks(dirs)
-  if (locks === undefined) {
-    return []
-  }
-  // The first listing: whatever is found later is a newcomer.
-  const known = new Set(files)
-  // Forget own manifests that something else has removed.
-  for (const file of ownManifests.keys()) {
-    if (isHere(file) && !known.has(file)) {
-      ownManifests.delete(file)
-    }
-  }
 
-  // An unreadable manifest names mount points that cannot be honoured one by
-  // one. While it is locked, or new enough that a sandbox may be starting,
-  // nothing at all is removed.
-  let unreadableIsLive = false
-  for (const file of unreadable) {
-    let stat: fs.BigIntStats
-    try {
-      stat = fs.statSync(file, { bigint: true })
-    } catch {
+  const kept = new Set<string>()
+  const keep = (manifest: Manifest): void => {
+    for (const named of [...manifest.paths, ...manifest.sources]) {
+      kept.add(named)
+    }
+  }
+  const finished: Manifest[] = []
+  for (const manifest of reading.manifests) {
+    if (manifest.claimed && !isLive(manifest)) {
+      finished.push(manifest)
       continue
     }
-    const age = Date.now() - Number(stat.mtimeMs)
-    if (
-      holdsLock(locks, {
-        file,
-        inode: String(stat.ino),
-        device: deviceOf(stat.dev),
-      }) ||
-      age < MANIFEST_GRACE_MS
-    ) {
-      unreadableIsLive = true
-    } else if (isHere(file) && age > UNREADABLE_MANIFEST_MAX_AGE_MS) {
+    keep(manifest)
+    if (own.has(manifest.file)) {
       try {
-        fs.unlinkSync(file)
+        fs.renameSync(manifest.file, `${idOf(manifest.file)}${MANIFEST_SUFFIX}`)
       } catch {
-        // Gone already.
+        // Stays claimed, and kept while a process on its record runs.
       }
     }
   }
-  if (unreadableIsLive) {
-    logForDebugging(
-      '[Sandbox Linux] A mount point manifest a sandbox is running under could not be read - leaving every mount point where it is',
-      { level: 'warn' },
-    )
-    return []
-  }
 
-  // What a process killed between writing a file and moving it into place
-  // left. Nothing reads these, and nothing else removes them.
-  for (const file of files) {
-    if (!isHere(file) || !file.endsWith(TEMPORARY_SUFFIX)) continue
-    try {
-      if (
-        Date.now() - fs.lstatSync(file).mtimeMs >
-        UNREADABLE_MANIFEST_MAX_AGE_MS
-      ) {
-        fs.unlinkSync(file)
-      }
-    } catch {
-      // Moved into place, or removed by its writer, in the meantime.
-    }
-  }
-
-  // Over, by the caller's word, unless a sandbox still holds the lock.
-  for (const manifest of manifests) {
-    manifest.released =
-      ownManifests.get(manifest.file)?.over === true &&
-      !holdsLock(locks, manifest)
-  }
-
-  const finished: Manifest[] = []
-  const claimed = new Set<string>()
-  const claim = (manifest: Manifest): void => {
-    for (const named of [...manifest.paths, ...manifest.sources]) {
-      claimed.add(named)
-    }
-  }
-  for (const manifest of manifests) {
-    if (isLive(manifest, locks)) {
-      claim(manifest)
-    } else {
-      finished.push(manifest)
-    }
-  }
-  // Each path once, and as a mount point where a manifest names it as one. Only
-  // what the finished manifests of this directory name.
+  // Each path once, and as a mount point where a manifest names it as one.
   const candidates = new Map<string, boolean>()
-  for (const manifest of finished) {
-    if (!isHere(manifest.file)) continue
+  for (const manifest of unrecordedToo ? [...finished, unrecorded] : finished) {
     for (const mountPoint of manifest.paths) {
-      if (!claimed.has(mountPoint)) {
-        candidates.set(mountPoint, false)
-      }
+      candidates.set(mountPoint, false)
     }
     for (const source of manifest.sources) {
-      if (!claimed.has(source) && !candidates.has(source)) {
+      if (!candidates.has(source)) {
         candidates.set(source, true)
       }
     }
   }
-
-  // `revived`: manifests that read as finished at first and as locked on a
-  // later look. Only the lock can change; a gone writer does not come back.
-  const revived = new Set<Manifest>()
-  let removalsOnThisLook = 0
-  let lookedAt: number | undefined
-  let listedAt: number | undefined
-  const locksAreFresh = (): boolean =>
-    lookedAt !== undefined &&
-    removalsOnThisLook < REMOVALS_PER_LOOK &&
-    performance.now() - lookedAt < LOCKS_GOOD_FOR_MS
-  const listingIsFresh = (): boolean =>
-    listedAt !== undefined && performance.now() - listedAt < LISTING_GOOD_FOR_MS
-  const readTheLocksAgain = (): boolean => {
-    const locksNow = readLocks(dirs)
-    if (locksNow === undefined) {
-      return false
-    }
-    for (const manifest of finished) {
-      if (!revived.has(manifest) && holdsLock(locksNow, manifest)) {
-        revived.add(manifest)
-        claim(manifest)
-      }
-    }
-    removalsOnThisLook = 0
-    lookedAt = performance.now()
-    return true
-  }
-  const listTheDirectoryAgain = (): boolean => {
-    let filesNow: string[]
+  const known = new Set(reading.names)
+  const goodFor =
+    candidates.size <= LISTS_BEFORE_EACH_REMOVAL_UP_TO ? 0 : LISTING_GOOD_FOR_MS
+  let listedAt = -Infinity
+  const newcomersKeepWhatTheyName = (): boolean => {
     try {
-      filesNow = listEveryDirectory()
-    } catch {
-      return false
-    }
-    for (const file of filesNow) {
-      if (!file.endsWith(MANIFEST_SUFFIX) || known.has(file)) continue
-      known.add(file)
-      const arrived = readManifest(file)
-      if (arrived !== undefined) {
-        // Published since the pass began: a sandbox is about to start under
-        // it, or has. Whatever it names stays, with no further question.
-        claim(arrived)
-      } else if (fs.existsSync(file)) {
-        // There, and not to be read: what it names cannot be kept path by
-        // path, so everything is.
-        logForDebugging(
-          `[Sandbox Linux] A mount point manifest that appeared during the pass could not be read - leaving the rest where it is: ${file}`,
-          { level: 'warn' },
-        )
-        return false
+      for (const name of fs.readdirSync(dir)) {
+        if (known.has(name) || !name.endsWith(MANIFEST_SUFFIX)) continue
+        // Published, or given back, since the reading. One that is gone again
+        // is looked for the next time: it may be given back once more.
+        const arrived = readManifest(path.join(dir, name))
+        if (arrived === undefined) continue
+        keep(arrived)
+        known.add(name)
       }
+    } catch (e) {
+      logForDebugging(
+        `[Sandbox Linux] The mount point manifests could not be read again (${String(e)}) - leaving the rest where it is`,
+        { level: 'warn' },
+      )
+      return false
     }
     listedAt = performance.now()
     return true
   }
-  // Locks first, listing last: reading /proc/locks can take milliseconds, and a
-  // listing made before it would be out of date.
-  const mayStillRemove = (): boolean =>
-    (locksAreFresh() || readTheLocksAgain()) &&
-    (listingIsFresh() || listTheDirectoryAgain())
 
   const removed: string[] = []
   const notRemoved = new Set<string>()
-  for (const [candidate, isSource] of candidates) {
-    if (!mayStillRemove()) {
+  for (const candidate of childrenFirst(candidates.keys())) {
+    if (
+      performance.now() - listedAt >= goodFor &&
+      !newcomersKeepWhatTheyName()
+    ) {
       return removed
     }
-    if (claimed.has(candidate)) {
+    if (kept.has(candidate)) {
       continue
     }
-    const outcome = isSource
+    const outcome = candidates.get(candidate)
       ? removeMountSource(candidate)
       : removeMountPoint(candidate)
-    removalsOnThisLook++
     if (outcome === 'removed') {
       removed.push(candidate)
-    } else if (outcome === 'failed') {
+    } else if (
+      outcome === 'failed' ||
+      (outcome === 'occupied' &&
+        [...kept, ...notRemoved].some(p => p.startsWith(`${candidate}/`)))
+    ) {
       notRemoved.add(candidate)
     }
   }
-  // The manifests themselves, last. Only a lock taken since can speak for one
-  // of these; a manifest somebody else has published in the meantime cannot.
+  if (unrecordedToo) {
+    for (const named of [unrecorded.paths, unrecorded.sources]) {
+      for (const one of named) if (!notRemoved.has(one)) named.delete(one)
+    }
+  }
   for (const manifest of finished) {
-    if (!isHere(manifest.file)) continue
-    if (!locksAreFresh() && !readTheLocksAgain()) {
-      return removed
-    }
-    if (revived.has(manifest)) {
-      continue
-    }
     // A mount point that could not be removed from here is still somebody's to
-    // remove, and the manifest is all that says so.
+    // remove, and the manifest is all that says so. The record goes only with
+    // the claim: a manifest given back since may have a sandbox on its record.
     if (
-      [...manifest.paths, ...manifest.sources].some(named =>
+      ![...manifest.paths, ...manifest.sources].some(named =>
         notRemoved.has(named),
-      )
+      ) &&
+      drop(manifest.file)
     ) {
-      continue
+      drop(manifest.record)
+      ownManifests.delete(`${idOf(manifest.file)}${MANIFEST_SUFFIX}`)
     }
-    try {
-      fs.unlinkSync(manifest.file)
-    } catch {
-      // Collected by another process already.
-    }
-    ownManifests.delete(manifest.file)
-    removalsOnThisLook++
   }
   return removed
 }
 
 /**
- * Put directories of a test's own in the place of those the manifest
- * directories are looked for in (see {@link ManifestDirectoryPlaces}), or, with
- * nothing, put the real ones back. Test seam, and nothing else may call it: the
- * real places are shared with every other process of the user. A place that is
- * left out stays what it really is. Which directory the manifests are written
- * to is forgotten with it, so the next use works it out again.
+ * Forget which directory the manifests are kept in, and which PID namespace
+ * this is, so the next use works them out again. Test seam: a test gives itself
+ * a runtime directory of its own after this module may have settled on the real
+ * one.
  */
-export function setMountPointManifestPlacesForTesting(
-  places?: Partial<ManifestDirectoryPlaces>,
-): void {
-  placesForTesting = places
+export function forgetMountPointManifestDirectory(): void {
+  pidNamespace = null
   manifestDirectory = undefined
   manifestDirectoryIsPrivate = false
   manifestDirectoryUnavailable = false

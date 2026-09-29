@@ -1,294 +1,122 @@
-import { afterAll, beforeAll } from 'bun:test'
+import { afterAll, afterEach, beforeAll } from 'bun:test'
 import {
-  chmodSync,
-  existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
-  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, extname, join } from 'node:path'
-import {
-  type ManifestDirectoryPlaces,
-  setMountPointManifestPlacesForTesting,
-} from '../../src/sandbox/bwrap-mount-manifests.js'
+import { join } from 'node:path'
+import { forgetMountPointManifestDirectory } from '../../src/sandbox/bwrap-mount-manifests.js'
 import { cleanupBwrapMountPoints } from '../../src/sandbox/linux-sandbox-utils.js'
 
-const REPOSITORY = join(import.meta.dir, '../..')
-const SEAM = join(REPOSITORY, 'src/sandbox/bwrap-mount-manifests.ts')
+/** Field 22 of a /proc/PID/stat line: when that process started. */
+const startOf = (stat: string): string | undefined =>
+  stat
+    .slice(stat.lastIndexOf(')') + 1)
+    .trim()
+    .split(' ')[19]
 
 /**
- * The manifests of every srt process of a user live in a few directories worked
- * out from the user id (`/run/user/UID/srt-mount-points`,
- * `/tmp/srt-mount-points-UID`) and after those in what the environment names.
- * Every wrap makes and binds them and every clean-up reads and removes what is
- * in them, so a test that used the real ones would act on whatever else the
- * user is running. No test looks there:
+ * Kills every bubblewrap that is still on a started record in `dir`, and its
+ * sandbox with it: a test that failed half way must not leave one polling. Then
+ * empties `dir`. Only bubblewrap: a test may put any process on a record, itself
+ * included.
+ */
+function endSandboxesOnRecord(dir: string): void {
+  const attempt = <T>(what: () => T): T | undefined => {
+    try {
+      return what()
+    } catch {
+      // No directory, no record, or the process is gone: nothing to end.
+      return undefined
+    }
+  }
+  for (const name of attempt(() => readdirSync(dir)) ?? []) {
+    const file = join(dir, name)
+    // A test may plant a FIFO there, and reading one waits for a writer.
+    if (
+      !name.endsWith('.started') ||
+      !attempt(() => lstatSync(file).isFile())
+    ) {
+      continue
+    }
+    const record = attempt(() => readFileSync(file, 'utf8')) ?? ''
+    for (const line of record.split('\n')) {
+      const pid = /^\d+/.exec(line)?.[0]
+      const now = attempt(() => readFileSync(`/proc/${pid}/stat`, 'utf8'))
+      if (now?.includes(' (bwrap) ') && startOf(now) === startOf(line)) {
+        attempt(() => process.kill(Number(pid), 'SIGKILL'))
+      }
+    }
+  }
+  for (const name of attempt(() => readdirSync(dir)) ?? []) {
+    attempt(() => rmSync(join(dir, name), { recursive: true, force: true }))
+  }
+}
+
+/**
+ * Gives the enclosing `describe` a runtime directory and a temp dir of its own,
+ * for as long as its tests run.
  *
- * - in the test process, directories of the test's own stand in for all four
- *   places ({@link isolateManifestDirectoriesForTheRun} for the run, {@link
- *   usePrivateManifestDirectory} for one `describe`);
- * - a child process that loads the library is given a module that puts the same
- *   stand-ins in place first ({@link isolatedModule}), and one that runs the
- *   command line tool a program that does ({@link isolatedProgram});
- * - a child process that is to work the directories out for itself runs in a
- *   mount namespace in which the stand-ins are bound over `/tmp` and
- *   `/run/user` ({@link inPrivateNamespace}).
- *
- * Off Linux the library keeps no manifest, nothing is replaced, and a child
- * process is given the module or the program itself.
- */
-type Places = ManifestDirectoryPlaces
-
-const onLinux = process.platform === 'linux'
-
-type PrivatePlaces = {
-  /** Holds the stand-ins, and what is made for child processes to load. */
-  base: string
-  places: Places
-}
-
-// Every base that was made and not removed yet, for the end of the run: a
-// `describe` that is skipped is read all the same, and never torn down.
-const bases = new Set<string>()
-
-/**
- * Directories of the caller's own to stand in for the four places. The runtime
- * directory is named after the user id under its parent, so the parent can be
- * bound over `/run/user`. Nothing stands in for `$XDG_RUNTIME_DIR`, and the
- * temp dir the environment names is the one that stands in for `/tmp`.
- */
-function makePlaces(): PrivatePlaces {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'srt-test-places-')))
-  bases.add(base)
-  const runtimeDir = join(base, 'run', String(process.getuid?.() ?? 0))
-  const tempDir = join(base, 'tmp')
-  mkdirSync(runtimeDir, { recursive: true })
-  chmodSync(runtimeDir, 0o700)
-  mkdirSync(tempDir)
-  chmodSync(tempDir, 0o1777)
-  return {
-    base,
-    places: {
-      runtimeDir,
-      tempDir,
-      environmentRuntimeDir: undefined,
-      environmentTempDir: tempDir,
-    },
-  }
-}
-
-function removePlaces(made: PrivatePlaces): void {
-  rmSync(made.base, { recursive: true, force: true })
-  bases.delete(made.base)
-}
-
-/** `places` as source text, with what is not set spelled out. */
-function sourceOf(places: Partial<Places>): string {
-  const fields = Object.entries(places).map(
-    ([name, value]) =>
-      `${name}: ${value === undefined ? 'undefined' : JSON.stringify(value)}`,
-  )
-  return `{ ${fields.join(', ')} }`
-}
-
-let filesMade = 0
-
-/**
- * A file for a child process to load in place of `target`, which puts `places`
- * in place and then is `target`: a module, which it gives again, or the command
- * line tool, which it runs. The stand-ins are in place before the child uses
- * what it loaded: a module's imports are evaluated before its own body, and the
- * body is the call to the seam; a program starts work as it is loaded, so it is
- * loaded after the call.
- */
-function isolatedFile(
-  made: PrivatePlaces,
-  target: string,
-  places: Partial<Places>,
-  kind: 'module' | 'program',
-): string {
-  const built = extname(target) !== '.ts'
-  const seam =
-    kind === 'module'
-      ? SEAM
-      : join(
-          dirname(target),
-          'sandbox',
-          `bwrap-mount-manifests${extname(target)}`,
-        )
-  const file = join(
-    made.base,
-    `isolated-${filesMade++}${built ? '.mjs' : '.ts'}`,
-  )
-  writeFileSync(
-    file,
-    [
-      `import { setMountPointManifestPlacesForTesting } from ${JSON.stringify(seam)}`,
-      `setMountPointManifestPlacesForTesting(${sourceOf(places)})`,
-      kind === 'module'
-        ? `export * from ${JSON.stringify(target)}`
-        : `await import(${JSON.stringify(target)})`,
-      '',
-    ].join('\n'),
-  )
-  return file
-}
-
-// What stands in for the real places in every test file of the run, which a
-// `describe` with stand-ins of its own puts back when it is done.
-let placesOfTheRun: PrivatePlaces | undefined
-
-/**
- * Puts stand-ins in place for the whole run, so no suite makes, binds or
- * collects in the user's real directories. The test runner's preload calls it
- * before any test file is loaded and removes the stand-ins after the last one
- * ({@link removeManifestDirectoriesOfTheRun}).
- */
-export function isolateManifestDirectoriesForTheRun(): void {
-  if (onLinux && placesOfTheRun === undefined) {
-    placesOfTheRun = makePlaces()
-    setMountPointManifestPlacesForTesting(placesOfTheRun.places)
-  }
-}
-
-/**
- * Removes every stand-in that is still there. They stay in place in the
- * module, so that nothing that still runs finds the real ones.
- */
-export function removeManifestDirectoriesOfTheRun(): void {
-  for (const left of bases) {
-    rmSync(left, { recursive: true, force: true })
-  }
-  bases.clear()
-}
-
-/** The stand-ins of the run, which are put in place if they were not. */
-function ofTheRun(): PrivatePlaces {
-  isolateManifestDirectoriesForTheRun()
-  return placesOfTheRun!
-}
-
-/**
- * The path of a module for a child process to load in place of `module`, with
- * the stand-ins of the run in place, or `places` instead. A place left out of
- * `places` is the real one for that child.
- */
-export function isolatedModule(
-  module: string,
-  places?: Partial<Places>,
-): string {
-  if (!onLinux) {
-    return module
-  }
-  const run = ofTheRun()
-  return isolatedFile(run, module, places ?? run.places, 'module')
-}
-
-/**
- * The path of a program for a child process to run in place of `program` (the
- * command line tool, from the sources or as built), with the stand-ins of the
- * run in place.
- */
-export function isolatedProgram(program: string): string {
-  if (!onLinux) {
-    return program
-  }
-  const run = ofTheRun()
-  return isolatedFile(run, program, run.places, 'program')
-}
-
-/**
- * The start of a command line that runs what follows it in a mount namespace of
- * its own, in which `places.tempDir` is bound over `/tmp` and the parent of
- * `places.runtimeDir` over `/run/user`: for a child process that is to work the
- * directories out for itself without reaching the real ones. Whatever is in
- * `keep` is bound back where it is, as are this repository and the runtime
- * where they lie under the real `/tmp`. No PID namespace, so `/proc/locks` and
- * its pids are the test's own. Needs a bubblewrap that can make a namespace
- * (see `bwrapCanNamespace`).
- */
-export function inPrivateNamespace(
-  places: Pick<Places, 'runtimeDir' | 'tempDir'>,
-  keep: readonly string[] = [],
-): string[] {
-  const needed = [REPOSITORY, dirname(process.execPath)].filter(dir =>
-    dir.startsWith('/tmp/'),
-  )
-  return [
-    'bwrap',
-    '--dev-bind',
-    '/',
-    '/',
-    '--bind',
-    places.tempDir,
-    '/tmp',
-    // Where there is no /run/user there is no runtime directory to reach.
-    ...(existsSync('/run/user')
-      ? ['--bind', dirname(places.runtimeDir), '/run/user']
-      : []),
-    ...[...needed, ...keep].flatMap(kept => ['--bind', kept, kept]),
-    '--',
-  ]
-}
-
-/**
- * Gives the enclosing `describe` directories of its own for the mount point
- * manifests, for as long as its tests run: a test that lists or attacks the
- * manifests needs to be the only one that writes there.
+ * The manifests of every srt process of a user live in one directory, and a
+ * collect reads, judges and removes all of them, so a test that lists or
+ * attacks that directory would otherwise act on whatever else the user is
+ * running. The library looks under `$XDG_RUNTIME_DIR` first, and every wrap
+ * that restricts writes makes the directory under the temp dir as well, so both
+ * are replaced, before anything is cleaned up: nothing is made or removed in
+ * the directories the user's own processes keep.
  *
  * It also starts the `describe` with no wrap of this process outstanding, and
  * leaves it so: the library's count of wraps is shared by every test file of a
- * run, and other suites wrap without cleaning up.
+ * run, and other suites wrap without cleaning up. After each test it ends
+ * whatever sandbox is still on record there and empties the directory, so no
+ * test finds what an earlier one left.
  *
- * Call it inside the `describe` callback. Returns:
- *
- * - `manifestDir()`, where this process's manifests go: under the runtime
- *   directory, the first place looked in;
- * - `places()`, the stand-ins themselves;
- * - `isolated(module, places)`, which is {@link isolatedModule} with the
- *   stand-ins of this `describe`.
+ * Call it inside the `describe` callback. Returns where the manifests go.
  */
-export function usePrivateManifestDirectory(): {
-  manifestDir(): string
-  places(): Places
-  isolated(module: string, places?: Partial<Places>): string
-} {
-  let made: PrivatePlaces | undefined
-  // Made on first use, which may be while the `describe` is being read, for
-  // the module a child is to load.
-  const own = (): PrivatePlaces => (made ??= makePlaces())
+export function usePrivateManifestDirectory(): { manifestDir(): string } {
+  const replaced = ['XDG_RUNTIME_DIR', 'TMPDIR'] as const
+  const saved = replaced.map(name => process.env[name])
+  let base: string | undefined
 
   beforeAll(() => {
-    if (!onLinux) {
-      return
+    base = realpathSync(mkdtempSync(join(tmpdir(), 'srt-test-')))
+    for (const name of replaced) {
+      process.env[name] = join(base, name)
+      mkdirSync(process.env[name], { mode: 0o700 })
     }
-    // In the directories the earlier suites used, before they are left
-    // behind.
+    forgetMountPointManifestDirectory()
     cleanupBwrapMountPoints({ force: true })
-    setMountPointManifestPlacesForTesting(own().places)
+  })
+
+  afterEach(() => {
+    if (base !== undefined) {
+      endSandboxesOnRecord(join(base, 'XDG_RUNTIME_DIR', 'srt-mount-points'))
+    }
   })
 
   afterAll(() => {
-    if (!onLinux) {
-      return
-    }
     cleanupBwrapMountPoints({ force: true })
-    setMountPointManifestPlacesForTesting(placesOfTheRun?.places)
-    if (made !== undefined) {
-      removePlaces(made)
-      made = undefined
+    replaced.forEach((name, i) => {
+      if (saved[i] === undefined) delete process.env[name]
+      else process.env[name] = saved[i]
+    })
+    forgetMountPointManifestDirectory()
+    if (base !== undefined) {
+      rmSync(base, { recursive: true, force: true })
     }
   })
 
   return {
-    manifestDir: () => join(own().places.runtimeDir, 'srt-mount-points'),
-    places: () => own().places,
-    isolated: (module, places) =>
-      onLinux
-        ? isolatedFile(own(), module, places ?? own().places, 'module')
-        : module,
+    manifestDir: () => {
+      if (base === undefined) {
+        throw new Error('asked for before the tests began')
+      }
+      return join(base, 'XDG_RUNTIME_DIR', 'srt-mount-points')
+    },
   }
 }

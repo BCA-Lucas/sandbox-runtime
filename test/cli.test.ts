@@ -9,16 +9,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { isolatedProgram } from './helpers/private-manifest-directory.js'
-
-let cliPath: string | undefined
 
 /**
- * Get the path to the CLI entry point, started with directories of the run's
- * own in place of the ones the tool keeps its mount point manifests in.
+ * Get the path to the CLI entry point
  */
 function getCliPath(): string {
-  return (cliPath ??= isolatedProgram(join(process.cwd(), 'src', 'cli.ts')))
+  return join(process.cwd(), 'src', 'cli.ts')
 }
 
 /**

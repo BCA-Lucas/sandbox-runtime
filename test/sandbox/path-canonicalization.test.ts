@@ -3,11 +3,9 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
 import { isWindows } from '../helpers/platform.js'
-import { isolatedModule } from '../helpers/private-manifest-directory.js'
 
 /**
  * Interior non-canonical spellings.
@@ -49,14 +47,9 @@ function normalizeWithHome(
 ): { homedir: string; results: string[]; tildeBindsRoot: boolean } {
   const module = new URL('../../src/sandbox/sandbox-utils.ts', import.meta.url)
     .href
-  // The wrap makes and binds the directories the mount point manifests are
-  // kept in, which are not this test's to reach.
-  const linuxModule = pathToFileURL(
-    isolatedModule(
-      fileURLToPath(
-        new URL('../../src/sandbox/linux-sandbox-utils.ts', import.meta.url),
-      ),
-    ),
+  const linuxModule = new URL(
+    '../../src/sandbox/linux-sandbox-utils.ts',
+    import.meta.url,
   ).href
   const child = spawnSync(
     process.execPath,

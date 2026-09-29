@@ -423,7 +423,7 @@ struct AceTargets {
     /// `(canonical_path, ace)` to hand to `apply_aces`.
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
-    bad_inputs: Vec<(String, String)>,
+    bad_inputs: Vec<srt_win::state_db::AceFailure>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -454,6 +454,10 @@ struct AceTargets {
 /// denied is possible but rare. A `Grant` on a missing path stays
 /// a soft-skip (nothing to grant on).
 ///
+/// INVARIANT: no grant above a deny that never became a target. A
+/// skipped `Deny` input takes every `Grant` of the call with it; the
+/// denies that resolved are still stamped.
+///
 /// Runs under `with_init_lock` so placeholder creation, its DB
 /// record, and the ancestor-discovery query are all serialized
 /// with `apply_aces`.
@@ -471,12 +475,14 @@ fn canonicalize_ace_targets(
     use anyhow::anyhow;
     use srt_win::acl::{GrantMask, SbAce};
     use srt_win::path_id::{
-        CanonError, canonical_parent_of, canonicalize_path, create_placeholder_chain, is_unc_path,
-        strip_extended_prefix,
+        CanonError, canonical_parent_of, canonicalize_path, create_placeholder_chain,
+        is_access_denied, is_unc_path, strip_extended_prefix,
     };
+    use srt_win::state_db::AceFailure;
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut deny_skipped = false;
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -547,14 +553,31 @@ fn canonicalize_ace_targets(
                                  create there either"
                             );
                         } else {
-                            bad_inputs.push((p.clone(), format!("{e:#}")));
+                            bad_inputs.push(AceFailure::new(p, &e, "bad_input"));
+                            deny_skipped = true;
                         }
                         continue;
                     }
                 }
             }
-            Err(CanonError::NotFound(e) | CanonError::Other(e)) => {
-                bad_inputs.push((p.clone(), format!("{e:#}")));
+            Err(CanonError::NotFound(mut e) | CanonError::Other(mut e)) => {
+                deny_skipped |= matches!(ace, SbAce::Deny(_));
+                // Under a modify-grant, what the caller may not even
+                // open is the sandbox user's doing: it owns the object
+                // and has locked the caller out. Elsewhere it is a
+                // system object, and no advice to delete it is due.
+                if matches!(ace, SbAce::Deny(_))
+                    && is_access_denied(&e)
+                    && let Some((dir, name)) =
+                        p.trim_end_matches(['\\', '/']).rsplit_once(['\\', '/'])
+                    && let Ok((dir, _)) = canonicalize_path(dir)
+                    && db
+                        .grant_root_of(&format!(r"{dir}\{name}"), &roots)?
+                        .is_some()
+                {
+                    e = e.context(srt_win::acl::TakeOverFailed(p.clone()));
+                }
+                bad_inputs.push(AceFailure::new(p, &e, "bad_input"));
                 continue;
             }
         };
@@ -588,6 +611,9 @@ fn canonicalize_ace_targets(
         .filter_map(|(c, _)| Some((canonical_parent_of(c)?, SbAce::DenyFdc)))
         .collect();
     targets.extend(fdc);
+    if deny_skipped {
+        targets.retain(|(_, a)| !matches!(a, SbAce::Grant(_)));
+    }
     Ok(AceTargets {
         targets,
         bad_inputs,
@@ -747,21 +773,6 @@ enum WfpCmd {
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
-}
-
-/// `failed`, behind the inputs that never became a target.
-fn with_bad_inputs(
-    bad_inputs: &[(String, String)],
-    failed: Vec<srt_win::state_db::AceFailure>,
-) -> Vec<srt_win::state_db::AceFailure> {
-    let bad = bad_inputs
-        .iter()
-        .map(|(p, e)| srt_win::state_db::AceFailure {
-            path: p.clone(),
-            code: "bad_input",
-            reason: e.clone(),
-        });
-    bad.chain(failed).collect()
 }
 
 fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
@@ -1215,9 +1226,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             ),
                         ],
                     )?;
-                    for (p, e) in &at.bad_inputs {
-                        eprintln!("srt-win: skipped: '{p}': {e}");
-                    }
                     if dirs_only {
                         at.targets.retain(|(_, a)| a.session_held());
                     }
@@ -1228,12 +1236,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
-            let n = failed.len();
-            if json {
-                let failed = with_bad_inputs(&bad_inputs, failed);
-                println!("{}", json!({ "failed": failed }));
-            }
-            let failed = n;
+            let (bad_inputs, failed) = {
+                let n = (bad_inputs.len(), failed.len());
+                if json {
+                    let failed: Vec<_> = bad_inputs.into_iter().chain(failed).collect();
+                    println!("{}", json!({ "failed": failed }));
+                }
+                n
+            };
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl stamp (deny-ace) — {} target(s) → {} \
@@ -1242,8 +1252,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets.len(),
                 witnesses.len(),
                 fresh,
-                if !bad_inputs.is_empty() {
-                    format!(", {} skipped", bad_inputs.len())
+                if bad_inputs > 0 {
+                    format!(", {bad_inputs} skipped")
                 } else {
                     String::new()
                 },
@@ -1262,11 +1272,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     targets.len(),
                 ));
             }
-            if !bad_inputs.is_empty() {
+            if bad_inputs > 0 {
                 eprintln!(
-                    "srt-win: {} input path(s) skipped (see above); \
-                     exiting 2 (partial)",
-                    bad_inputs.len()
+                    "srt-win: {bad_inputs} input path(s) skipped (see above); \
+                     exiting 2 (partial)"
                 );
                 std::process::exit(2);
             }
@@ -1300,9 +1309,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             ),
                         ],
                     )?;
-                    for (p, e) in &at.bad_inputs {
-                        eprintln!("srt-win: skipped: '{p}': {e}");
-                    }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
                     Ok((at, w, f))
                 })?;
@@ -1310,12 +1316,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
-            let n = failed.len();
-            if json {
-                let failed = with_bad_inputs(&bad_inputs, failed);
-                println!("{}", json!({ "failed": failed }));
-            }
-            let failed = n;
+            let (bad_inputs, failed) = {
+                let n = (bad_inputs.len(), failed.len());
+                if json {
+                    let failed: Vec<_> = bad_inputs.into_iter().chain(failed).collect();
+                    println!("{}", json!({ "failed": failed }));
+                }
+                n
+            };
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
@@ -1324,8 +1332,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets.len(),
                 fresh,
                 witnesses.len() - fresh,
-                if !bad_inputs.is_empty() {
-                    format!(", {} skipped", bad_inputs.len())
+                if bad_inputs > 0 {
+                    format!(", {bad_inputs} skipped")
                 } else {
                     String::new()
                 },
@@ -1344,11 +1352,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     targets.len(),
                 ));
             }
-            if !bad_inputs.is_empty() {
+            if bad_inputs > 0 {
                 eprintln!(
-                    "srt-win: {} input path(s) skipped (see above); \
-                     exiting 2 (partial)",
-                    bad_inputs.len()
+                    "srt-win: {bad_inputs} input path(s) skipped (see above); \
+                     exiting 2 (partial)"
                 );
                 std::process::exit(2);
             }
@@ -1574,7 +1581,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             ],
                         )?;
                         n += at.targets.len();
-                        let mut failed = with_bad_inputs(&at.bad_inputs, vec![]);
+                        let mut failed = at.bad_inputs;
                         if failed.is_empty() {
                             failed = db.apply_aces(&sb_sid, &at.targets)?.1;
                         }
@@ -1592,8 +1599,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         json!({
                             "code": "acl_stamp_failed",
                             "message": format!(
-                                "per-exec deny: {} of {n} path(s) could \
-                                 not be stamped; rolled back",
+                                "per-exec deny: {} path(s) could not be \
+                                 stamped; rolled back",
                                 failed.len()
                             ),
                             "failed": failed,

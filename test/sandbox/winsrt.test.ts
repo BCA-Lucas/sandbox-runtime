@@ -164,15 +164,21 @@ type RunResult = { stdout: string; stderr: string; status: number | null }
 
 const writtenIn = (stderr: string) =>
   [...stderr.matchAll(/DACL written: '([^']+)'/g)].map(m => m[1])
+const walkedIn = (stderr: string) =>
+  [...stderr.matchAll(/walked beneath: '([^']+)'/g)].map(m => m[1])
 
 /** The paths whose DACL srt-win says it wrote while `f` ran, in order. */
-async function daclWrites(f: () => Promise<unknown>): Promise<string[]> {
+const daclWrites = async (f: () => Promise<unknown>) =>
+  writtenIn(await srtWinLog(f))
+
+/** What srt-win said while `f` ran. */
+async function srtWinLog(f: () => Promise<unknown>): Promise<string> {
   const debug = process.env.SRT_DEBUG
   process.env.SRT_DEBUG = '1'
   const spy = spyOn(console, 'error').mockImplementation(() => {})
   try {
     await f()
-    return writtenIn(spy.mock.calls.flat().join('\n'))
+    return spy.mock.calls.flat().join('\n')
   } finally {
     spy.mockRestore()
     if (debug === undefined) delete process.env.SRT_DEBUG
@@ -2152,9 +2158,19 @@ describe.if(isWindows)(
         .map(([what, ms]) => `${what} ${ms} ms`)
         .join(', ')
 
+    /** Not --quiet: srt-win then says which DACLs it wrote, and where it walked. */
+    async function runLoud(command: string) {
+      const w = await SandboxManager.wrapWithSandboxArgv(command)
+      return spawnAsync(
+        w.argv[0],
+        w.argv.slice(1).filter(a => a !== '--quiet'),
+        { env: w.env, timeout: 120_000 },
+      )
+    }
+
     // 16,000 files, and 4,000 loose objects in `.git`; no mandatory name
-    // yet. Shared by M6 and M8, which removes it: making it is most of
-    // either row's time.
+    // yet. Shared by M6, M31 and M8, which removes it: making it is most
+    // of each row's time.
     let big: string | undefined
     function bigTree(): string {
       if (big !== undefined) return big
@@ -2396,16 +2412,9 @@ describe.if(isWindows)(
           )
           for (const nth of ['first', 'second', 'third']) {
             ran.push(
-              await timeInto(took, `${nth} command`, async () => {
-                const w =
-                  await SandboxManager.wrapWithSandboxArgv('echo M6-RAN')
-                // Not --quiet: srt-win then says which DACLs it wrote.
-                return spawnAsync(
-                  w.argv[0],
-                  w.argv.slice(1).filter(a => a !== '--quiet'),
-                  { env: w.env, timeout: 120_000 },
-                )
-              }),
+              await timeInto(took, `${nth} command`, () =>
+                runLoud('echo M6-RAN'),
+              ),
             )
           }
         } catch (e) {
@@ -2475,6 +2484,48 @@ describe.if(isWindows)(
         }
       } finally {
         process.chdir(saved)
+      }
+    }, 600_000)
+
+    it('M31: a denied directory of 4,000 files is walked when its deny is written, and costs a command nothing', async () => {
+      const dir = bigTree()
+      const objects = join(dir, '.git', 'objects')
+      const took: Took = {}
+      /** A session's first command, and where its initialize() walked. */
+      const first = async (what: string, denyWrite: string[]) => {
+        let r: RunResult | undefined
+        const log = await srtWinLog(() =>
+          inSession(dir, { allowWrite: [dir], denyWrite }, async () => {
+            r = await timeInto(took, what, () => runLoud('echo M31-RAN'))
+          }),
+        )
+        return { r: r!, walked: walkedIn(log) }
+      }
+      const without = await first('without it', [])
+      const withIt = await first('with it', [objects])
+      const got = {
+        // Else the row shows nothing.
+        walkedByInitialize: withIt.walked.some(p => p.endsWith('\\objects')),
+        byTheCommand: [
+          ...writtenIn(withIt.r.stderr),
+          ...walkedIn(withIt.r.stderr),
+        ],
+        ran: [without, withIt].map(x => x.r.stdout.includes('M31-RAN')),
+      }
+      const limit = took['without it'] * 1.3 + 100
+      console.log(`M31: a session's first command: ${inWords(took)}`)
+      if (
+        !got.walkedByInitialize ||
+        got.byTheCommand.length > 0 ||
+        !got.ran.every(Boolean) ||
+        took['with it'] > limit
+      ) {
+        throw new Error(
+          `M31: wanted initialize() to walk beneath .git\\objects, and the ` +
+            `first command to write and walk nothing within ${limit} ms — ` +
+            `${inWords(took)} ${JSON.stringify(got)} ` +
+            `stderr=${JSON.stringify(withIt.r.stderr)}`,
+        )
       }
     }, 600_000)
 
@@ -2947,7 +2998,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M23-M28: what an owner, Full control, a pointer file or a second
+    // ── M23-M30: what an owner, Full control, a pointer file or a second
     // name could do to a deny ──
 
     /** Who owns each of `paths`, as `DOMAIN\\name`. */
@@ -3036,6 +3087,7 @@ describe.if(isWindows)(
         const thrown = await inSession(dir, fs, () =>
           Promise.resolve(undefined),
         ).catch((e: unknown) => e as WindowsSandboxError)
+        const left = ownAces(dir)
         spawnSync('cmd', ['/c', 'del', '/f', '/q', mcp], { timeout: 10_000 })
         const afterwards = await inSession(dir, fs, () =>
           runSandboxed('echo M25-RAN'),
@@ -3045,6 +3097,9 @@ describe.if(isWindows)(
           nextRan: next.stdout.includes('M25-RAN'),
           next: named(parseWindowsSandboxError(next.stderr)),
           initialize: named(thrown),
+          // No grant above a deny that never became a target.
+          writtenByIt: writtenIn(thrown?.message ?? ''),
+          left,
           afterwardsRan: afterwards.stdout.includes('M25-RAN'),
         }
         const want = { code: 'acl_takeover_failed', paths: [true] }
@@ -3055,12 +3110,15 @@ describe.if(isWindows)(
             nextRan: false,
             next: want,
             initialize: want,
+            writtenByIt: [],
+            left: [],
             afterwardsRan: true,
           })
         ) {
           throw new Error(
             `M25: wanted exit 18 with no command run, then initialize() ` +
-              `refusing, both as acl_takeover_failed naming .mcp.json, and a ` +
+              `refusing, both as acl_takeover_failed naming .mcp.json, no ` +
+              `DACL written by it and no ACE left on the directory, and a ` +
               `session once it is deleted — ${JSON.stringify(got)} ` +
               `stderr=${JSON.stringify(next.stderr)} ` +
               `thrown=${JSON.stringify(thrown?.message)}`,
@@ -3224,6 +3282,66 @@ describe.if(isWindows)(
         rmSync(dir, { recursive: true, force: true })
       }
     }, 180_000)
+
+    for (const [row, what, rel] of [
+      ['M29', 'a hook', ['.git/hooks', '.git/hooks/pre-commit']],
+      ['M30', '.mcp.json', ['.mcp.json']],
+    ] as const) {
+      it(`${row}: ${what} its maker left protected, with Full control for the sandbox account, is refused to the next command and put right`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'srt-sleep-'))
+        const made = rel.map(r => join(dir, r))
+        const victim = made.at(-1)!
+        const app = join(dir, 'app.txt')
+        const inherits = () => dacl(victim).includes('(I)')
+        try {
+          const inside = await inSession(
+            dir,
+            { allowWrite: [dir] },
+            async () => {
+              // The user keeps access: M25 has the lock-out.
+              await runSandboxed(
+                (made.length > 1 ? `mkdir "${made[0]}" & ` : '') +
+                  `echo V1>"${victim}" & icacls "${victim}" /inheritance:r ` +
+                  `/grant:r *${sbSid}:(F) /grant "${userInfo().username}":(F)`,
+              )
+              const before = { own: ownAces(victim), inherits: inherits() }
+              const r = await runSandboxed(
+                `echo POISON>"${victim}" & echo OK>"${app}"`,
+              )
+              return { before, held: ownAces(victim), r }
+            },
+          )
+          const got = {
+            ...inside,
+            victim: read(victim),
+            app: read(app),
+            own: ownAces(victim),
+            inherits: inherits(),
+            owner: owners([victim])[0],
+          }
+          if (
+            // Else the row shows nothing.
+            !got.before.own.some(l => l.includes('(F)')) ||
+            got.before.inherits ||
+            !got.victim?.startsWith('V1') ||
+            !got.app?.startsWith('OK') ||
+            !got.held.every(l => l.includes('(DENY)')) ||
+            got.own.length > 0 ||
+            !got.inherits ||
+            !isMine(got.owner)
+          ) {
+            throw new Error(
+              `${row}: wanted it protected and granted at first; then V1 kept, ` +
+                `app.txt written, no allow of the account's on it, and after ` +
+                `reset() no ACE of the account's, inherited ACEs back, and the ` +
+                `user its owner — ${JSON.stringify(got)}`,
+            )
+          }
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      }, 120_000)
+    }
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

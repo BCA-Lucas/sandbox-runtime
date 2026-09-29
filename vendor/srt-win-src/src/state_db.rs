@@ -128,6 +128,11 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
 );
+-- Denied paths whose deny may be on disk while what lies beneath has
+-- not been seen to the end (`recompose_at`).
+CREATE TABLE IF NOT EXISTS unfinished (
+  canonical_path TEXT PRIMARY KEY
+);
 "#;
 
 /// Outcome of a crash-recovery pass.
@@ -729,7 +734,7 @@ impl Locked {
             for (canon, ace) in targets {
                 match db.record_ace(canon, *ace) {
                     Ok(w) => witnesses.push(w),
-                    Err(e) => failed.push(AceFailure::new(canon, &e)),
+                    Err(e) => failed.push(AceFailure::new(canon, &e, "failed")),
                 }
             }
             if failed.is_empty() {
@@ -758,10 +763,13 @@ impl Locked {
 
     /// [`recompose_at`], reported.
     fn converge(&self, canon: &str, sandbox_sid: &str) -> Result<(), AceFailure> {
-        let wrote =
-            recompose_at(&self.conn, canon, sandbox_sid).map_err(|e| AceFailure::new(canon, &e))?;
+        let (wrote, walked) = recompose_at(&self.conn, canon, sandbox_sid)
+            .map_err(|e| AceFailure::new(canon, &e, "failed"))?;
         if wrote && !self.quiet {
             eprintln!("srt-win: DACL written: '{canon}'");
+        }
+        if walked && !self.quiet {
+            eprintln!("srt-win: walked beneath: '{canon}'");
         }
         Ok(())
     }
@@ -1121,7 +1129,10 @@ impl Locked {
 /// for sandbox-user ACE state — every add/drop/crash-recover routes
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
-fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<bool> {
+///
+/// Returns whether the DACL was written, and whether what lies beneath
+/// was walked.
+fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<(bool, bool)> {
     // INVARIANT: the rows of EVERY name of this file count, the widest
     // of a kind winning. Hardlinks share one descriptor while the rows
     // are keyed by path: by its own rows alone, one name's release would
@@ -1143,15 +1154,16 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<boo
             SbAce::DenyDelete | SbAce::DenyPin => set.deny_delete = true,
         }
     }
-    // Ahead of the write, which an owner could undo. Beneath a denied
-    // directory only under a modify-grant, where the sandbox user can
-    // have made something: elsewhere (`%ProgramData%`, a profile) lie
-    // trees too large to walk at every command, holding objects the
-    // caller cannot read either. By the rows, so not for an ambient deny.
+    // Ahead of the write, which an owner could undo.
     if set.deny.is_some() || set.deny_fdc || set.deny_delete {
-        let deep = set.deny.is_some() && Locked::grant_root_in(conn, canon, &[])?.is_some();
-        acl::take_over(canon, sandbox_sid, deep)?;
+        acl::take_over(canon, sandbox_sid, false)?;
     }
+    // Beneath a denied directory only under a modify-grant, where the
+    // sandbox user can have made something: elsewhere (`%ProgramData%`,
+    // a profile) lie trees holding objects the caller cannot read
+    // either. By the rows, so not for an ambient deny.
+    let denied = set.deny.is_some();
+    let deep = denied && Locked::grant_root_in(conn, canon, &[])?.is_some();
     // Install-time ambient write-deny (HKLM AmbientDenies) folds
     // into every converge on the path, so session release/recovery
     // cannot strip it. WriteDeny is the floor: a session's wider
@@ -1161,27 +1173,59 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<boo
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
-        .with_context(|| format!("recompose '{canon}' ({set:?})"))
+    // INVARIANT: the walk FOLLOWS the write. The deny refuses every later
+    // create beneath, where a live process of the sandbox user could
+    // otherwise make something behind the walk's back. And only a write
+    // is followed by a walk: while the deny is on disk nothing of that
+    // user's appears beneath. The row outlives a write or a walk that
+    // fails or is killed: the deny is then on the directory, perhaps not
+    // on all beneath it, and the next converge does both again.
+    let pending = denied
+        && conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM unfinished WHERE canonical_path = ?1)",
+            params![canon],
+            |r| r.get(0),
+        )?;
+    let wrote = acl::apply_sandbox_aces_marked(canon, sandbox_sid, set, pending, || {
+        if denied {
+            conn.execute(
+                "INSERT OR IGNORE INTO unfinished VALUES (?1)",
+                params![canon],
+            )?;
+        }
+        Ok(())
+    })
+    .with_context(|| format!("recompose '{canon}' ({set:?})"))?;
+    let walk = deep && wrote;
+    if walk {
+        acl::take_over(canon, sandbox_sid, true)?;
+    }
+    if denied && wrote {
+        conn.execute(
+            "DELETE FROM unfinished WHERE canonical_path = ?1",
+            params![canon],
+        )?;
+    }
+    Ok((wrote, walk))
 }
 
 /// A path [`Locked::apply_aces`] could not protect.
 #[derive(Debug, serde::Serialize)]
 pub struct AceFailure {
     pub path: String,
-    /// `takeover_failed` ([`acl::take_over`]: the user can fix that
+    /// `takeover_failed` ([`acl::TakeOverFailed`]: the user can fix that
     /// one), `bad_input`, or `failed`.
     pub code: &'static str,
     pub reason: String,
 }
 
 impl AceFailure {
-    fn new(canon: &str, e: &anyhow::Error) -> Self {
+    pub fn new(canon: &str, e: &anyhow::Error, otherwise: &'static str) -> Self {
         eprintln!("srt-win: '{canon}': {e:#}");
         let taken = e.downcast_ref::<acl::TakeOverFailed>();
         Self {
             path: taken.map_or(canon, |t| &t.0).to_string(),
-            code: taken.map_or("failed", |_| "takeover_failed"),
+            code: taken.map_or(otherwise, |_| "takeover_failed"),
             reason: format!("{e:#}"),
         }
     }
@@ -1635,14 +1679,44 @@ mod tests {
     }
 
     #[test]
+    fn a_walk_follows_a_write_and_what_was_left_unfinished_is_done_again() {
+        const SB: &str = "S-1-5-32-546";
+        let root = std::env::temp_dir().join(format!("srtwin-walk-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("denied")).unwrap();
+        let [root_c, dir] = [root.clone(), root.join("denied")].map(|p| {
+            let Ok((canon, _)) = path_id::canonicalize_path(p.to_str().unwrap()) else {
+                panic!("canonicalize {p:?}");
+            };
+            canon
+        });
+        with_mem_db(|db| {
+            let targets = [
+                (root_c.clone(), SbAce::Grant(acl::GrantMask::Modify)),
+                (dir.clone(), SbAce::Deny(acl::DenyMask::WriteDeny)),
+            ];
+            assert!(db.apply_aces(SB, &targets).unwrap().1.is_empty());
+            let again = || recompose_at(&db.conn, &dir, SB).unwrap();
+            assert_eq!(again(), (false, false), "the deny is on disk");
+            db.conn
+                .execute("INSERT INTO unfinished VALUES (?1)", params![dir])
+                .unwrap();
+            assert_eq!(again(), (true, true), "it was left unfinished");
+            assert_eq!(again(), (false, false), "and now is not");
+            acl::apply_sandbox_aces(&dir, SB, Default::default()).unwrap();
+            assert_eq!(again(), (true, true), "the deny was off");
+        });
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_failed_take_over_names_the_object_under_its_own_code() {
         let gone = r"\\?\C:\srtwin-no-such-object";
         let e = acl::take_over(gone, "S-1-5-32-546", true)
             .unwrap_err()
             .context("recompose");
-        let f = AceFailure::new(r"\\?\C:\above", &e);
+        let f = AceFailure::new(r"\\?\C:\above", &e, "failed");
         assert_eq!((f.path.as_str(), f.code), (gone, "takeover_failed"));
-        assert_eq!(AceFailure::new("p", &anyhow!("x")).code, "failed");
+        assert_eq!(AceFailure::new("p", &anyhow!("x"), "failed").code, "failed");
     }
 
     #[test]

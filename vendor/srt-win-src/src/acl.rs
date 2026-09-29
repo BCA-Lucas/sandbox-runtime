@@ -852,6 +852,32 @@ impl SbAceSet {
 ///
 /// Returns whether the DACL was written.
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<bool> {
+    converge_aces(canonical_path, sandbox_sid, set, false, false, || Ok(()))
+}
+
+/// [`apply_sandbox_aces`] for a write that must not stay half done.
+/// `before_write` runs ahead of one. `force` writes without the skip: a
+/// write propagates afresh through a directory's tree, where an earlier
+/// one may have been killed.
+pub fn apply_sandbox_aces_marked(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    force: bool,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    converge_aces(canonical_path, sandbox_sid, set, force, false, before_write)
+}
+
+/// `unprotect`: write it back `UNPROTECTED_` whatever it was.
+fn converge_aces(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    force: bool,
+    unprotect: bool,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
@@ -876,18 +902,19 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     // the DACL just read from DISK, never against the state DB, so
     // that ACEs stripped from outside (`icacls /reset`, the sandbox
     // user on a directory it owns) are put back by the next command.
-    if same_explicit_aces(old, new.as_ptr())? {
+    if !force && !(protected && unprotect) && same_explicit_aces(old, new.as_ptr())? {
         return Ok(false);
     }
     // 4. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
     //    parent, PROTECTED when inheritance was severed before we
     //    touched the path (see doc comment).
-    let prot = if protected {
+    let prot = if protected && !unprotect {
         Protection::Protected
     } else {
         Protection::Unprotected
     };
+    before_write()?;
     write_file_dacl(canonical_path, new.as_ptr(), prot)
         .with_context(|| format!("recompose '{canonical_path}'"))?;
     Ok(true)
@@ -912,6 +939,12 @@ impl std::fmt::Display for TakeOverFailed {
 /// installer, scaffolding). An owner that cannot be read counts as the
 /// sandbox user: it may have locked the caller out.
 ///
+/// What is taken over also loses the sandbox user's explicit ACEs and
+/// `SE_DACL_PROTECTED`: its owner could write its DACL as it liked, and
+/// `D:P(A;;FA;;;<sb>)` on a child would outlive the take-over, out of
+/// the inherited deny's reach. Elsewhere the flag is kept as an
+/// administrator's deliberate lock-down; on this object it is not one.
+///
 /// Permanent, so no row and no restore. Links are neither entered nor
 /// touched.
 pub fn take_over(canonical_path: &str, sandbox_sid: &str, deep: bool) -> Result<()> {
@@ -919,7 +952,7 @@ pub fn take_over(canonical_path: &str, sandbox_sid: &str, deep: bool) -> Result<
     let me = LocalPsid::from_string(&crate::sid::current_user_sid()?)?;
     let mut todo = vec![PathBuf::from(canonical_path)];
     while let Some(p) = todo.pop() {
-        take_one(&p, &sb, &me, deep.then_some(&mut todo))
+        take_one(&p, sandbox_sid, &sb, &me, deep.then_some(&mut todo))
             .with_context(|| TakeOverFailed(p.display().to_string()))?;
     }
     Ok(())
@@ -927,6 +960,7 @@ pub fn take_over(canonical_path: &str, sandbox_sid: &str, deep: bool) -> Result<
 
 fn take_one(
     p: &Path,
+    sandbox_sid: &str,
     sb: &LocalPsid,
     me: &LocalPsid,
     beneath: Option<&mut Vec<PathBuf>>,
@@ -962,6 +996,8 @@ fn take_one(
             )
         };
         win32_ok(r, "SetNamedSecurityInfoW(owner)")?;
+        let p = p.to_str().context("not UTF-8")?;
+        converge_aces(p, sandbox_sid, SbAceSet::default(), false, true, || Ok(()))?;
     }
     if let Some(todo) = beneath.filter(|_| p.is_dir()) {
         for e in std::fs::read_dir(p)? {
@@ -1153,6 +1189,41 @@ mod tests {
             "a superset"
         );
         assert!(!same(&[allow(OICI)], &want), "our ACE stripped");
+    }
+
+    #[test]
+    fn what_is_taken_over_loses_the_sandbox_users_aces_and_its_protection() {
+        const SB: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.to_str().unwrap();
+        let me = crate::sid::current_user_sid().unwrap();
+        let mine = Allow(&me, Mask::FILE_ALL, NO_INHERIT);
+        let repair =
+            || converge_aces(path, SB, SbAceSet::default(), false, true, || Ok(())).unwrap();
+        // With an ACE of the sandbox user's, and protected alone.
+        for aces in [&[Allow(SB, Mask::FILE_ALL, NO_INHERIT), mine][..], &[mine]] {
+            let dacl = build_allow_dacl(aces).unwrap();
+            write_file_dacl(path, dacl.as_ptr(), Protection::Protected).unwrap();
+            assert!(repair(), "written");
+            let (sd, dacl) = read_file_dacl(path).unwrap();
+            assert!(!sd_dacl_protected(&sd).unwrap(), "no longer protected");
+            let count = |f: &dyn Fn(&ACE_HEADER, &[u8]) -> bool| {
+                filter_aces(dacl, |hdr, body| f(hdr, body)).unwrap().0.len()
+            };
+            let sb = LocalPsid::from_string(SB).unwrap();
+            assert_eq!(count(&|_, body| ace_sid_is(body, sb.as_bytes())), 0);
+            assert_ne!(count(&|hdr, _| hdr.AceFlags & INHERITED_ACE != 0), 0);
+            assert_eq!(
+                count(&|hdr, _| hdr.AceFlags & INHERITED_ACE == 0),
+                1,
+                "mine stays"
+            );
+            assert!(!repair(), "nothing is left to write");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

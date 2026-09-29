@@ -61,10 +61,18 @@ impl std::error::Error for CanonError {}
 /// `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3).
 pub fn is_not_found(e: &anyhow::Error) -> bool {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    root_is(e, &[ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND])
+}
+
+/// The same for `ERROR_ACCESS_DENIED` (5).
+pub fn is_access_denied(e: &anyhow::Error) -> bool {
+    root_is(e, &[windows::Win32::Foundation::ERROR_ACCESS_DENIED])
+}
+
+fn root_is(e: &anyhow::Error, any_of: &[windows::Win32::Foundation::WIN32_ERROR]) -> bool {
     e.root_cause()
         .downcast_ref::<windows::core::Error>()
-        .map(|we| we.code())
-        .is_some_and(|c| c == ERROR_FILE_NOT_FOUND.into() || c == ERROR_PATH_NOT_FOUND.into())
+        .is_some_and(|we| any_of.iter().any(|c| we.code() == (*c).into()))
 }
 
 /// True iff `p` names a UNC network path (`\\server\share\…`,

@@ -521,8 +521,21 @@ async function main(): Promise<void> {
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            // There is no child yet to pass an interrupt on to, so it stops
+            // the wrap, which can take seconds over a large tree.
+            const interrupted = new AbortController()
+            const interrupt = (signal: NodeJS.Signals): void =>
+              interrupted.abort(new Error(`interrupted by ${signal}`))
+            process.once('SIGINT', interrupt)
+            process.once('SIGTERM', interrupt)
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),

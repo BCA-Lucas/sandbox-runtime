@@ -18,10 +18,14 @@ import { join } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
+  finish,
+  finishInTurns,
   globPatternBaseDir,
   globToRegex,
   normalizePathForSandbox,
+  type Steps,
   walkGlobPattern,
+  walkGlobPatternSteps,
 } from '../../src/sandbox/sandbox-utils.js'
 import {
   containsGlobCharsWin,
@@ -762,6 +766,73 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 // expandTilde — `~\` form is Windows-only
 // ============================================================================
 
+describe('finishInTurns', () => {
+  /** `count` steps of about `ms` each; returns how many it took. */
+  function* busy(
+    count: number,
+    ms: number,
+    taken = { steps: 0 },
+  ): Steps<number> {
+    for (let i = 0; i < count; i++) {
+      const until = performance.now() + ms
+      while (performance.now() < until);
+      taken.steps++
+      yield
+    }
+    return taken.steps
+  }
+
+  it('lets the event loop have a turn while the steps go on', async () => {
+    const taken = { steps: 0 }
+    let stepsWhenTheTimerFired = -1
+    setTimeout(() => (stepsWhenTheTimerFired = taken.steps), 0)
+    expect(await finishInTurns(busy(30, 3, taken))).toBe(30)
+    expect(stepsWhenTheTimerFired).toBeGreaterThan(0)
+    expect(stepsWhenTheTimerFired).toBeLessThan(30)
+  })
+
+  it('takes no step for a signal already aborted', async () => {
+    const taken = { steps: 0 }
+    const reason = new Error('stopped')
+    expect(
+      await finishInTurns(busy(3, 0, taken), AbortSignal.abort(reason)).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+    expect(taken.steps).toBe(0)
+  })
+
+  it("stops at the next turn with the signal's reason", async () => {
+    const taken = { steps: 0 }
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    setTimeout(() => controller.abort(reason), 0)
+    expect(
+      await finishInTurns(busy(30, 3, taken), controller.signal).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+    expect(taken.steps).toBeLessThan(30)
+  })
+
+  it('finds what the walk finds on the spot', async () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-turns-')))
+    try {
+      mkdirSync(join(root, 'a', 'b'), { recursive: true })
+      writeFileSync(join(root, 'a', 'b', 'id.pem'), '')
+      symlinkSync(join(root, 'a'), join(root, 'link'))
+      const opts = { followSymlinkedDirectories: true, withDirectoryForm: true }
+      const pattern = join(root, '**/*.pem')
+      const inTurns = await finishInTurns(walkGlobPatternSteps(pattern, opts))
+      expect(inTurns).toEqual(walkGlobPattern(pattern, opts))
+      expect(inTurns).toEqual(finish(walkGlobPatternSteps(pattern, opts)))
+      expect(inTurns.matches).toEqual([join(root, 'a', 'b', 'id.pem')])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('expandTilde', () => {
   it.if(!isWindows)(
     'should NOT expand `~\\` on POSIX (literal filename byte)',
@@ -1271,6 +1342,59 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       await SandboxManager.reset()
     }
   })
+
+  for (const list of ['denyRead', 'allowRead'] as const) {
+    it(`gives up a wrap whose signal is aborted while a ${list} pattern is walked`, async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-abort-')))
+      const dirs = Array.from({ length: 12 }, (_, i) => join(root, `d${i}`))
+      for (const dir of dirs) mkdirSync(dir)
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: list === 'denyRead' ? [join(root, '**/*.pem')] : [root],
+          allowRead: list === 'allowRead' ? [join(root, '**/*.pem')] : [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+
+      // Each listing takes longer than a turn, and the third one aborts.
+      const controller = new AbortController()
+      const reason = new Error('stopped')
+      let listed = 0
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]).startsWith(root)) {
+          if (++listed === 3) controller.abort(reason)
+          const until = performance.now() + 15
+          while (performance.now() < until);
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        expect(
+          await SandboxManager.wrapWithSandbox(
+            'true',
+            undefined,
+            undefined,
+            controller.signal,
+          ).catch((e: unknown) => e),
+        ).toBe(reason)
+        expect(listed).toBe(3)
+      } finally {
+        readdirSpy.mockRestore()
+        await SandboxManager.reset()
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+  }
 
   it('should pass non-glob paths through unchanged on Linux', async () => {
     const { SandboxManager } = await import(

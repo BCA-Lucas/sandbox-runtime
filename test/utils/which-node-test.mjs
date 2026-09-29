@@ -158,7 +158,7 @@ try {
   const search = findHostHelper('srt-test-helper', [project])
   assert.strictEqual(search.path, join(safe, 'srt-test-helper'))
   assert.deepStrictEqual(
-    search.skipped.map(s => s.candidate),
+    search.skipped.map(s => s.path),
     [join(projectBin, 'srt-test-helper'), join(linked, 'srt-test-helper')],
   )
   assert.strictEqual(

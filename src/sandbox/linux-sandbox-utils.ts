@@ -372,6 +372,9 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
+    // Stopped, it found nothing: the caller must not be handed a command
+    // without the denies it would have found.
+    signal.throwIfAborted()
     logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
   }
 

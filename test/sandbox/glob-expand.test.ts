@@ -815,6 +815,21 @@ describe('finishInTurns', () => {
     expect(taken.steps).toBeLessThan(30)
   })
 
+  it('hands nothing out when the signal is aborted in the last step', async () => {
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    function* abortsAtTheEnd(): Steps<string> {
+      yield
+      controller.abort(reason)
+      return 'done'
+    }
+    expect(
+      await finishInTurns(abortsAtTheEnd(), controller.signal).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+  })
+
   it('finds what the walk finds on the spot', async () => {
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-turns-')))
     try {
@@ -1395,6 +1410,86 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       }
     })
   }
+
+  it('keeps to the configuration a wrap started with when that is replaced in a turn', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-replaced-')))
+    for (let i = 0; i < 6; i++)
+      mkdirSync(join(root, 'tree', `d${i}`), { recursive: true })
+    for (const name of ['first', 'second']) writeFileSync(join(root, name), '')
+    const configDenying = (name: string) => ({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: [join(root, name)],
+        allowRead: [join(root, 'tree', '**/*.pem')],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize(configDenying('first'))
+
+    // Each listing takes longer than a turn; the configuration is replaced
+    // while the allowRead pattern, the first to be walked, is under way.
+    let listed = 0
+    const readdirSync = fs.readdirSync
+    const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (String(args[0]).startsWith(root)) {
+        if (++listed === 2) SandboxManager.updateConfig(configDenying('second'))
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return readdirSync(...args)
+    }) as typeof fs.readdirSync)
+    try {
+      const command = await SandboxManager.wrapWithSandbox('true')
+      expect(listed).toBeGreaterThan(2)
+      expect(command).toContain(join(root, 'first'))
+      expect(command).not.toContain(join(root, 'second'))
+    } finally {
+      readdirSpy.mockRestore()
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('gives up a wrap whose signal is aborted while the mandatory denies are looked for', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-scan-')))
+    // Stands in for ripgrep, and outlasts the abort.
+    const slowScan = join(root, 'slow-scan')
+    writeFileSync(slowScan, '#!/bin/sh\nsleep 5\n', { mode: 0o755 })
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [root], denyWrite: [] },
+      ripgrep: { command: slowScan },
+    })
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    setTimeout(() => controller.abort(reason), 200)
+    try {
+      expect(
+        await SandboxManager.wrapWithSandbox(
+          'true',
+          undefined,
+          undefined,
+          controller.signal,
+        ).catch((e: unknown) => e),
+      ).toBe(reason)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 
   it('should pass non-glob paths through unchanged on Linux', async () => {
     const { SandboxManager } = await import(

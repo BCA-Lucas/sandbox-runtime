@@ -534,6 +534,7 @@ async function main(): Promise<void> {
               undefined,
               interrupted.signal,
             )
+            interrupted.signal.throwIfAborted()
             process.off('SIGINT', interrupt)
             process.off('SIGTERM', interrupt)
             child = spawn(sandboxedCommand, {

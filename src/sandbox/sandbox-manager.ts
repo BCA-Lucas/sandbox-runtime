@@ -1663,6 +1663,25 @@ async function wrapWithSandbox(
   const commandId = options?.commandId
   registerCommandText(command, options)
 
+  // Check if network config is specified - this determines if we need network restrictions
+  // Network restriction is needed when:
+  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
+  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+  // An empty allowedDomains array means "no domains allowed" = block all network access
+  const hasNetworkConfig =
+    customConfig?.network?.allowedDomains !== undefined ||
+    config?.network?.allowedDomains !== undefined
+
+  // Network RESTRICTION is needed whenever network config is specified
+  // This includes empty allowedDomains which means "block all network"
+  const needsNetworkRestriction = hasNetworkConfig
+
+  // Network PROXY is needed whenever network config is specified
+  // Even with empty allowedDomains, we route through proxy so that:
+  // 1. updateConfig() can enable network access for already-running processes
+  // 2. The proxy blocks all requests when allowlist is empty
+  const needsNetworkProxy = hasNetworkConfig
+
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
   // filesystem restrictions" (seatbelt emits `(allow file-write*)`; bwrap
@@ -1721,36 +1740,35 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
+    //
+    // INVARIANT: what the configuration says is read above and here, ahead of
+    // the first turn below. updateConfig() can run in a turn, and this wrap
+    // must not get the writes of one configuration and the reads of another.
+    const allowRead =
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
+    const denyRead = unionDenyReadPaths(
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+      credentialRestrictions,
+    )
+    const ownReadPaths = [
+      // The TLS-termination CA cert and the trust bundle the env vars point at
+      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if
+      // their paths fall under a user-configured denyRead.
+      ...(mitmCA ? [mitmCA.certPath, mitmCA.trustBundlePath] : []),
+      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
+      ...(javaAgentJarPath ? [javaAgentJarPath] : []),
+    ]
     const expandedAllowRead = await finishInTurns(
-      resolveReadPathEntries(
-        customConfig?.filesystem?.allowRead ??
-          config?.filesystem.allowRead ??
-          [],
-        expandAllowReadGlob,
-      ),
+      resolveReadPathEntries(allowRead, expandAllowReadGlob),
       abortSignal,
     )
-    // The TLS-termination CA cert and the trust bundle the env vars point at
-    // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
-    // paths fall under a user-configured denyRead.
-    if (mitmCA) {
-      expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
-    }
-    // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
-    if (javaAgentJarPath) {
-      expandedAllowRead.push(javaAgentJarPath)
-    }
+    expandedAllowRead.push(...ownReadPaths)
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
     const unlistableDenyDirs = new Set<string>()
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await finishInTurns(
       resolveReadPathEntries(
-        unionDenyReadPaths(
-          customConfig?.filesystem?.denyRead ??
-            config?.filesystem.denyRead ??
-            [],
-          credentialRestrictions,
-        ),
+        denyRead,
         pattern =>
           expandReadDenyGlobLinuxSteps(
             pattern,
@@ -1768,25 +1786,6 @@ async function wrapWithSandbox(
       unlistableDenyDirs: [...unlistableDenyDirs],
     }
   }
-
-  // Check if network config is specified - this determines if we need network restrictions
-  // Network restriction is needed when:
-  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
-  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
-  // An empty allowedDomains array means "no domains allowed" = block all network access
-  const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
-
-  // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
-
-  // Network PROXY is needed whenever network config is specified
-  // Even with empty allowedDomains, we route through proxy so that:
-  // 1. updateConfig() can enable network access for already-running processes
-  // 2. The proxy blocks all requests when allowlist is empty
-  const needsNetworkProxy = hasNetworkConfig
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {

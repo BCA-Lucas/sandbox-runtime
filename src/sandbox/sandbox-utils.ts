@@ -1167,7 +1167,7 @@ const TURN_MS = 10
  * Runs `steps` to the end, letting the event loop have a turn every
  * {@link TURN_MS}: a walk of a large tree takes seconds, and a caller whose
  * thread is held that long can neither draw nor hear that it should stop.
- * Rejects with `signal`'s reason once that is aborted.
+ * Rejects with `signal`'s reason once that is aborted, however far it got.
  */
 export async function finishInTurns<T>(
   steps: Steps<T>,
@@ -1177,10 +1177,10 @@ export async function finishInTurns<T>(
   let since = performance.now()
   for (;;) {
     const step = steps.next()
-    if (step.done) return step.value
-    if (performance.now() - since < TURN_MS) continue
-    await new Promise(resolve => setImmediate(resolve))
+    if (!step.done && performance.now() - since < TURN_MS) continue
+    if (!step.done) await new Promise(resolve => setImmediate(resolve))
     signal?.throwIfAborted()
+    if (step.done) return step.value
     since = performance.now()
   }
 }

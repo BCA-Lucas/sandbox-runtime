@@ -406,6 +406,13 @@ export interface WindowsSandboxParams {
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
+   * PID that holds the directory-level ACEs the denies need (see
+   * {@link WindowsAclStampOptions.dirsOnly}), so that they outlive the
+   * command; its {@link restoreWindowsAcl} releases them. Default: the
+   * `srt-win exec` process, which releases them as the child exits.
+   */
+  sessionHolderPid?: number
+  /**
    * Working directory the child starts in. Fed to
    * {@link buildGitConfigEnv} as a `safe.directory` entry so git
    * inside the sandbox accepts the real-user-owned working tree.
@@ -1872,6 +1879,14 @@ export interface WindowsAclStampOptions {
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /**
+   * Only the directory-level ACEs of the targets: the
+   * `FILE_DELETE_CHILD` deny on each parent and the pins on the
+   * directories above. Windows re-propagates a directory's DACL through
+   * its whole tree at every write, so these are worth holding for a
+   * session while the deny on each target is per command.
+   */
+  dirsOnly?: boolean
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
 }
@@ -1906,6 +1921,7 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
       `${holder}`,
       '--sandbox-user-sid',
       opts.sandboxUserSid,
+      ...(opts.dirsOnly ? ['--dirs-only'] : []),
     ],
     { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
@@ -2160,6 +2176,9 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (p.quiet !== false) argv.push('--quiet')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
+  if (p.sessionHolderPid !== undefined) {
+    argv.push('--session-holder-pid', `${p.sessionHolderPid}`)
+  }
   // The two-hop runner starts with the SANDBOX user's profile env
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as
   // `--env`. The broker does NOT enumerate its own env — the overlay

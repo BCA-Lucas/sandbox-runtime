@@ -319,7 +319,7 @@ try {
   # canonical paths, but `ace_holders` is PATH-keyed. A Deny on
   # one alias is invisible to a holder of another — releasing it
   # would write the SHARED DACL back without the deny while the
-  # other holder's child is still running. `ensure_ace` refuses
+  # other holder's child is still running. `record_ace` refuses
   # `links > 1` for ALL Deny callers (per-exec and session-level
   # `acl stamp` alike — no `refuse_escalation` distinction under
   # the additive-ACE model).

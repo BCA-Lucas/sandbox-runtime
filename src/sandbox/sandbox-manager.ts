@@ -65,6 +65,7 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   windowsGetMandatoryDenyPaths,
+  stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
@@ -152,9 +153,9 @@ let javaAgentJarPath: string | undefined
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
-// Windows: the resolved access set that was actually applied at
-// initialize(). `undefined` means no stamp/grant was applied
-// (gates running `acl restore`/`acl revoke` at reset()).
+// Windows: the resolved grant set that was actually applied at
+// initialize(). `undefined` means none was (gates running
+// `acl revoke` at reset()).
 let windowsFsStampedSet:
   | ReturnType<typeof computeWindowsFsAccessSet>
   | undefined
@@ -836,7 +837,8 @@ async function initialize(
         )
       }
     }
-    // Filesystem grants — additive sandbox-user ACEs.
+    // Filesystem grants, and the directory-level ACEs of the denies —
+    // additive sandbox-user ACEs.
     try {
       const acc = computeWindowsFsAccessSet(runtimeConfig)
       // The trust bundle the CA-trust env vars point at
@@ -880,6 +882,16 @@ async function initialize(
             `${acc.grantWrite.length} grantWrite, ` +
             `${acc.grantRead.length} grantRead`,
         )
+      }
+      // For the denies known now, so that the first command does not pay
+      // for them. After the grants, whose roots bound the pins.
+      const deny = computeWindowsPerExecDenySet(
+        runtimeConfig,
+        undefined,
+        process.cwd(),
+      )
+      if (deny.denyRead.length > 0 || deny.denyWrite.length > 0) {
+        stampWindowsAcl({ sandboxUserSid: sb, ...deny, dirsOnly: true, srtWin })
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
@@ -1378,7 +1390,9 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  * Deny set for one exec: session + per-exec `denyRead`/`denyWrite`,
  * credential files, and the mandatory set under `cwd`. Applied via
  * `srt-win exec --deny-*` under the exec's PID, so a `.git` the host
- * creates or rewrites between commands is covered by the next one.
+ * creates or rewrites between commands is covered by the next one. Only
+ * the ACEs on the directories above the targets outlive the command:
+ * `dirsOnly` of {@link stampWindowsAcl}.
  *
  * A grant of the same path or of one above it does not lift a deny:
  * srt-win writes a path's deny ahead of its allow. A grant BENEATH a
@@ -1917,6 +1931,8 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExec.denyRead,
       denyWrite: perExec.denyWrite,
+      // Only a session has a reset() to release them.
+      sessionHolderPid: windowsFsSbUserSid ? process.pid : undefined,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
       // roots the sandbox user has MODIFY on plus any repo top-level
@@ -2141,7 +2157,7 @@ async function reset(): Promise<void> {
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
   // `srt-win acl recover` (which sweeps by trustee SID).
-  if (windowsFsStampedSet && windowsFsSbUserSid) {
+  if (windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
@@ -2160,9 +2176,13 @@ async function reset(): Promise<void> {
         )
       }
     }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
+    if (windowsFsStampedSet) {
+      for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
+        log('grant revoke', e)
+      }
     }
+    // The directory-level denies: initialize()'s, and whatever this
+    // session's commands have added since.
     for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
       log('deny restore', e)
     }

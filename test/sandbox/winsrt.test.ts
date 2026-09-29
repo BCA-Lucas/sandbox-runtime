@@ -52,6 +52,8 @@ import {
   ensurePersistentWindowsCa,
   windowsStateDir,
   wrapCommandWithSandboxWindows,
+  stampWindowsAcl,
+  restoreWindowsAcl,
   parseWindowsBinShell,
   resolveSrtWin,
   buildGitConfigEnv,
@@ -332,6 +334,22 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       srtWin,
     })
     expect(off.argv).not.toContain('--quiet')
+  })
+
+  it('argv: --session-holder-pid only when given, before --', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'x',
+      sessionHolderPid: 4242,
+      srtWin,
+    })
+    const i = argv.indexOf('--session-holder-pid')
+    expect(argv[i + 1]).toBe('4242')
+    expect(i).toBeGreaterThan(-1)
+    expect(i).toBeLessThan(argv.indexOf('--'))
+    expect(
+      wrapCommandWithSandboxWindows({ command: 'x', srtWin }).argv,
+    ).not.toContain('--session-holder-pid')
   })
 
   it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
@@ -1938,7 +1956,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M1-M7: the mandatory write denies ──
+    // ── M1-M12: the mandatory write denies ──
     // Resolved at each wrap from the working directory, so each row
     // chdirs into its own tree first. Which paths are picked is in
     // test/sandbox/windows-per-exec-deny.test.ts; these rows are what
@@ -1967,6 +1985,95 @@ describe.if(isWindows)(
         return await rexecSandboxed(cmd, fs, afterInit)
       } finally {
         process.chdir(saved)
+      }
+    }
+
+    /** `body` inside a session whose working directory is `dir`. */
+    async function inSession<T>(
+      dir: string,
+      fs: FsOverrides,
+      body: () => Promise<T>,
+    ): Promise<T> {
+      const saved = process.cwd()
+      process.chdir(dir)
+      try {
+        await SandboxManager.initialize(createFsTestConfig(fs))
+        return await body()
+      } finally {
+        await SandboxManager.reset()
+        process.chdir(saved)
+      }
+    }
+
+    type Took = Record<string, number>
+    async function timeInto<T>(took: Took, what: string, f: () => Promise<T>) {
+      const t = Date.now()
+      try {
+        return await f()
+      } finally {
+        took[what] = Date.now() - t
+      }
+    }
+    const inWords = (took: Took) =>
+      Object.entries(took)
+        .map(([what, ms]) => `${what} ${ms} ms`)
+        .join(', ')
+
+    // 16,000 files, and 4,000 loose objects in `.git`. Shared by M6 and
+    // M8, which removes it: making it is most of either row's time.
+    let big: string | undefined
+    function bigTree(): string {
+      if (big !== undefined) return big
+      const dir = mkdtempSync(join(tmpdir(), 'srt-mandbig-'))
+      const fill = (parent: string, dirs: number) => {
+        for (let d = 0; d < dirs; d++) {
+          mkdirSync(join(parent, `d${d}`), { recursive: true })
+          for (let f = 0; f < 100; f++) {
+            writeFileSync(join(parent, `d${d}`, `f${f}`), 'x')
+          }
+        }
+      }
+      fill(dir, 160)
+      fill(join(dir, '.git', 'objects'), 40)
+      mkdirSync(join(dir, '.git', 'hooks'))
+      writeFileSync(join(dir, '.git', 'config'), 'x')
+      return (big = dir)
+    }
+
+    const dacl = (p: string) =>
+      spawnSync('icacls', [p], { encoding: 'utf8', timeout: 10_000 }).stdout
+    /** The sandbox account's EXPLICIT ACEs on `p`, as icacls prints them. */
+    const ownAces = (p: string) =>
+      dacl(p)
+        .split(/\r?\n/)
+        .filter(l => l.includes(sbSid) || l.includes('srt-sandbox'))
+        .filter(l => !l.includes('(I)'))
+
+    /** M4's attack, then a write that shows the command ran at all. */
+    const renameGitAside = (dir: string) =>
+      `ren "${join(dir, '.git')}" .git-aside & ` +
+      `robocopy "${join(dir, '.git-aside')}" "${join(dir, '.git')}" ` +
+      `/E /R:0 /W:0 /NFL /NDL /NJH /NJS & ` +
+      `echo POISON>"${join(dir, '.git', 'hooks', 'pre-commit')}" & ` +
+      `echo OK>"${join(dir, 'app.txt')}"`
+    function expectGitPinned(row: string, dir: string, r: RunResult) {
+      const hook = join(dir, '.git', 'hooks', 'pre-commit')
+      const got = {
+        hook: existsSync(hook) ? readFileSync(hook, 'utf8') : null,
+        renamedAside: existsSync(join(dir, '.git-aside')),
+        app: readFileSync(join(dir, 'app.txt'), 'utf8'),
+      }
+      if (
+        got.hook !== 'HOOK-V1' ||
+        got.renamedAside ||
+        !got.app.startsWith('OK')
+      ) {
+        throw new Error(
+          `${row}: wanted the hook kept, .git in place and app.txt written — ` +
+            `${JSON.stringify(got)} exit=${r.status} ` +
+            `stdout=${JSON.stringify(r.stdout)} ` +
+            `stderr=${JSON.stringify(r.stderr)}`,
+        )
       }
     }
 
@@ -2125,60 +2232,58 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    it('M6: initialize(), one command and reset() take under 30 s each in a 20,000-file working directory', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'srt-mandbig-'))
+    it('M6: 20,000 files: initialize(), the first command and reset() under 30 s, later commands under 2 s', async () => {
+      const dir = bigTree()
+      mkdirSync(join(dir, '.vscode'))
+      writeFileSync(join(dir, '.gitconfig'), 'x')
       const saved = process.cwd()
+      process.chdir(dir)
       try {
-        mkdirSync(join(dir, '.vscode'))
-        writeFileSync(join(dir, '.gitconfig'), 'x')
-        for (let d = 0; d < 200; d++) {
-          mkdirSync(join(dir, `d${d}`))
-          for (let f = 0; f < 100; f++) {
-            writeFileSync(join(dir, `d${d}`, `f${f}`), 'x')
-          }
-        }
-        process.chdir(dir)
-        // allowWrite: a command cannot start in a directory it has no
-        // rights on. So initialize() and reset() time the grant, and the
-        // command the two mandatory stamps and their release.
+        const took: Took = {}
+        const ran: RunResult[] = []
         let error: unknown
-        let echo: Awaited<ReturnType<typeof spawnAsync>> | undefined
-        const t0 = Date.now()
-        let t1 = t0
         try {
-          await SandboxManager.initialize(
-            createFsTestConfig({ allowWrite: [dir] }),
+          // allowWrite: a command cannot start in a directory it has no
+          // rights on.
+          await timeInto(took, 'initialize()', () =>
+            SandboxManager.initialize(
+              createFsTestConfig({ allowWrite: [dir] }),
+            ),
           )
-          t1 = Date.now()
-          const w = await SandboxManager.wrapWithSandboxArgv('echo M6-RAN')
-          echo = await spawnAsync(w.argv[0], w.argv.slice(1), {
-            env: w.env,
-            timeout: 120_000,
-          })
+          for (const nth of ['first', 'second', 'third']) {
+            ran.push(
+              await timeInto(took, `${nth} command`, () =>
+                runSandboxed('echo M6-RAN', 120_000),
+              ),
+            )
+          }
         } catch (e) {
           error = e
         }
-        const t2 = Date.now()
-        await SandboxManager.reset()
-        const t3 = Date.now()
-        const took =
-          `initialize() ${t1 - t0} ms, one command ${t2 - t1} ms, ` +
-          `reset() ${t3 - t2} ms`
-        console.log(`M6: ${took}`)
+        await timeInto(took, 'reset()', () => SandboxManager.reset())
+        console.log(`M6: ${inWords(took)}`)
         if (error !== undefined) throw error
-        if (echo?.status !== 0 || !echo.stdout.includes('M6-RAN')) {
+        const bad = ran.find(
+          r => r.status !== 0 || !r.stdout.includes('M6-RAN'),
+        )
+        if (bad) {
           throw new Error(
-            `M6: the timed command did not run — exit=${echo?.status} ` +
-              `stdout=${JSON.stringify(echo?.stdout)} ` +
-              `stderr=${JSON.stringify(echo?.stderr)}`,
+            `M6: a timed command did not run — exit=${bad.status} ` +
+              `stdout=${JSON.stringify(bad.stdout)} ` +
+              `stderr=${JSON.stringify(bad.stderr)}`,
           )
         }
-        if (Math.max(t1 - t0, t2 - t1, t3 - t2) >= 30_000) {
-          throw new Error(`M6: ${took}, over the 30000 ms allowed each`)
+        const over = Object.keys(took).filter(
+          what => took[what] >= (/second|third/.test(what) ? 2_000 : 30_000),
+        )
+        if (over.length > 0) {
+          throw new Error(
+            `M6: ${inWords(took)}: over its limit (2000 ms for the second ` +
+              `and third command, 30000 ms for the rest): ${over.join(', ')}`,
+          )
         }
       } finally {
         process.chdir(saved)
-        rmSync(dir, { recursive: true, force: true })
       }
     }, 600_000)
 
@@ -2205,6 +2310,139 @@ describe.if(isWindows)(
           )
         }
       } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M8: a mandatory name that appears after initialize() is denied to the next command, and only that command pays', async () => {
+      const dir = bigTree()
+      const settings = join(dir, '.vscode', 'settings.json')
+      try {
+        rmSync(join(dir, '.vscode'), { recursive: true, force: true })
+        rmSync(join(dir, '.gitconfig'), { force: true })
+        const took: Took = {}
+        const ran = await inSession(dir, { allowWrite: [dir] }, async () => {
+          mkdirSync(join(dir, '.vscode'))
+          writeFileSync(settings, 'V1')
+          return [
+            await timeInto(took, 'the next command', () =>
+              runSandboxed(`echo POISON>"${settings}" & echo M8-RAN`, 120_000),
+            ),
+            await timeInto(took, 'the one after', () =>
+              runSandboxed('echo M8-RAN', 120_000),
+            ),
+          ]
+        })
+        console.log(`M8: ${inWords(took)}`)
+        const got = readFileSync(settings, 'utf8')
+        if (
+          got !== 'V1' ||
+          !ran.every(r => r.stdout.includes('M8-RAN')) ||
+          took['the one after'] >= 2_000
+        ) {
+          throw new Error(
+            `M8: wanted both commands run, settings.json kept, and the ` +
+              `second in under 2000 ms — ${inWords(took)} ` +
+              `settings=${JSON.stringify(got)} ran=${JSON.stringify(ran)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        big = undefined
+      }
+    }, 600_000)
+
+    it('M9: .git is pinned again after `icacls /reset` strips it between two commands', async () => {
+      const dir = mandatoryTree()
+      const git = join(dir, '.git')
+      try {
+        await inSession(dir, { allowWrite: [dir] }, async () => {
+          await runSandboxed('echo 1')
+          spawnSync('icacls', [git, '/reset'], { timeout: 10_000 })
+          if (ownAces(git).length > 0) {
+            throw new Error(`M9: icacls /reset stripped nothing: ${dacl(git)}`)
+          }
+          expectGitPinned('M9', dir, await runSandboxed(renameGitAside(dir)))
+        })
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M10: a .git the host removed and recreated between two commands is pinned again', async () => {
+      const dir = mandatoryTree()
+      const git = join(dir, '.git')
+      try {
+        await inSession(dir, { allowWrite: [dir] }, async () => {
+          await runSandboxed('echo 1')
+          rmSync(git, { recursive: true, force: true })
+          mkdirSync(join(git, 'hooks'), { recursive: true })
+          writeFileSync(join(git, 'config'), 'CONFIG-V1')
+          writeFileSync(join(git, 'hooks', 'pre-commit'), 'HOOK-V1')
+          expectGitPinned('M10', dir, await runSandboxed(renameGitAside(dir)))
+        })
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M11: reset() leaves the DACLs of the working directory and of .git as initialize() found them', async () => {
+      const dir = mandatoryTree()
+      const both = () => dacl(dir) + dacl(join(dir, '.git'))
+      try {
+        const before = both()
+        const held = await inSession(dir, { allowWrite: [dir] }, async () => {
+          await runSandboxed('echo 1')
+          return both()
+        })
+        const after = both()
+        // `held` differing shows that there was something to undo.
+        if (held === before || after !== before) {
+          throw new Error(
+            `M11: before=${JSON.stringify(before)} ` +
+              `in the session=${JSON.stringify(held)} ` +
+              `after=${JSON.stringify(after)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it("M12: one session's reset() leaves another's directory-level denies in force", async () => {
+      const dir = mandatoryTree()
+      const git = join(dir, '.git')
+      // Stands in for a second host: any live process can hold.
+      const other = spawn('ping', ['-n', '120', '127.0.0.1'], {
+        stdio: 'ignore',
+      })
+      const theirs = {
+        sandboxUserSid: sbSid,
+        holderPid: other.pid!,
+        srtWin: TEST_SRT_WIN,
+      }
+      try {
+        await inSession(dir, { allowWrite: [dir] }, () => {
+          stampWindowsAcl({
+            ...theirs,
+            denyRead: [],
+            denyWrite: [join(git, 'hooks')],
+            dirsOnly: true,
+          })
+          return Promise.resolve()
+        })
+        const afterOne = ownAces(git)
+        restoreWindowsAcl(theirs)
+        const afterBoth = ownAces(git)
+        if (afterOne.length === 0 || afterBoth.length > 0) {
+          throw new Error(
+            `M12: the sandbox account's ACEs on .git — ` +
+              `after one release ${JSON.stringify(afterOne)} (wanted some), ` +
+              `after both ${JSON.stringify(afterBoth)} (wanted none)`,
+          )
+        }
+      } finally {
+        other.kill()
         rmSync(dir, { recursive: true, force: true })
       }
     }, 90_000)

@@ -673,8 +673,8 @@ pub enum SbAce {
     DenyDelete,
     /// Same ACE on a REAL directory between a `Deny` target and its
     /// modify-grant root, so the ancestor chain cannot be renamed
-    /// aside. No parent-FDC side ACE: that would re-propagate an
-    /// inheritable ACE over the tree on every exec.
+    /// aside. No parent-FDC side ACE: on the grant root, the topmost
+    /// pin's parent, it would re-propagate over the whole tree.
     DenyPin,
 }
 
@@ -708,6 +708,12 @@ impl DenyMask {
 }
 
 impl SbAce {
+    /// The directory-level denies. Writing one re-propagates through
+    /// the directory's tree, so they are held for the session and not
+    /// per command; the `Deny` on each target is per command.
+    pub fn session_held(self) -> bool {
+        matches!(self, SbAce::DenyFdc | SbAce::DenyPin)
+    }
     /// `'grant' | 'deny' | 'deny_fdc'` — the row's `kind` column.
     pub fn kind(self) -> &'static str {
         match self {
@@ -844,6 +850,14 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
     let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
+    // Nothing would change: skip the write, which on a directory
+    // re-propagates through its whole tree. INVARIANT: judged against
+    // the DACL just read from DISK, never against the state DB, so
+    // that ACEs stripped from outside (`icacls /reset`, the sandbox
+    // user on a directory it owns) are put back by the next command.
+    if same_explicit_aces(old, new.as_ptr())? {
+        return Ok(());
+    }
     // 4. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
     //    parent, PROTECTED when inheritance was severed before we
@@ -855,6 +869,20 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     };
     write_file_dacl(canonical_path, new.as_ptr(), prot)
         .with_context(|| format!("recompose '{canonical_path}'"))
+}
+
+/// Whether `old`'s explicit ACEs are exactly `new`'s ACEs, byte for
+/// byte and in order. `old`'s inherited ACEs do not count: a write
+/// does not carry them, the system re-derives them.
+fn same_explicit_aces(old: *const ACL, new: *const ACL) -> Result<bool> {
+    fn bytes(k: &KeptAces) -> Vec<&[u8]> {
+        k.0.iter()
+            .map(|&(p, n)| unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) })
+            .collect()
+    }
+    let old = filter_aces(old, |hdr, _| hdr.AceFlags & INHERITED_ACE == 0)?;
+    let new = filter_aces(new, |_, _| true)?;
+    Ok(bytes(&old) == bytes(&new))
 }
 
 /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
@@ -994,6 +1022,34 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dacl_write_is_skipped_only_for_the_same_explicit_aces() {
+        let (sb, sy) = (
+            LocalPsid::from_string("S-1-5-32-546").unwrap(),
+            LocalPsid::from_string(SID_SYSTEM).unwrap(),
+        );
+        let deny = || NewAce::Deny(sb.as_psid(), Mask::FILE_DELETE_CHILD.bits(), OICI);
+        let allow = |flags| NewAce::Allow(sy.as_psid(), Mask::FILE_ALL.bits(), flags);
+        let inherited = ACE_FLAGS(OICI.0 | INHERITED_ACE as u32);
+        let same = |on_disk: &[NewAce], to_write: &[NewAce]| {
+            let acl =
+                |a| rebuild_acl(ACL_REVISION, a, &(Vec::new(), 0, ACL_REVISION), &[]).unwrap();
+            same_explicit_aces(acl(on_disk).as_ptr(), acl(to_write).as_ptr()).unwrap()
+        };
+        let want = [deny(), allow(OICI)];
+        assert!(same(&[deny(), allow(OICI)], &want), "the same");
+        assert!(
+            same(&[deny(), allow(OICI), allow(inherited)], &want),
+            "inherited ACEs do not count"
+        );
+        assert!(!same(&[allow(OICI), deny()], &want), "another order");
+        assert!(
+            !same(&[deny(), allow(OICI), allow(NO_INHERIT)], &want),
+            "a superset"
+        );
+        assert!(!same(&[allow(OICI)], &want), "our ACE stripped");
     }
 
     #[test]

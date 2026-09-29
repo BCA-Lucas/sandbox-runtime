@@ -45,6 +45,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
@@ -72,7 +73,7 @@ impl std::str::FromStr for HolderPid {
 }
 
 /// Per-user session DB (brokers / ace_holders / working_aces).
-const SESSION_SCHEMA_VERSION: i64 = 8;
+const SESSION_SCHEMA_VERSION: i64 = 9;
 
 const SESSION_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
@@ -81,7 +82,7 @@ CREATE TABLE IF NOT EXISTS brokers (
   started_at          INTEGER NOT NULL
 );
 -- Additive explicit ACEs for the sandbox user. kind ∈
--- {'grant','deny','deny_fdc'}: `acl grant` writes ALLOW rows,
+-- {'grant','deny','deny_fdc','deny_delete','deny_pin'}: `acl grant` writes ALLOW rows,
 -- `acl stamp` writes DENY rows on the target plus a `deny_fdc`
 -- row on the parent. Stores no original_sd — restore is a
 -- walk-and-filter that drops the SID's ACEs, not a full-SD
@@ -545,7 +546,11 @@ pub fn with_init_lock<R>(
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
     let (_mutex, conn, report) = locked_recovered(force_recover)?;
-    let mut locked = Locked { conn, holder_pid };
+    let mut locked = Locked {
+        conn,
+        holder_pid,
+        session: None,
+    };
     let out = f(&mut locked)?;
     Ok((out, report))
 }
@@ -574,10 +579,25 @@ fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, Recov
 pub struct Locked {
     conn: Connection,
     holder_pid: HolderPid,
+    /// Holder of the [`SbAce::session_held`] rows an `exec` records:
+    /// the host whose session it runs in. `None`: `holder_pid`.
+    pub session: Option<HolderPid>,
 }
 
 impl Locked {
-    /// Record `self.holder_pid` in `brokers`. The row's
+    fn holder_of(&self, ace: SbAce) -> HolderPid {
+        self.session
+            .filter(|_| ace.session_held())
+            .unwrap_or(self.holder_pid)
+    }
+
+    /// [`Self::register`] this call's holders.
+    pub fn register_broker(&self) -> Result<()> {
+        self.register(self.holder_pid)?;
+        self.session.map_or(Ok(()), |s| self.register(s))
+    }
+
+    /// Record `pid` in `brokers`. The row's
     /// `process_create_time` is the HOLDER's, so crash-recovery
     /// checks whether the holder — not this short-lived CLI — is
     /// still alive.
@@ -590,9 +610,9 @@ impl Locked {
     /// holds, and the next crash-recovery would strip those ACEs
     /// while the holder's child is still running. `ON CONFLICT DO
     /// UPDATE` updates in place and leaves child rows intact.
-    pub fn register_broker(&self) -> Result<()> {
-        let ct = pid_create_time(self.holder_pid.0)
-            .with_context(|| format!("read create-time of holder pid {}", self.holder_pid.0))?;
+    fn register(&self, pid: HolderPid) -> Result<()> {
+        let ct = pid_create_time(pid.0)
+            .with_context(|| format!("read create-time of holder pid {}", pid.0))?;
         let now = unix_now();
         self.conn
             .execute(
@@ -601,7 +621,7 @@ impl Locked {
                  ON CONFLICT(pid) DO UPDATE SET \
                    process_create_time = excluded.process_create_time, \
                    started_at          = excluded.started_at",
-                params![self.holder_pid.0 as i64, ct, now],
+                params![pid.0 as i64, ct, now],
             )
             .context("INSERT brokers")?;
         Ok(())
@@ -630,16 +650,14 @@ impl Locked {
         self.register_broker()?;
         let (witnesses, failed) = f(self)?;
         if failed > 0 {
-            for w in witnesses.iter().filter(|w| w.holder_added) {
-                if let Err(e) = self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid) {
-                    eprintln!(
-                        "srt-win: WARNING: rollback {} '{}': {e:#}; \
-                         ACE left in place",
-                        w.ace.kind(),
-                        w.canon
-                    );
-                }
-            }
+            // The session's rows stay: they only deny, and its next
+            // command wants them again.
+            let mine: Vec<(String, String)> = witnesses
+                .iter()
+                .filter(|w| w.holder_added && self.holder_of(w.ace) == self.holder_pid)
+                .map(|w| (w.canon.clone(), w.ace.kind().to_string()))
+                .collect();
+            self.release_holds(&mine, sandbox_sid);
             if self
                 .my_ace_holds(None)
                 .map(|h| h.is_empty())
@@ -652,18 +670,13 @@ impl Locked {
     }
 
     /// Apply additive sandbox-user ACEs on each `(canon, ace)` and
-    /// record `self.holder_pid` as a holder. Refcounted: a path
-    /// already held by another holder gets its on-disk ACE
-    /// re-converged (idempotent) and a holder row added; release
-    /// recomputes the effective mask from the remaining holders.
+    /// record its holder ([`Self::holder_of`]). Refcounted: a path
+    /// already held by another holder gets a holder row added;
+    /// release recomputes the effective mask from the remaining
+    /// holders.
     ///
-    /// `Deny` targets implicitly add a `(parent, DenyFdc)` entry so
-    /// the sandbox user cannot `del`/`ren` the file via parent-FDC
-    /// even when the parent carries an inherited
-    /// `BUILTIN\Users:(F)`. Multiple denied siblings under one
-    /// parent share the parent's `deny_fdc` row (PK
-    /// `(path, kind, pid)` dedupes within one holder; refcount
-    /// handles cross-holder).
+    /// Every row is recorded first, so that each path is then written
+    /// at most once, and not at all by a batch that rolls back.
     ///
     /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
     pub fn apply_aces(
@@ -674,48 +687,46 @@ impl Locked {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
             let mut failed = 0usize;
-            let mut one = |canon: &str, ace: SbAce| -> bool {
-                match db.ensure_ace(canon, ace, sandbox_sid) {
-                    Ok(w) => {
-                        witnesses.push(w);
-                        true
-                    }
+            for (canon, ace) in targets {
+                match db.record_ace(canon, *ace) {
+                    Ok(w) => witnesses.push(w),
                     Err(e) => {
                         eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
                         failed += 1;
-                        false
                     }
                 }
-            };
-            for (canon, ace) in targets {
-                // Skip the parent-FDC ACE when the file's own
-                // Deny failed (e.g. hardlink refuse) — the batch
-                // is going to roll back anyway (`failed > 0`),
-                // and stamping the parent first just to release
-                // it in the same pass wastes a SetSecurityInfo
-                // round-trip and clutters the failure output.
-                if one(canon, *ace)
-                    && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
-                    && let Some(p) = path_id::canonical_parent_of(canon)
-                {
-                    one(&p, SbAce::DenyFdc);
-                }
+            }
+            if failed == 0 {
+                failed = db.converge(witnesses.iter().map(|w| w.canon.as_str()), sandbox_sid);
             }
             Ok((witnesses, failed))
         })
     }
 
-    /// Disk-first single-ACE converge. Record-first upsert (holder
-    /// row plus `working_aces` row) then [`recompose_at`] so a
-    /// crash between leaves a row whose ACE hasn't been written —
-    /// the next call re-derives and reapplies.
-    fn ensure_ace(&self, canon: &str, want: SbAce, sandbox_sid: &str) -> Result<AceWitness> {
+    /// [`recompose_at`] each distinct path once. Returns how many
+    /// failed.
+    fn converge<'a>(&self, paths: impl Iterator<Item = &'a str>, sandbox_sid: &str) -> usize {
+        let mut failed = 0usize;
+        for p in paths.collect::<BTreeSet<_>>() {
+            if let Err(e) = recompose_at(&self.conn, p, sandbox_sid) {
+                eprintln!("srt-win: WARNING: {e:#}");
+                failed += 1;
+            }
+        }
+        failed
+    }
+
+    /// Upsert the holder row and the `working_aces` row. The caller
+    /// converges the path afterwards: a crash between leaves a row
+    /// whose ACE hasn't been written, and the next call reapplies it.
+    fn record_ace(&self, canon: &str, want: SbAce) -> Result<AceWitness> {
+        let pid = self.holder_of(want).0 as i64;
         let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
         // Hardlink guard: NTFS hardlinks share one SD across
         // distinct canonical paths, but `ace_holders` is
         // PATH-keyed. A Deny on one alias is invisible to a holder
-        // of another — `release_one_ace` on the alias sees
+        // of another — `drop_hold` on the alias sees
         // remaining=0 and recomposes the SHARED DACL without the
         // deny while the other holder's child is still running.
         // Refuse Deny on multi-link files; Grant is fail-open so
@@ -737,8 +748,13 @@ impl Locked {
             .query_row(params![canon, want.kind()], |r| r.get(0))
             .optional()
             .context("SELECT working_aces")?;
+        // A replaced DIRECTORY (the host removed and recreated `.git`)
+        // is stamped afresh, the row taking its id: refusing would fail
+        // every later command of the session, and keeping the old row
+        // would leave the new directory unpinned.
         if let Some(fid) = &prior
             && FileId::from_bytes(fid)? != cur_id
+            && !want.session_held()
         {
             bail!(
                 "'{canon}': file_id changed since prior {} — path \
@@ -764,7 +780,7 @@ impl Locked {
                  canonical_path = ?1 AND kind = ?2 AND pid = ?3 \
                  LIMIT 1",
             )?
-            .exists(params![canon, want.kind(), self.holder_pid.0 as i64])
+            .exists(params![canon, want.kind(), pid])
             .context("SELECT ace_holders (held?)")?;
         self.conn
             .prepare_cached(
@@ -774,12 +790,7 @@ impl Locked {
                  ON CONFLICT(canonical_path, kind, pid) \
                  DO UPDATE SET want_mask = excluded.want_mask",
             )?
-            .execute(params![
-                canon,
-                want.kind(),
-                self.holder_pid.0 as i64,
-                want.as_str()
-            ])
+            .execute(params![canon, want.kind(), pid, want.as_str()])
             .context("UPSERT ace_holders")?;
         let holder_added = !already_held;
         let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
@@ -799,7 +810,6 @@ impl Locked {
                 eff.as_str()
             ])
             .context("UPSERT working_aces")?;
-        recompose_at(&self.conn, canon, sandbox_sid)?;
         Ok(AceWitness {
             canon: canon.to_string(),
             ace: eff,
@@ -825,15 +835,16 @@ impl Locked {
             .transpose()
     }
 
-    /// Release one `(canon, kind)` hold; recompute the effective ACE
-    /// from the remaining holders (downgrade if this holder was the
-    /// one that escalated it; revoke when zero remain).
+    /// Drop one `(canon, kind)` hold of `holder_pid`; recompute the
+    /// effective ACE from the remaining holders (downgrade if this
+    /// holder was the one that escalated it; revoke when zero
+    /// remain). Rows only: returns the path to converge, if any.
     /// Identity-validated: if the path now resolves to a different
     /// `file_id`, the row is dropped and the ACE on the foreign
     /// object is NOT touched — except for `Grant`, where we
     /// best-effort `locate_by_file_id` and revoke at the moved path
     /// so the sandbox user does not keep stale access.
-    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
+    fn drop_hold(&self, canon: &str, kind: &str) -> Result<(AceRelease, Option<String>)> {
         self.conn
             .prepare_cached(
                 "DELETE FROM ace_holders WHERE canonical_path = ?1 \
@@ -850,10 +861,10 @@ impl Locked {
             .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((fid, stored)) = row else {
-            return Ok(AceRelease::NoRow);
+            return Ok((AceRelease::NoRow, None));
         };
         let new_eff = self.effective_ace(canon, kind)?;
-        // Row update first (record-first), then converge disk.
+        // Row update first (record-first); the caller converges disk.
         match new_eff {
             Some(e) => self
                 .conn
@@ -873,15 +884,15 @@ impl Locked {
                 .context("DELETE working_aces")?,
         };
         let want_id = FileId::from_bytes(&fid)?;
-        match identity_gate(canon, want_id) {
-            IdGate::Match => {
-                recompose_at(&self.conn, canon, sandbox_sid)?;
-                Ok(match new_eff {
+        Ok(match identity_gate(canon, want_id) {
+            IdGate::Match => (
+                match new_eff {
                     Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                     Some(_) => AceRelease::Downgraded,
                     None => AceRelease::Revoked,
-                })
-            }
+                },
+                Some(canon.to_string()),
+            ),
             IdGate::Mismatch if kind == "grant" => {
                 // The granted object moved. The ALLOW ACE travels
                 // with the inode → the sandbox user still has
@@ -889,23 +900,23 @@ impl Locked {
                 // revoke there (then re-converge if the new path
                 // happens to be tracked too). DENY/FDC are left in
                 // place on the moved inode (fail-closed).
-                Ok(match path_id::locate_by_file_id(&want_id) {
+                match path_id::locate_by_file_id(&want_id) {
                     Some(at) => {
                         eprintln!(
                             "srt-win: grant '{canon}': file_id moved \
                              to '{at}'; revoking there"
                         );
-                        recompose_at(&self.conn, &at, sandbox_sid)?;
-                        AceRelease::Relocated { moved_to: at }
+                        let moved_to = at.clone();
+                        (AceRelease::Relocated { moved_to }, Some(at))
                     }
                     None => {
                         eprintln!(
                             "srt-win: grant '{canon}': file_id not \
                              found on volume; dropping row"
                         );
-                        AceRelease::Missing
+                        (AceRelease::Missing, None)
                     }
-                })
+                }
             }
             IdGate::Mismatch => {
                 eprintln!(
@@ -913,16 +924,45 @@ impl Locked {
                      path substituted; not touching ACE on the \
                      foreign object (fail-closed)"
                 );
-                Ok(AceRelease::Mismatch)
+                (AceRelease::Mismatch, None)
             }
             IdGate::Unreadable => {
                 eprintln!(
                     "srt-win: {kind} '{canon}': open failed; \
                      dropping row"
                 );
-                Ok(AceRelease::Missing)
+                (AceRelease::Missing, None)
+            }
+        })
+    }
+
+    /// Drop `holds` of `holder_pid`: every row first, so that each
+    /// path is then written at most once. Per-path catch-and-continue.
+    fn release_holds(
+        &self,
+        holds: &[(String, String)],
+        sandbox_sid: &str,
+    ) -> (Vec<(String, AceRelease)>, usize) {
+        let mut out = Vec::with_capacity(holds.len());
+        let mut paths = Vec::new();
+        let mut failed = 0usize;
+        for (canon, kind) in holds {
+            match self.drop_hold(canon, kind) {
+                Ok((r, at)) => {
+                    out.push((canon.clone(), r));
+                    paths.extend(at);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "srt-win: WARNING: release {kind} '{canon}': \
+                         {e:#}; ACE left in place"
+                    );
+                    failed += 1;
+                }
             }
         }
+        failed += self.converge(paths.iter().map(String::as_str), sandbox_sid);
+        (out, failed)
     }
 
     /// `(canon, kind)` rows held by this holder, optionally filtered
@@ -944,27 +984,13 @@ impl Locked {
     /// Release every ACE hold of `self.holder_pid` for the given
     /// `kinds` ([`KIND_GRANT`] for `acl revoke`; [`KIND_DENY`] for
     /// `acl restore --sandbox-user-sid`) and unregister if no holds
-    /// of any kind remain. Per-path catch-and-continue.
+    /// of any kind remain.
     pub fn release_aces(
         &self,
         sandbox_sid: &str,
         kinds: &[&str],
     ) -> Result<(Vec<(String, AceRelease)>, usize)> {
-        let holds = self.my_ace_holds(Some(kinds))?;
-        let mut out = Vec::with_capacity(holds.len());
-        let mut failed = 0usize;
-        for (canon, kind) in &holds {
-            match self.release_one_ace(canon, kind, sandbox_sid) {
-                Ok(r) => out.push((canon.clone(), r)),
-                Err(e) => {
-                    eprintln!(
-                        "srt-win: WARNING: release {kind} '{canon}': \
-                         {e:#}; ACE left in place"
-                    );
-                    failed += 1;
-                }
-            }
-        }
+        let (out, failed) = self.release_holds(&self.my_ace_holds(Some(kinds))?, sandbox_sid);
         if self
             .my_ace_holds(None)
             .map(|h| h.is_empty())
@@ -1369,6 +1395,7 @@ mod tests {
         let mut db = Locked {
             conn,
             holder_pid: HolderPid(std::process::id()),
+            session: None,
         };
         f(&mut db)
     }
@@ -1381,7 +1408,7 @@ mod tests {
     fn second_register_broker_keeps_existing_holds() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            // Two holds via direct INSERT (ensure_ace needs a real
+            // Two holds via direct INSERT (record_ace needs a real
             // file; the CASCADE behavior under test is pure SQL).
             for p in [r"\\?\C:\a", r"\\?\C:\b"] {
                 db.conn

@@ -200,10 +200,9 @@ enum Cmd {
     /// otherwise exits **15**.
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
-        /// ACE for the sandbox user on `<PATH>` (and a parent
-        /// `FILE_DELETE_CHILD` DENY) for the lifetime of this exec
-        /// — under THIS process's PID as holder, released after the
-        /// child exits. Repeatable. Same chokepoint as `acl stamp`;
+        /// ACE for the sandbox user on `<PATH>` for the lifetime of
+        /// this exec — under THIS process's PID as holder, released
+        /// after the child exits. Repeatable. Same chokepoint as `acl stamp`;
         /// fails the exec if any path cannot be stamped (per-exec
         /// is "deny THIS one command", so a missing path is a
         /// caller error, not a skip).
@@ -212,6 +211,13 @@ enum Cmd {
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
+        /// Hold the directory-level ACEs the denies need (the parent
+        /// `FILE_DELETE_CHILD` DENY, the ancestor pins) under this
+        /// PID instead of this exec's, so that they outlive it and
+        /// the session's later commands find them in place. That
+        /// holder's `acl restore` releases them.
+        #[arg(long)]
+        session_holder_pid: Option<u32>,
         /// `KEY=VALUE` pair overlaid on the sandbox-user runner's
         /// profile environment when building the child's env block.
         /// Repeatable. The broker forwards exactly these — it does
@@ -298,6 +304,10 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Only the directory-level ACEs of the targets (see `exec
+        /// --session-holder-pid`), not the DENY on the targets.
+        #[arg(long)]
+        dirs_only: bool,
     },
     /// Read `{read:[…], write:[…]}` from stdin and add an
     /// inheritable `(OI)(CI)` ALLOW ACE for `--sandbox-user-sid` on
@@ -406,7 +416,9 @@ struct AceTargets {
 /// releasing any one holder cannot strip an intermediate another
 /// holder still depends on. Real ancestors strictly between the
 /// target and its enclosing modify-grant root get
-/// [`SbAce::DenyPin`].
+/// [`SbAce::DenyPin`], and the parent of every denied object
+/// [`SbAce::DenyFdc`], so that the sandbox user cannot `del`/`ren` it
+/// through a parent that carries an inherited `BUILTIN\Users:(F)`.
 ///
 /// A `Deny` target the broker cannot create (`PermissionDenied` —
 /// e.g. under `Program Files` non-elevated) or that names a UNC
@@ -424,6 +436,7 @@ struct AceTargets {
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
 /// [`SbAce::DenyPin`]: srt_win::acl::SbAce::DenyPin
+/// [`SbAce::DenyFdc`]: srt_win::acl::SbAce::DenyFdc
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
@@ -541,6 +554,12 @@ fn canonicalize_ace_targets(
         }
     }
     keep_read_denies(&mut targets);
+    let fdc: Vec<_> = targets
+        .iter()
+        .filter(|(_, a)| matches!(a, SbAce::Deny(_) | SbAce::DenyDelete))
+        .filter_map(|(c, _)| Some((canonical_parent_of(c)?, SbAce::DenyFdc)))
+        .collect();
+    targets.extend(fdc);
     Ok(AceTargets {
         targets,
         bad_inputs,
@@ -548,7 +567,7 @@ fn canonicalize_ace_targets(
 }
 
 /// Drop each `WriteDeny` whose path `targets` also read-denies.
-/// `ensure_ace` records the LAST mask a holder asks of a path, and one
+/// `record_ace` keeps the LAST mask a holder asks of a path, and one
 /// path can arrive twice: a sandboxed command can plant a junction
 /// under a mandatory write-deny name that resolves to a read-denied
 /// directory, which would otherwise end up readable.
@@ -1141,6 +1160,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Stamp {
                     holder_pid,
                     sandbox_user_sid,
+                    dirs_only,
                 },
         } => {
             // Deny is an additive DENY ACE for the sandbox user
@@ -1154,7 +1174,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
             let ((at, witnesses, failed), report) =
                 state_db::with_init_lock(holder, false, |db| {
-                    let at = canonicalize_ace_targets(
+                    let mut at = canonicalize_ace_targets(
                         db,
                         "deny",
                         &[
@@ -1167,6 +1187,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     )?;
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
+                    }
+                    if dirs_only {
+                        at.targets.retain(|(_, a)| a.session_held());
                     }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
                     Ok((at, w, f))
@@ -1403,6 +1426,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Exec {
             deny_read,
             deny_write,
+            session_holder_pid,
             env,
             quiet,
             target,
@@ -1462,7 +1486,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Per-exec file deny — `--deny-read`/`--deny-write`: the
             // host's whole deny set, recomputed for each command, via
             // the same additive DENY-ACE path as `acl stamp`, under
-            // THIS exec process's own PID as a DISTINCT holder.
+            // THIS exec process's own PID as a DISTINCT holder (the
+            // directory-level ACEs under `--session-holder-pid`).
             // Release downgrades the mask from the remaining holders'
             // MAX(want_mask). Any stamp error (glob, canon-fail,
             // apply-fail) FAILS the exec rather than running the
@@ -1473,6 +1498,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
+                    db.session = session_holder_pid.map(state_db::HolderPid);
                     let at = canonicalize_ace_targets(
                         db,
                         "deny",

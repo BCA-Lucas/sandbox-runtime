@@ -455,38 +455,6 @@ pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
     file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
 }
 
-/// `(file_id, NumberOfLinks, is_dir)` from ONE metadata open.
-/// `links > 1` on a non-directory means an alternate hardlink
-/// name exists; the additive-ACE refcount in `state_db` is
-/// PATH-keyed, so releasing one alias would strip the SHARED
-/// DACL while another alias's holder still expects it denied.
-/// Directory `NumberOfLinks` counts subdirs (NTFS has no dir
-/// hardlinks), so callers gate the check on `!is_dir`.
-pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)> {
-    use windows::Win32::Storage::FileSystem::{
-        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-    };
-    let h = open_for_metadata(canonical_path)
-        .with_context(|| format!("open '{canonical_path}' for file_id+links"))?;
-    let id = file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))?;
-    let mut std_info = FILE_STANDARD_INFO::default();
-    unsafe {
-        GetFileInformationByHandleEx(
-            h.raw(),
-            FileStandardInfo,
-            (&mut std_info as *mut FILE_STANDARD_INFO).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "GetFileInformationByHandleEx(FileStandardInfo) \
-             '{canonical_path}'"
-        )
-    })?;
-    Ok((id, std_info.NumberOfLinks, std_info.Directory))
-}
-
 /// Best-effort: locate the CURRENT path of a file by its captured
 /// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
 /// `OpenFileById` with an `ExtendedFileId` descriptor, then

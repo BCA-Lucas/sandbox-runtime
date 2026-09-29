@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -16,7 +17,7 @@ import { windowsGetMandatoryDenyPaths } from '../../src/sandbox/windows-sandbox-
 import { computeWindowsPerExecDenySet } from '../../src/sandbox/sandbox-manager.js'
 
 // Which paths a Windows command is denied: plain path computations, so these
-// run on every platform. What a deny costs a sandboxed write is M1-M22 of
+// run on every platform. What a deny costs a sandboxed write is M1-M28 of
 // test/sandbox/winsrt.test.ts.
 
 let root: string
@@ -115,11 +116,118 @@ describe('windowsGetMandatoryDenyPaths', () => {
     ])
   })
 
-  it('a `.git` pointer file yields no git denies and does not throw', () => {
-    writeFileSync(join(root, '.git'), 'gitdir: elsewhere\n')
-    writeFileSync(join(root, '.bashrc'), '')
-    expect(windowsGetMandatoryDenyPaths(root)).toEqual([join(root, '.bashrc')])
+  /** `main`, and its linked worktree `wt`. Returns `wt`'s own git directory. */
+  function linkedWorktree(): string {
+    repo(join(root, 'main'))
+    const gitDir = join(root, 'main', '.git', 'worktrees', 'wt')
+    mkdirSync(gitDir, { recursive: true })
+    writeFileSync(join(gitDir, 'commondir'), '../..\n')
+    mkdirSync(join(root, 'wt'))
+    writeFileSync(join(root, 'wt', '.git'), `gitdir: ${gitDir}\n`)
+    return gitDir
+  }
+  const inWt = (opts: { roots: string[]; allowGitConfig?: boolean }) =>
+    windowsGetMandatoryDenyPaths(join(root, 'wt'), {
+      grantRoots: () => opts.roots,
+      allowGitConfig: opts.allowGitConfig,
+    })
+
+  it("a linked worktree: the `.git` file, and the common directory's hooks and config", () => {
+    linkedWorktree()
+    expect(inWt({ roots: [root] })).toEqual([
+      join(root, 'wt', '.git'),
+      join(root, 'main', '.git', 'hooks'),
+      join(root, 'main', '.git', 'config'),
+    ])
+    expect(inWt({ roots: [root], allowGitConfig: true })).toEqual([
+      join(root, 'wt', '.git'),
+      join(root, 'main', '.git', 'hooks'),
+    ])
   })
+
+  it("a submodule: the `.git` file, and its own directory's, by a relative path", () => {
+    repo(root)
+    const own = join(root, '.git', 'modules', 'sub')
+    mkdirSync(join(own, 'hooks'), { recursive: true })
+    writeFileSync(join(own, 'config'), '')
+    mkdirSync(join(root, 'sub'))
+    writeFileSync(join(root, 'sub', '.git'), 'gitdir: ../.git/modules/sub\r\n')
+    const got = windowsGetMandatoryDenyPaths(root, { grantRoots: () => [root] })
+    expect(got).toEqual(
+      expect.arrayContaining([
+        join(root, 'sub', '.git'),
+        join(own, 'hooks'),
+        join(own, 'config'),
+      ]),
+    )
+  })
+
+  it('outside the granted roots only the `.git` file is denied, and nothing is read there', () => {
+    const gitDir = linkedWorktree()
+    const file = [join(root, 'wt', '.git')]
+    expect(inWt({ roots: [join(root, 'wt')] })).toEqual(file)
+    expect(inWt({ roots: [] })).toEqual(file)
+    // The worktree's own directory granted, the common one not.
+    mkdirSync(join(gitDir, 'hooks'))
+    expect(inWt({ roots: [gitDir] })).toEqual([...file, join(gitDir, 'hooks')])
+    // A sibling whose name only starts like a root.
+    expect(inWt({ roots: [join(root, 'ma')] })).toEqual(file)
+    // Its `commondir` leads back under a root: read, it would show.
+    repo(join(root, 'in'))
+    mkdirSync(join(root, 'out'))
+    writeFileSync(join(root, 'out', 'commondir'), '../in/.git\n')
+    writeFileSync(file[0]!, 'gitdir: ../out\n')
+    expect(inWt({ roots: [join(root, 'wt'), join(root, 'in')] })).toEqual(file)
+  })
+
+  it('a `.git` file that cannot be followed is still denied itself', () => {
+    linkedWorktree()
+    const file = join(root, 'wt', '.git')
+    for (const text of [
+      '',
+      'not a pointer\n',
+      '\ngitdir: ../main/.git\n',
+      'gitdir: ../gone\n',
+      // A UNC form, which `path.resolve` would fold into a path under the root.
+      `gitdir: //${join(root, 'main', '.git').replace(/^\//, '')}\n`,
+      `gitdir: ../main/.git\n${'#'.repeat(4096)}`,
+    ]) {
+      writeFileSync(file, text)
+      expect(inWt({ roots: [root] })).toEqual([file])
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'a `commondir` that is a link is not read',
+    () => {
+      const gitDir = linkedWorktree()
+      writeFileSync(join(root, 'target'), '../..\n')
+      rmSync(join(gitDir, 'commondir'))
+      symlinkSync(join(root, 'target'), join(gitDir, 'commondir'))
+      expect(inWt({ roots: [root] })).toEqual([join(root, 'wt', '.git')])
+    },
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'real paths are compared: a root spelled through a link counts, a directory that leads out through one does not',
+    () => {
+      linkedWorktree()
+      const alias = `${root}-alias`
+      symlinkSync(root, alias)
+      try {
+        expect(inWt({ roots: [alias] })).toContain(
+          join(root, 'main', '.git', 'hooks'),
+        )
+      } finally {
+        rmSync(alias)
+      }
+      symlinkSync(join(root, 'main', '.git'), join(root, 'wt', 'out'))
+      writeFileSync(join(root, 'wt', '.git'), 'gitdir: out\n')
+      expect(inWt({ roots: [join(root, 'wt')] })).toEqual([
+        join(root, 'wt', '.git'),
+      ])
+    },
+  )
 
   it('allowGitConfig leaves .git/config out', () => {
     repo(root)
@@ -168,6 +276,21 @@ describe('computeWindowsPerExecDenySet', () => {
       extraDenyRead: [key],
       extraDenyWrite: [notes],
     })
+  })
+
+  it('follows a `.git` file under allowWrite only', () => {
+    repo(join(root, 'main'))
+    mkdirSync(join(root, 'wt'))
+    writeFileSync(join(root, 'wt', '.git'), 'gitdir: ../main/.git\n')
+    const hooks = join(root, 'main', '.git', 'hooks')
+    const at = (allowWrite: string[]) =>
+      computeWindowsPerExecDenySet(
+        cfg({ allowWrite }),
+        undefined,
+        join(root, 'wt'),
+      ).denyWrite
+    expect(at([root])).toContain(hooks)
+    expect(at([join(root, 'wt')])).toEqual([join(root, 'wt', '.git')])
   })
 
   it('a denyRead target is not duplicated as denyWrite', () => {

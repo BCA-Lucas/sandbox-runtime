@@ -1432,6 +1432,8 @@ export function computeWindowsPerExecDenySet(
   const mandatory = windowsGetMandatoryDenyPaths(cwd, {
     maxDepth: c?.mandatoryDenySearchDepth ?? 3,
     allowGitConfig: c?.filesystem?.allowGitConfig ?? false,
+    grantRoots: () =>
+      expandWindowsFsPaths(sessFs?.allowWrite ?? [], { mode: 'grant' }),
   })
   const read = new Set(denyRead)
   const denyWrite = [

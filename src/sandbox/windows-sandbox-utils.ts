@@ -113,6 +113,13 @@ export type WindowsSandboxErrorCode =
   | 'acl_stamp_failed'
   /** `srt-win acl grant` exited non-zero. */
   | 'acl_grant_failed'
+  /**
+   * Instead of the two above: the sandbox account owns a denied path (see
+   * `.failed`) and has locked the user out of it, so no deny on it would
+   * hold. The user can fix that: delete it, or `takeown /f <path>` from an
+   * elevated prompt.
+   */
+  | 'acl_takeover_failed'
   /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
   | 'argv_too_long'
   /** Sandbox user account / credential not present — run install. */
@@ -137,19 +144,58 @@ export type WindowsSandboxErrorCode =
  * `srt_win_bad_json`) to the first CLI arg (e.g. `'install'`,
  * `'wfp'`) so a consumer can distinguish install-spawn-failed from
  * probe-spawn-failed without prose-matching. Unset elsewhere.
+ *
+ * `.failed` is set on `acl_stamp_failed`, `acl_grant_failed` and
+ * `acl_takeover_failed`, where `srt-win` got as far as reporting it.
  */
 export class WindowsSandboxError extends Error {
   readonly code: WindowsSandboxErrorCode
   readonly subcommand?: string
+  readonly failed?: readonly WindowsAclFailure[]
   constructor(
     code: WindowsSandboxErrorCode,
     message: string,
     subcommand?: string,
+    failed?: readonly WindowsAclFailure[],
   ) {
     super(message)
     this.name = 'WindowsSandboxError'
     this.code = code
     this.subcommand = subcommand
+    this.failed = failed
+  }
+}
+
+/** A path `srt-win` could not protect, and its reason. */
+export interface WindowsAclFailure {
+  path: string
+  /** `takeover_failed`, `bad_input` (never became a target) or `failed`. */
+  code: string
+  reason: string
+}
+
+function aclError(
+  code: 'acl_stamp_failed' | 'acl_grant_failed',
+  message: string,
+  subcommand: string,
+  failed: readonly WindowsAclFailure[] | undefined,
+): WindowsSandboxError {
+  return new WindowsSandboxError(
+    failed?.some(f => f.code === 'takeover_failed')
+      ? 'acl_takeover_failed'
+      : code,
+    message,
+    subcommand,
+    failed,
+  )
+}
+
+/** `failed` of `acl stamp --json` / `acl grant --json`. */
+function parseAclFailures(stdout: string): WindowsAclFailure[] | undefined {
+  try {
+    return (JSON.parse(stdout) as { failed?: WindowsAclFailure[] }).failed
+  } catch {
+    return undefined
   }
 }
 
@@ -1753,13 +1799,22 @@ export function expandWindowsFsPaths(
  *
  * Only paths that ARE THERE are returned: srt-win answers a missing deny
  * target with a permanent placeholder, which would leave an empty `.mcp.json`
- * or `.vscode\` in every directory ever sandboxed. Where `.git` is a pointer
- * file (a linked worktree, a submodule) nothing exists beneath it, so no git
- * deny results.
+ * or `.vscode\` in every directory ever sandboxed.
+ *
+ * Where `.git` is a pointer FILE (a linked worktree, a submodule) the file
+ * itself is denied: rewritten, it would send the user's next git command to
+ * a directory with hooks of the writer's own. So are the same two names in
+ * the directories it leads to ({@link windowsGitFileDirs}) under `grantRoots`,
+ * the only place a sandboxed command could write them. (A function: most
+ * trees have no such file, and expanding the roots costs a walk.)
  */
 export function windowsGetMandatoryDenyPaths(
   cwd: string,
-  opts: { maxDepth?: number; allowGitConfig?: boolean } = {},
+  opts: {
+    maxDepth?: number
+    allowGitConfig?: boolean
+    grantRoots?: () => readonly string[]
+  } = {},
 ): string[] {
   cwd = path.resolve(cwd)
   const maxDepth = opts.maxDepth ?? 3
@@ -1775,6 +1830,7 @@ export function windowsGetMandatoryDenyPaths(
   ]
     .map(name => path.resolve(cwd, name))
     .filter(isThere)
+  let roots: readonly string[] | undefined
   const walk = (dir: string, depth: number) => {
     let entries: fs.Dirent[]
     try {
@@ -1787,6 +1843,13 @@ export function windowsGetMandatoryDenyPaths(
       const full = path.join(dir, e.name)
       if (!e.isDirectory()) {
         if (files.has(name)) out.push(full)
+        if (name === '.git' && e.isFile()) {
+          out.push(full)
+          roots ??= opts.grantRoots?.() ?? []
+          for (const d of windowsGitFileDirs(full, roots)) {
+            out.push(...gitLeaves.map(l => path.join(d, l)).filter(isThere))
+          }
+        }
         continue
       }
       if (name === 'node_modules') continue
@@ -1807,6 +1870,57 @@ export function windowsGetMandatoryDenyPaths(
   }
   walk(cwd, 1)
   return [...new Set(out)]
+}
+
+/**
+ * The directories a `.git` pointer file leads to: the one its `gitdir:` line
+ * names (relative to the file's directory) and, for a linked worktree, the
+ * one that directory's `commondir` names (relative to it).
+ *
+ * Real paths are compared: git writes the long form of what a root may spell
+ * as an 8.3 name, and a junction under a root may lead out of it.
+ *
+ * THREAT: a sandboxed command may have written both files. So nothing is read
+ * at a path outside `roots`, only a small regular file is read at all, and a
+ * UNC or device form is dropped before it is so much as resolved: that alone
+ * would have this process, which no fence holds, call a server of the
+ * writer's choosing.
+ */
+export function windowsGitFileDirs(
+  gitFile: string,
+  roots: readonly string[],
+): string[] {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync.native(p)
+    } catch {
+      return path.resolve(p)
+    }
+  }
+  const fold = (p: string) =>
+    normalizeCaseForComparison(p.endsWith(path.sep) ? p : p + path.sep)
+  const under = roots.map(r => fold(real(r)))
+  const follow = (from: string, named: string | undefined) => {
+    if (!named || /^[\\/]{2}/.test(named)) return undefined
+    const p = real(path.resolve(from, named))
+    return under.some(r => fold(p).startsWith(r)) ? p : undefined
+  }
+  const firstLine = (f: string): string => {
+    try {
+      const st = fs.lstatSync(f)
+      if (!st.isFile() || st.size > 4096) return ''
+      return fs.readFileSync(f, 'utf8').split(/\r?\n/, 1)[0]!.trim()
+    } catch {
+      return ''
+    }
+  }
+  const gitDir = follow(
+    path.dirname(gitFile),
+    /^gitdir:\s*(.+)$/.exec(firstLine(gitFile))?.[1],
+  )
+  if (!gitDir) return []
+  const commonDir = follow(gitDir, firstLine(path.join(gitDir, 'commondir')))
+  return commonDir ? [gitDir, commonDir] : [gitDir]
 }
 
 /**
@@ -1837,7 +1951,9 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  * Parse a structured `srt-win exec` error from its stderr. `exec`
  * emits typed launch failures as a single JSON line
  * `{"code":…,"message":…}` alongside a distinct exit code —
- * `mapped_drive_cwd` is exit **16**. Embedders that spawn the
+ * `mapped_drive_cwd` is exit **16**, a deny that could not be stamped
+ * (`acl_stamp_failed` or `acl_takeover_failed`, with `.failed`) exit
+ * **18**. Embedders that spawn the
  * `{argv, env}` from {@link wrapCommandWithSandboxWindows} call
  * this on non-zero exit to surface an actionable
  * {@link WindowsSandboxError} instead of a bare status.
@@ -1847,10 +1963,15 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  * `srt-win` exit code before calling — the sandboxed child's own
  * stderr is pumped through unchanged, so a child that happened to
  * print a matching JSON line would parse here too.
+ *
+ * THREAT: the sandboxed command chooses its own stderr AND exit code, so
+ * it can forge all of this. Show the result; never change a permission
+ * or delete a file on the strength of it. What `initialize()` throws
+ * cannot be forged: it comes from an `srt-win` that runs no command.
  */
 export function parseWindowsSandboxError(
   stderr: string,
-): MappedDriveCwdError | undefined {
+): (WindowsSandboxError & { readonly drive?: string }) | undefined {
   for (const line of stderr.split(/\r?\n/)) {
     const t = line.trim()
     if (!t.startsWith('{') || !t.includes('"code"')) continue
@@ -1859,6 +1980,15 @@ export function parseWindowsSandboxError(
         code?: string
         message?: string
         drive?: string
+        failed?: WindowsAclFailure[]
+      }
+      if (j.code === 'acl_stamp_failed') {
+        return aclError(
+          j.code,
+          j.message ?? 'a deny could not be stamped',
+          'exec',
+          j.failed,
+        )
       }
       if (j.code === 'mapped_drive_cwd') {
         // The canonical class carries `code`/`subcommand`; `drive`
@@ -1930,6 +2060,7 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
       '--sandbox-user-sid',
       opts.sandboxUserSid,
       ...(opts.dirsOnly ? ['--dirs-only'] : []),
+      '--json',
     ],
     { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
@@ -1937,11 +2068,13 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    throw new WindowsSandboxError(
+    throw aclError(
       'acl_stamp_failed',
       `srt-win acl stamp exited ${r.status} ` +
         (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
         `: ${r.stderr || r.stdout}`,
+      'acl',
+      parseAclFailures(r.stdout),
     )
   }
 }
@@ -2061,6 +2194,7 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
       `${holder}`,
       '--sandbox-user-sid',
       opts.sandboxUserSid,
+      '--json',
     ],
     { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
@@ -2068,9 +2202,11 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    throw new WindowsSandboxError(
+    throw aclError(
       'acl_grant_failed',
       `srt-win acl grant exited ${r.status}: ${r.stderr || r.stdout}`,
+      'acl',
+      parseAclFailures(r.stdout),
     )
   }
 }

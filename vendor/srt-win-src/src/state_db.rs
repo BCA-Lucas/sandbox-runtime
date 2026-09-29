@@ -683,11 +683,11 @@ impl Locked {
     fn with_broker_registration(
         &self,
         sandbox_sid: &str,
-        f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, usize)>,
-    ) -> Result<(Vec<AceWitness>, usize)> {
+        f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, Vec<AceFailure>)>,
+    ) -> Result<(Vec<AceWitness>, Vec<AceFailure>)> {
         self.register_broker()?;
         let (witnesses, failed) = f(self)?;
-        if failed > 0 {
+        if !failed.is_empty() {
             // The session's rows stay: they only deny, and its next
             // command wants them again.
             let mine: Vec<(String, String)> = witnesses
@@ -722,20 +722,17 @@ impl Locked {
         &self,
         sandbox_sid: &str,
         targets: &[(String, SbAce)],
-    ) -> Result<(Vec<AceWitness>, usize)> {
+    ) -> Result<(Vec<AceWitness>, Vec<AceFailure>)> {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
-            let mut failed = 0usize;
+            let mut failed = Vec::new();
             for (canon, ace) in targets {
                 match db.record_ace(canon, *ace) {
                     Ok(w) => witnesses.push(w),
-                    Err(e) => {
-                        eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
-                        failed += 1;
-                    }
+                    Err(e) => failed.push(AceFailure::new(canon, &e)),
                 }
             }
-            if failed == 0 {
+            if failed.is_empty() {
                 // By the rows, not by this batch: a root stripped from
                 // outside gets its grant back with this write.
                 let granted: Vec<String> = query_vec(
@@ -749,31 +746,24 @@ impl Locked {
                     .map(|w| (w.canon.as_str(), granted.contains(&w.canon)));
                 // Stops at the first failure: no grant above a deny
                 // that could not be written.
-                if !path_order(rows, false)
-                    .into_iter()
-                    .all(|(p, _)| db.converge(p, sandbox_sid))
-                {
-                    failed = 1;
-                }
+                failed.extend(
+                    path_order(rows, false)
+                        .into_iter()
+                        .find_map(|(p, _)| db.converge(p, sandbox_sid).err()),
+                );
             }
             Ok((witnesses, failed))
         })
     }
 
-    /// [`recompose_at`], reported. Returns whether it succeeded.
-    fn converge(&self, canon: &str, sandbox_sid: &str) -> bool {
-        match recompose_at(&self.conn, canon, sandbox_sid) {
-            Ok(wrote) => {
-                if wrote && !self.quiet {
-                    eprintln!("srt-win: DACL written: '{canon}'");
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("srt-win: WARNING: {e:#}");
-                false
-            }
+    /// [`recompose_at`], reported.
+    fn converge(&self, canon: &str, sandbox_sid: &str) -> Result<(), AceFailure> {
+        let wrote =
+            recompose_at(&self.conn, canon, sandbox_sid).map_err(|e| AceFailure::new(canon, &e))?;
+        if wrote && !self.quiet {
+            eprintln!("srt-win: DACL written: '{canon}'");
         }
+        Ok(())
     }
 
     /// Upsert the holder row and the `working_aces` row. The caller
@@ -781,24 +771,7 @@ impl Locked {
     /// whose ACE hasn't been written, and the next call reapplies it.
     fn record_ace(&self, canon: &str, want: SbAce) -> Result<AceWitness> {
         let pid = self.holder_of(want).0 as i64;
-        let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
-            .with_context(|| format!("capture file_id+links '{canon}'"))?;
-        // Hardlink guard: NTFS hardlinks share one SD across
-        // distinct canonical paths, but `ace_holders` is
-        // PATH-keyed. A Deny on one alias is invisible to a holder
-        // of another — `drop_hold` on the alias sees
-        // remaining=0 and recomposes the SHARED DACL without the
-        // deny while the other holder's child is still running.
-        // Refuse Deny on multi-link files; Grant is fail-open so
-        // an early release is safe, and `DenyFdc` only targets
-        // directories.
-        if matches!(want, SbAce::Deny(_)) && !is_dir && links > 1 {
-            bail!(
-                "deny refused: '{canon}' has {links} hardlink(s); \
-                 ace_holders rows are path-keyed, so releasing an \
-                 alias would prematurely strip the shared deny ACE"
-            );
-        }
+        let cur_id = path_id::capture_file_id(canon)?;
         let prior: Option<Vec<u8>> = self
             .conn
             .prepare_cached(
@@ -1034,7 +1007,10 @@ impl Locked {
                     }
                 }
             }
-            let bad = at.iter().filter(|a| !self.converge(a, sandbox_sid)).count();
+            let bad = at
+                .iter()
+                .filter(|a| self.converge(a, sandbox_sid).is_err())
+                .count();
             failed += bad;
             // A grant that may still be on disk keeps the denies under it.
             if grant && bad > 0 {
@@ -1121,8 +1097,11 @@ impl Locked {
     /// DELETE, so they are not roots. `also`: modify-grants about to be
     /// recorded.
     pub fn grant_root_of(&self, canon: &str, also: &[String]) -> Result<Option<String>> {
+        Self::grant_root_in(&self.conn, canon, also)
+    }
+    fn grant_root_in(conn: &Connection, canon: &str, also: &[String]) -> Result<Option<String>> {
         let mut all: Vec<String> = query_vec(
-            &self.conn,
+            conn,
             "SELECT canonical_path FROM working_aces \
              WHERE kind = 'grant' AND mask = 'modify'",
             [],
@@ -1143,21 +1122,35 @@ impl Locked {
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
 fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<bool> {
+    // INVARIANT: the rows of EVERY name of this file count, the widest
+    // of a kind winning. Hardlinks share one descriptor while the rows
+    // are keyed by path: by its own rows alone, one name's release would
+    // strip, and its narrower deny would narrow, what another still holds.
+    let id = path_id::capture_file_id(canon)?;
     let rows: Vec<(String, String)> = query_vec(
         conn,
         "SELECT kind, mask FROM working_aces \
-         WHERE canonical_path = ?1",
-        params![canon],
+         WHERE canonical_path = ?1 OR file_id = ?2",
+        params![canon, id.as_bytes().as_slice()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let mut set = acl::SbAceSet::default();
     for (k, m) in &rows {
         match SbAce::parse(k, m)? {
-            SbAce::Grant(g) => set.grant = Some(g),
-            SbAce::Deny(d) => set.deny = Some(d),
+            SbAce::Grant(g) => set.grant = set.grant.max(Some(g)),
+            SbAce::Deny(d) => set.deny = set.deny.max(Some(d)),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete | SbAce::DenyPin => set.deny_delete = true,
         }
+    }
+    // Ahead of the write, which an owner could undo. Beneath a denied
+    // directory only under a modify-grant, where the sandbox user can
+    // have made something: elsewhere (`%ProgramData%`, a profile) lie
+    // trees too large to walk at every command, holding objects the
+    // caller cannot read either. By the rows, so not for an ambient deny.
+    if set.deny.is_some() || set.deny_fdc || set.deny_delete {
+        let deep = set.deny.is_some() && Locked::grant_root_in(conn, canon, &[])?.is_some();
+        acl::take_over(canon, sandbox_sid, deep)?;
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds
     // into every converge on the path, so session release/recovery
@@ -1170,6 +1163,28 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<boo
     }
     acl::apply_sandbox_aces(canon, sandbox_sid, set)
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
+}
+
+/// A path [`Locked::apply_aces`] could not protect.
+#[derive(Debug, serde::Serialize)]
+pub struct AceFailure {
+    pub path: String,
+    /// `takeover_failed` ([`acl::take_over`]: the user can fix that
+    /// one), `bad_input`, or `failed`.
+    pub code: &'static str,
+    pub reason: String,
+}
+
+impl AceFailure {
+    fn new(canon: &str, e: &anyhow::Error) -> Self {
+        eprintln!("srt-win: '{canon}': {e:#}");
+        let taken = e.downcast_ref::<acl::TakeOverFailed>();
+        Self {
+            path: taken.map_or(canon, |t| &t.0).to_string(),
+            code: taken.map_or("failed", |_| "takeover_failed"),
+            reason: format!("{e:#}"),
+        }
+    }
 }
 
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to
@@ -1580,6 +1595,54 @@ mod tests {
             }
         });
         std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn the_names_of_one_file_share_their_rows() {
+        use acl::DenyMask::{ReadDeny, WriteDeny};
+        const SB: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        let [a, b] = ["a", "b"].map(|n| {
+            let Ok((canon, _)) = path_id::canonicalize_path(dir.join(n).to_str().unwrap()) else {
+                panic!("canonicalize {n}");
+            };
+            canon
+        });
+        // A converge to what the file carries writes nothing.
+        let carries = |deny| {
+            let set = acl::SbAceSet {
+                deny,
+                ..Default::default()
+            };
+            !acl::apply_sandbox_aces(&a, SB, set).unwrap()
+        };
+        with_mem_db(|db| {
+            let targets = [
+                (a.clone(), SbAce::Deny(ReadDeny)),
+                (b.clone(), SbAce::Deny(WriteDeny)),
+            ];
+            assert!(db.apply_aces(SB, &targets).unwrap().1.is_empty());
+            assert!(carries(Some(ReadDeny)), "another name's does not narrow it");
+            db.release_holds(&[(a.clone(), "deny".into())], SB);
+            assert!(carries(Some(WriteDeny)), "the other name's stays");
+            db.release_holds(&[(b.clone(), "deny".into())], SB);
+            assert!(carries(None), "the last release takes it off");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_take_over_names_the_object_under_its_own_code() {
+        let gone = r"\\?\C:\srtwin-no-such-object";
+        let e = acl::take_over(gone, "S-1-5-32-546", true)
+            .unwrap_err()
+            .context("recompose");
+        let f = AceFailure::new(r"\\?\C:\above", &e);
+        assert_eq!((f.path.as_str(), f.code), (gone, "takeover_failed"));
+        assert_eq!(AceFailure::new("p", &anyhow!("x")).code, "failed");
     }
 
     #[test]

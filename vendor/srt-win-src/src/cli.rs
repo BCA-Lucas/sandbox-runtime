@@ -293,7 +293,7 @@ enum UserCmd {
 enum AclCmd {
     /// Read `{denyRead:[…], denyWrite:[…]}` from stdin and add an
     /// additive `(D;OICI;mask;;;<sid>)` ACE for the sandbox user on
-    /// each target plus a `(D;OICI;FILE_DELETE_CHILD;;;<sid>)` on
+    /// each target plus a `(D;OICI;FILE_DELETE_CHILD…;;;<sid>)` on
     /// the parent — NO PROTECTED rewrite, no SD snapshot.
     /// Refcounted per holder; `acl restore` removes the ACE when
     /// the last holder releases. Globs are rejected; directory
@@ -317,6 +317,10 @@ enum AclCmd {
         /// --session-holder-pid`), not the DENY on the targets.
         #[arg(long)]
         dirs_only: bool,
+        /// Emit `{"failed":[{path, code, reason}]}` on stdout: what
+        /// could not be protected, skipped inputs included.
+        #[arg(long)]
+        json: bool,
     },
     /// Read `{read:[…], write:[…]}` from stdin and add an
     /// inheritable `(OI)(CI)` ALLOW ACE for `--sandbox-user-sid` on
@@ -335,6 +339,9 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// As `acl stamp --json`.
+        #[arg(long)]
+        json: bool,
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
@@ -740,6 +747,21 @@ enum WfpCmd {
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
+}
+
+/// `failed`, behind the inputs that never became a target.
+fn with_bad_inputs(
+    bad_inputs: &[(String, String)],
+    failed: Vec<srt_win::state_db::AceFailure>,
+) -> Vec<srt_win::state_db::AceFailure> {
+    let bad = bad_inputs
+        .iter()
+        .map(|(p, e)| srt_win::state_db::AceFailure {
+            path: p.clone(),
+            code: "bad_input",
+            reason: e.clone(),
+        });
+    bad.chain(failed).collect()
 }
 
 fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
@@ -1168,6 +1190,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     holder_pid,
                     sandbox_user_sid,
                     dirs_only,
+                    json,
                 },
         } => {
             // Deny is an additive DENY ACE for the sandbox user
@@ -1205,6 +1228,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
+            let n = failed.len();
+            if json {
+                let failed = with_bad_inputs(&bad_inputs, failed);
+                println!("{}", json!({ "failed": failed }));
+            }
+            let failed = n;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl stamp (deny-ace) — {} target(s) → {} \
@@ -1247,6 +1276,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Grant {
                     holder_pid,
                     sandbox_user_sid,
+                    json,
                 },
         } => {
             use srt_win::{acl, state_db};
@@ -1280,6 +1310,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
+            let n = failed.len();
+            if json {
+                let failed = with_bad_inputs(&bad_inputs, failed);
+                println!("{}", json!({ "failed": failed }));
+            }
+            let failed = n;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
@@ -1537,23 +1573,34 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 (write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
                             ],
                         )?;
-                        if let Some((p, e)) = at.bad_inputs.first() {
-                            return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
-                        }
                         n += at.targets.len();
-                        let (_, failed) = db.apply_aces(&sb_sid, &at.targets)?;
-                        if failed > 0 {
+                        let mut failed = with_bad_inputs(&at.bad_inputs, vec![]);
+                        if failed.is_empty() {
+                            failed = db.apply_aces(&sb_sid, &at.targets)?.1;
+                        }
+                        if !failed.is_empty() {
                             return Ok((n, failed));
                         }
                     }
-                    Ok((n, 0))
+                    Ok((n, vec![]))
                 })
                 .context("per-exec deny-ace")?;
-                if failed > 0 {
-                    return Err(anyhow!(
-                        "per-exec deny: {failed} of {n} path(s) \
-                         could not be stamped; rolled back"
-                    ));
+                if !failed.is_empty() {
+                    // Typed, as `mapped_drive_cwd` below.
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "code": "acl_stamp_failed",
+                            "message": format!(
+                                "per-exec deny: {} of {n} path(s) could \
+                                 not be stamped; rolled back",
+                                failed.len()
+                            ),
+                            "failed": failed,
+                        })
+                    );
+                    drop(cred);
+                    std::process::exit(18);
                 }
                 if !quiet {
                     eprintln!(

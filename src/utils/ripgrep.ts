@@ -52,6 +52,7 @@ export async function ripGrep(
   throw new RipgrepError(
     `ripgrep failed with exit code ${code}: ${stderr}`,
     stdout.split('\n').slice(0, -1).filter(Boolean),
+    stderr,
   )
 }
 
@@ -61,6 +62,8 @@ export class RipgrepError extends Error {
     message: string,
     /** What it had listed by then. */
     readonly listed: string[],
+    /** What it said went wrong. The paths in it are the tree's own text. */
+    readonly stderr: string,
   ) {
     super(message)
     this.name = 'RipgrepError'

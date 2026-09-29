@@ -318,6 +318,51 @@ export function linuxGetCwdMandatoryDenyPaths(
 }
 
 /**
+ * The directories below `cwd`, down to `maxDepth`, that ripgrep said it could
+ * not read and that this process cannot read either. What is in one is not
+ * known, so the caller denies it whole. Exported for testing.
+ */
+export function unreadableDirectories(
+  stderr: string,
+  cwd: string,
+  maxDepth: number,
+): string[] {
+  const found: string[] = []
+  for (const line of stderr.split('\n')) {
+    const named = /^rg: (.+): .+ \(os error \d+\)$/.exec(line)?.[1]
+    if (named === undefined) continue
+    // What cannot be looked at, because what holds it cannot be searched, is
+    // stood in for by the nearest directory above it that can.
+    for (
+      let dir = path.resolve(cwd, named);
+      dir.startsWith(cwd + path.sep);
+      dir = path.dirname(dir)
+    ) {
+      try {
+        // THREAT: the text is only a hint. A name can hold a newline and a
+        // whole line of its own, and a bind of `link/x` would bring what the
+        // link leads to INTO the sandbox. So: a directory, with no link on the
+        // way to it, that cannot be read from here.
+        if (!fs.lstatSync(dir).isDirectory() || fs.realpathSync(dir) !== dir) {
+          break
+        }
+      } catch {
+        continue
+      }
+      try {
+        fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK)
+      } catch {
+        if (path.relative(cwd, dir).split(path.sep).length <= maxDepth) {
+          found.push(dir)
+        }
+      }
+      break
+    }
+  }
+  return found
+}
+
+/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
@@ -366,11 +411,14 @@ async function linuxGetMandatoryDenyPaths(
       [
         '--files',
         '--hidden',
-        // INVARIANT: what is listed depends on the names alone. An ignore file
-        // that names a directory hides all beneath it, and a configuration
-        // file can add any flag; both are files in or above the tree.
+        // INVARIANT: no file decides what is listed. An ignore file that names
+        // a directory hides all beneath it, and a configuration file can add
+        // any flag; both are files in or above the tree.
         '--no-ignore',
         '--no-config',
+        // Into a pipe ripgrep writes by the block, and killed it drops the
+        // block: it would have listed nothing.
+        '--line-buffered',
         '--max-depth',
         String(maxDepth + 1),
         ...iglobArgs,
@@ -382,10 +430,14 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 as
-    // soon as one directory cannot be read, and is killed after ten seconds,
-    // with all it had found by then on its output.
-    if (error instanceof RipgrepError) matches = error.listed
+    // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 if
+    // there was a directory it could not read, having listed the rest, and is
+    // killed after ten seconds. What it had not come to by then is not denied.
+    if (error instanceof RipgrepError) {
+      matches = error.listed
+      // A read-only bind also keeps the command from giving the mode back.
+      denyPaths.push(...unreadableDirectories(error.stderr, cwd, maxDepth))
+    }
     logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`, {
       level: 'warn',
     })

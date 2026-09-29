@@ -9,6 +9,7 @@ import {
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
   rmdirSync,
   rmSync,
@@ -28,6 +29,7 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  unreadableDirectories,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   DANGEROUS_FILES,
@@ -349,6 +351,116 @@ describe.if(isSupportedPlatform)(
           rmdirSync(unreadable)
         }
       })
+
+      for (const [directory, mode] of [
+        ['locked', 0o000],
+        ['locked/.git', 0o000],
+        // As deep as one of the names can itself lie.
+        ['locked/.claude/commands', 0o000],
+        // Can be listed, and nothing in it looked at.
+        ['locked', 0o444],
+        // The other way about.
+        ['locked', 0o111],
+      ] as const) {
+        it(`blocks them all the same in locked/ when ${directory} has mode ${mode.toString(8)}`, async () => {
+          const names = [
+            '.bashrc',
+            '.git/config',
+            '.git/hooks/pre-commit',
+            `.claude/commands/${DIRECTORY_PROBE_FILE}`,
+          ]
+          populate('locked')
+          try {
+            for (const name of names) {
+              // Each time: a command that is not held gives the mode back.
+              chmodSync(join(TEST_DIR, directory), mode)
+              const result = await runSandboxed(
+                `chmod 755 locked '${directory}'; echo x > 'locked/${name}'`,
+              )
+
+              expect([name, result.success]).toEqual([name, false])
+            }
+          } finally {
+            chmodSync(join(TEST_DIR, directory), 0o755)
+          }
+          for (const name of names) {
+            expect(readFileSync(`locked/${name}`, 'utf8')).toBe(
+              ORIGINAL_CONTENT,
+            )
+          }
+        })
+      }
+
+      // root reads a directory of any mode.
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'takes what ripgrep says it could not read for a hint only',
+        async () => {
+          const project = join(TEST_DIR, 'hints')
+          const outside = join(TEST_DIR, 'hints-outside')
+          for (const directory of [
+            join(project, 'is-readable'),
+            join(project, 'really-locked'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]) {
+            mkdirSync(directory, { recursive: true })
+          }
+          symlinkSync(outside, join(project, 'link'))
+          const locked = [
+            join(project, 'really-locked'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]
+          // What a name in the tree could make ripgrep say.
+          const said = [
+            'is-readable',
+            'really-locked',
+            'a/b/c/too-deep',
+            'link/behind-a-link',
+            '../hints-outside/behind-a-link',
+            'not-there/at-all',
+          ].map(
+            name => `rg: ${project}/${name}: Permission denied (os error 13)`,
+          )
+          const standIn = join(TEST_DIR, 'says-it-could-not-read')
+          const asked = join(TEST_DIR, 'was-asked')
+          writeFileSync(
+            standIn,
+            [
+              '#!/bin/sh',
+              `printf '%s\\n' "$@" > '${asked}'`,
+              ...said.map(line => `echo '${line}' >&2`),
+              'exit 2',
+            ].join('\n'),
+            { mode: 0o755 },
+          )
+          process.chdir(project)
+          locked.forEach(directory => chmodSync(directory, 0o000))
+          try {
+            const wrapped = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+              ripgrepConfig: { command: standIn },
+            })
+
+            expect(unreadableDirectories(said.join('\n'), project, 3)).toEqual([
+              join(project, 'really-locked'),
+            ])
+            expect(wrapped).toContain('really-locked')
+            expect(readFileSync(asked, 'utf8').split('\n')).toEqual(
+              expect.arrayContaining([
+                '--no-ignore',
+                '--no-config',
+                '--line-buffered',
+              ]),
+            )
+          } finally {
+            locked.forEach(directory => chmodSync(directory, 0o755))
+          }
+        },
+      )
 
       it.if(isLinux)(
         'takes no directory above the working directory for one of the names',

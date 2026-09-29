@@ -80,7 +80,7 @@ describe('ripGrep', () => {
       const script = join(dir, 'lists-then-fails.cjs')
       writeFileSync(
         script,
-        "process.stdout.write('one\\ntwo\\nhalf a li'); process.exitCode = 2",
+        "process.stdout.write('one\\ntwo\\nhalf a li'); process.stderr.write('went wrong'); process.exitCode = 2",
       )
 
       const error: unknown = await ripGrep(
@@ -92,6 +92,7 @@ describe('ripGrep', () => {
 
       expect(error).toBeInstanceOf(RipgrepError)
       expect((error as RipgrepError).listed).toEqual(['one', 'two'])
+      expect((error as RipgrepError).stderr).toBe('went wrong')
     } finally {
       rmSync(dir, { recursive: true })
     }

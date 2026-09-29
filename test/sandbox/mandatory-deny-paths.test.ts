@@ -233,13 +233,17 @@ describe.if(isSupportedPlatform)(
           writeFileSync(join(TEST_DIR, container, name), ORIGINAL_CONTENT)
         }
       }
-      // The deepest directory the default depth reaches on Linux is `a/b`.
-      const covered = ['sub', 'a/b']
+      // How far the default depth reaches on Linux: every name in `sub`, and
+      // the files alone in `a/b`.
+      const covered = [
+        ['sub', existing],
+        ['a/b', DANGEROUS_FILES],
+      ] as const
       const beyond = 'a/b/c'
-      beforeAll(() => [...covered, beyond].forEach(populate))
+      beforeAll(() => ['sub', 'a/b', beyond].forEach(populate))
 
-      for (const container of covered) {
-        for (const name of existing) {
+      for (const [container, names] of covered) {
+        for (const name of names) {
           it(`blocks writes to ${container}/${name}`, async () => {
             const target = `${container}/${name}`
             const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
@@ -248,21 +252,22 @@ describe.if(isSupportedPlatform)(
             expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
           })
         }
-        for (const dir of heldIn.keys()) {
-          it(`blocks a new file in ${container}/${dir}/`, async () => {
-            const target = `${container}/${dir}/new-file`
-            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
-
-            expect(result.success).toBe(false)
-            expect(existsSync(target)).toBe(false)
-          })
-        }
         it(`allows writes to ${container}/safe-file.txt`, async () => {
           const target = `${container}/safe-file.txt`
           const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
 
           expect(result.success).toBe(true)
           expect(readFileSync(target, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+        })
+      }
+
+      for (const dir of heldIn.keys()) {
+        it(`blocks a new file in sub/${dir}/`, async () => {
+          const target = `sub/${dir}/new-file`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(false)
+          expect(existsSync(target)).toBe(false)
         })
       }
 
@@ -362,18 +367,23 @@ describe.if(isSupportedPlatform)(
         },
       )
 
-      it.if(isLinux)(
-        `looks no deeper than the depth says: none of the names in ${beyond}/`,
-        async () => {
-          for (const name of existing) {
-            const target = `${beyond}/${name}`
-            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+      for (const [container, names] of [
+        ['a/b', existing.filter(name => name.includes('/'))],
+        [beyond, existing],
+      ] as const) {
+        it.if(isLinux)(
+          `looks no deeper than the depth says: ${names.length} names in ${container}/`,
+          async () => {
+            for (const name of names) {
+              const target = `${container}/${name}`
+              const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
 
-            expect([target, result.success]).toEqual([target, true])
-          }
-        },
-        60_000,
-      )
+              expect([target, result.success]).toEqual([target, true])
+            }
+          },
+          60_000,
+        )
+      }
     })
 
     describe('Safe files should still be writable', () => {

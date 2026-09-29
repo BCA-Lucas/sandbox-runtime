@@ -1153,8 +1153,9 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'How far below the working directory dangerous names are looked for on Linux (default: 3): ' +
-          'in it and in the directories up to one level less than this below it. ' +
+        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
+          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+          'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z

@@ -357,9 +357,9 @@ async function linuxGetMandatoryDenyPaths(
   // Limit depth for performance - deeply nested dangerous files are rare
   // and the security benefit doesn't justify the traversal cost
   //
-  // ripgrep lists files, and its depth is the file's. `maxDepth` is that of a
-  // dangerous FILE, which lies in a directory one level up; the same
-  // directory's `.git/hooks/pre-commit` is two levels further down.
+  // ripgrep lists files, and its depth is the file's. `sub/.vscode/x` and
+  // `sub/.git/config` lie at `maxDepth`; `sub/.git/hooks/pre-commit`, of the
+  // same directory, one level further down.
   let matches: string[] = []
   try {
     matches = await ripGrep(
@@ -372,7 +372,7 @@ async function linuxGetMandatoryDenyPaths(
         '--no-ignore',
         '--no-config',
         '--max-depth',
-        String(maxDepth + 2),
+        String(maxDepth + 1),
         ...iglobArgs,
         '-g',
         '!**/node_modules/**',
@@ -407,18 +407,21 @@ async function linuxGetMandatoryDenyPaths(
     // `directoryNames` on the way down, else the file itself.
     let at = segments.length - 1
     let length = 1
+    // How deep the directory holding the name, `at`, may lie. One level less
+    // for `directoryNames`, all alike: each costs mounts that keep what holds
+    // it from being renamed or removed, and bwrap's start grows with them.
+    let deepest = maxDepth - 1
     search: for (let i = 0; i < lower.length; i++) {
       for (const name of directoryNames) {
         if (name.every((component, k) => lower[i + k] === component)) {
           at = i
           length = name.length
+          deepest = maxDepth - 2
           break search
         }
       }
     }
-    // The depth is that of the directory holding the name, `at`, so that the
-    // names the scan saw in one directory are treated alike.
-    if (at > maxDepth - 1) continue
+    if (at > deepest) continue
     const found = segments.slice(0, at + length)
     if (lower[at] === '.git' && lower[at + 1] === 'head')
       found[at + 1] = 'hooks'

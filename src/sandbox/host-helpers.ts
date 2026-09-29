@@ -13,7 +13,12 @@ import {
 } from './sandbox-utils.js'
 
 /** A file the search found and would not use, and why. */
-export type SkippedHostHelper = { candidate: string; reason: string }
+export type SkippedHostHelper = {
+  path: string
+  reason: string
+  /** The allowed write path that covers it, when that is the reason. */
+  writePath?: string
+}
 
 export type HostHelperSearch = {
   /** The helper to run, by absolute path; null when none may be used. */
@@ -124,16 +129,22 @@ function firstWritablePlace(
  * Why `file` must not be run on the host under these write paths, or `null`
  * when it may. Refused too when it cannot be followed to its end.
  */
-function refusalFor(file: string, writable: readonly string[]): string | null {
+function refusalFor(
+  file: string,
+  writable: readonly string[],
+): Omit<SkippedHostHelper, 'path'> | null {
   const trail = resolutionTrail(file)
-  if (trail === null) return 'it could not be followed to a file'
+  if (trail === null) return { reason: 'it could not be followed to a file' }
   const found = firstWritablePlace(trail, writable)
   if (found === undefined) return null
   const inside = `inside the allowed write path ${found.covering}`
-  if (found.index === 0) return inside
-  return found.index === trail.length - 1
-    ? `resolves to ${found.place}, ${inside}`
-    : `reached through the link ${found.place}, ${inside}`
+  const reason =
+    found.index === 0
+      ? inside
+      : found.index === trail.length - 1
+        ? `resolves to ${found.place}, ${inside}`
+        : `reached through the link ${found.place}, ${inside}`
+  return { reason, writePath: found.covering }
 }
 
 // One accepted result per name and PATH string. A hit is never returned on
@@ -181,16 +192,19 @@ export function findHostHelper(
   const skipped: SkippedHostHelper[] = []
   for (const { entry, file } of pathCandidates(name, pathVar)) {
     if (!isExecutableFile(file)) continue
-    const reason = path.isAbsolute(entry)
+    const refusal = path.isAbsolute(entry)
       ? refusalFor(file, writable)
-      : entry === ''
-        ? 'an empty PATH entry means the current directory'
-        : `the PATH entry ${entry} is relative`
-    if (reason === null) {
+      : {
+          reason:
+            entry === ''
+              ? 'an empty PATH entry means the current directory'
+              : `the PATH entry ${entry} is relative`,
+        }
+    if (refusal === null) {
       accepted.set(key, file)
       return { path: file, skipped }
     }
-    skipped.push({ candidate: file, reason })
+    skipped.push({ path: file, ...refusal })
   }
   return { path: null, skipped }
 }
@@ -244,7 +258,9 @@ function optionNaming(helper: string): string {
 
 /**
  * The refusal for a search that found nothing to use: which helper, what was
- * passed over and why, and what lifts it.
+ * passed over and why, and what lifts it. INVARIANT: it opens with
+ * "<helper> runs on the host and was not found on PATH". The dependency check
+ * hands out strings only, and embedders tell its errors apart by that.
  */
 export function describeUnavailableHostHelper(
   helper: string,
@@ -253,7 +269,7 @@ export function describeUnavailableHostHelper(
   const passedOver =
     search.skipped.length > 0
       ? ` Passed over: ${search.skipped
-          .map(s => `${s.candidate} (${s.reason})`)
+          .map(s => `${s.path} (${s.reason})`)
           .join('; ')}.`
       : ''
   return (

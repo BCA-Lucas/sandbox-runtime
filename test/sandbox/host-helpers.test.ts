@@ -101,8 +101,9 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(search.path).toBe(join(safe, HELPER))
       expect(search.skipped).toEqual([
         {
-          candidate: join(projectBin, HELPER),
+          path: join(projectBin, HELPER),
           reason: `inside the allowed write path ${project}`,
+          writePath: project,
         },
       ])
       expect(existsSync(marker)).toBe(false)
@@ -134,7 +135,7 @@ describe('programs run on the host are found outside the allowed write paths', (
       const search = findHostHelper('bwrap', [project])
 
       expect(search.path).toBeNull()
-      expect(search.skipped.map(s => s.candidate)).toEqual([
+      expect(search.skipped.map(s => s.path)).toEqual([
         join(projectBin, 'bwrap'),
       ])
       const refusal = describeUnavailableHostHelper('bwrap', search)
@@ -167,15 +168,15 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(search.path).toBe(join(safe, HELPER))
       expect(search.skipped).toEqual([
         {
-          candidate: join(cwd, HELPER),
+          path: join(cwd, HELPER),
           reason: 'an empty PATH entry means the current directory',
         },
         {
-          candidate: join(cwd, HELPER),
+          path: join(cwd, HELPER),
           reason: 'the PATH entry . is relative',
         },
         {
-          candidate: join(cwd, 'bin', HELPER),
+          path: join(cwd, 'bin', HELPER),
           reason: 'the PATH entry bin is relative',
         },
       ])
@@ -195,8 +196,9 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(search.path).toBe(join(safe, HELPER))
       expect(search.skipped).toEqual([
         {
-          candidate: join(linked, HELPER),
+          path: join(linked, HELPER),
           reason: `resolves to ${target}, inside the allowed write path ${project}`,
+          writePath: project,
         },
       ])
     })
@@ -215,8 +217,9 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(search.path).toBe(join(elsewhere, HELPER))
       expect(search.skipped).toEqual([
         {
-          candidate: join(project, 'tools', HELPER),
+          path: join(project, 'tools', HELPER),
           reason: `inside the allowed write path ${project}`,
+          writePath: project,
         },
       ])
     })
@@ -236,8 +239,9 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(search.path).toBe(join(elsewhere, HELPER))
       expect(search.skipped).toEqual([
         {
-          candidate: join(base, 'alias', 'tools', HELPER),
+          path: join(base, 'alias', 'tools', HELPER),
           reason: `reached through the link ${join(project, 'tools')}, inside the allowed write path ${project}`,
+          writePath: project,
         },
       ])
     })
@@ -255,8 +259,9 @@ describe('programs run on the host are found outside the allowed write paths', (
         path: join(safe, HELPER),
         skipped: [
           {
-            candidate: join(projectBin, HELPER),
+            path: join(projectBin, HELPER),
             reason: `inside the allowed write path ${project}`,
+            writePath: project,
           },
         ],
       })
@@ -341,9 +346,7 @@ describe('programs run on the host are found outside the allowed write paths', (
       // The write paths now cover what was found: it is not returned again.
       const widened = findHostHelper(HELPER, [project, first])
       expect(widened.path).toBe(join(second, HELPER))
-      expect(widened.skipped.map(s => s.candidate)).toEqual([
-        join(first, HELPER),
-      ])
+      expect(widened.skipped.map(s => s.path)).toEqual([join(first, HELPER)])
 
       // And narrowed back, either copy will do; the one in hand is kept.
       expect(findHostHelper(HELPER, [project]).path).toBe(join(second, HELPER))
@@ -492,9 +495,22 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(thrown).toBeInstanceOf(LinuxSandboxProfileError)
       const refusal = thrown as LinuxSandboxProfileError
       expect(refusal.code).toBe('host_helper_unavailable')
-      expect(refusal.message).toContain('bwrap runs on the host')
+      expect(refusal.message).toStartWith(
+        'bwrap runs on the host and was not found on PATH',
+      )
       expect(refusal.message).toContain(join(projectBin, 'bwrap'))
       expect(refusal.message).toContain('bwrapPath')
+      // The same as fields, for a caller that words its own message.
+      expect(refusal.cause).toEqual({
+        helper: 'bwrap',
+        skipped: [
+          {
+            path: join(projectBin, 'bwrap'),
+            reason: `inside the allowed write path ${project}`,
+            writePath: project,
+          },
+        ],
+      })
       expect(existsSync(marker)).toBe(false)
 
       // The same for the scan's ripgrep.
@@ -570,7 +586,10 @@ describe('programs run on the host are found outside the allowed write paths', (
       })
 
       expect(restricted.errors).toHaveLength(1)
-      expect(restricted.errors[0]).toContain('bwrap runs on the host')
+      // Embedders tell the check's errors apart by these opening words.
+      expect(restricted.errors[0]).toStartWith(
+        'bwrap runs on the host and was not found on PATH',
+      )
       expect(restricted.errors[0]).toContain(join(projectBin, 'bwrap'))
       // One that is nowhere gets the plain message.
       process.env.PATH = tools

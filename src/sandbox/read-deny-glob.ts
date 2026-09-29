@@ -74,18 +74,20 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
  * @param opts.budget - shared with every expansion handed the same object.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { budget?: GlobWalkBudget } = {},
+  opts: { anchor?: string; budget?: GlobWalkBudget } = {},
 ): string[] {
   const startedAt = performance.now()
   const walk = walkGlobPattern(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    anchor: opts.anchor,
     budget: opts.budget,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
@@ -164,8 +166,11 @@ export function expandReadDenyGlobLinux(
     addLocation(standIn, candidate)
   }
 
+  // Allow paths, which reach this backend as names whatever they hold.
   const reExposed = new Set(
-    reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
+    reExposedPaths.flatMap(p =>
+      pathSpellings(normalizePathForSandbox(p, { literal: true })),
+    ),
   )
   const mounts = collapseReadDenyLocations({
     locations,

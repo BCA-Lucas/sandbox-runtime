@@ -120,12 +120,17 @@ describe.if(isSupportedPlatform)(
       cleanupBwrapMountPoints({ force: true })
     })
 
-    async function runSandboxedWrite(
+    function runSandboxedWrite(
       filePath: string,
       content: string,
     ): Promise<{ success: boolean; stderr: string }> {
+      return runSandboxed(`echo '${content}' > '${filePath}'`)
+    }
+
+    async function runSandboxed(
+      command: string,
+    ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
-      const command = `echo '${content}' > '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
@@ -204,6 +209,115 @@ describe.if(isSupportedPlatform)(
           expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
         })
       }
+    })
+
+    describe('The same names below the working directory', () => {
+      /** What holds files the host runs or trusts, and a file in each. */
+      const heldIn = new Map([
+        ['.git/hooks', 'pre-commit'],
+        ...getDangerousDirectories().map(
+          dir => [dir, DIRECTORY_PROBE_FILE] as const,
+        ),
+      ])
+      const existing = [
+        ...DANGEROUS_FILES,
+        '.git/config',
+        ...[...heldIn].map(([dir, file]) => `${dir}/${file}`),
+      ]
+      const populate = (container: string): void => {
+        for (const dir of heldIn.keys()) {
+          mkdirSync(join(TEST_DIR, container, dir), { recursive: true })
+        }
+        for (const name of [...existing, 'safe-file.txt']) {
+          writeFileSync(join(TEST_DIR, container, name), ORIGINAL_CONTENT)
+        }
+      }
+      // The deepest directory the default depth reaches on Linux is `a/b`.
+      const covered = ['sub', 'a/b']
+      const beyond = 'a/b/c'
+      beforeAll(() => [...covered, beyond].forEach(populate))
+
+      for (const container of covered) {
+        for (const name of existing) {
+          it(`blocks writes to ${container}/${name}`, async () => {
+            const target = `${container}/${name}`
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+          })
+        }
+        for (const dir of heldIn.keys()) {
+          it(`blocks a new file in ${container}/${dir}/`, async () => {
+            const target = `${container}/${dir}/new-file`
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+            expect(result.success).toBe(false)
+            expect(existsSync(target)).toBe(false)
+          })
+        }
+        it(`allows writes to ${container}/safe-file.txt`, async () => {
+          const target = `${container}/safe-file.txt`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(target, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+        })
+      }
+
+      for (const state of ['empty', 'missing']) {
+        it(`blocks a new hook in a repository whose hooks directory is ${state}`, async () => {
+          const repository = `hooks-${state}`
+          const hooks = `${repository}/.git/hooks`
+          mkdirSync(join(TEST_DIR, repository, '.git'), { recursive: true })
+          writeFileSync(
+            join(TEST_DIR, repository, '.git', 'HEAD'),
+            'ref: refs/heads/main',
+          )
+          if (state === 'empty') mkdirSync(join(TEST_DIR, hooks))
+
+          const result = await runSandboxed(
+            `mkdir -p '${hooks}' && echo x > '${hooks}/pre-commit'`,
+          )
+
+          expect(result.success).toBe(false)
+          expect(existsSync(`${hooks}/pre-commit`)).toBe(false)
+          // The rest of the repository is still the command's to write.
+          expect(
+            (await runSandboxedWrite(`${repository}/.git/HEAD`, 'x')).success,
+          ).toBe(true)
+        })
+      }
+
+      it.if(isLinux)(
+        'takes no directory above the working directory for one of the names',
+        async () => {
+          const project = join(TEST_DIR, 'above', '.idea', 'project')
+          mkdirSync(join(project, 'sub'), { recursive: true })
+          writeFileSync(join(project, 'sub', '.bashrc'), ORIGINAL_CONTENT)
+          process.chdir(project)
+
+          expect((await runSandboxedWrite('sub/.bashrc', 'x')).success).toBe(
+            false,
+          )
+          expect((await runSandboxedWrite('safe-file.txt', 'x')).success).toBe(
+            true,
+          )
+        },
+      )
+
+      it.if(isLinux)(
+        `looks no deeper than the depth says: none of the names in ${beyond}/`,
+        async () => {
+          for (const name of existing) {
+            const target = `${beyond}/${name}`
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+            expect([target, result.success]).toEqual([target, true])
+          }
+        },
+        60_000,
+      )
     })
 
     describe('Safe files should still be writable', () => {

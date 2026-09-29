@@ -344,8 +344,9 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
+  // Git hooks always blocked in nested repos. A repository is known by its
+  // HEAD, so that its hooks are denied before there are any.
+  iglobArgs.push('--iglob', '**/.git/hooks/**', '--iglob', '**/.git/HEAD')
 
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
@@ -355,6 +356,10 @@ async function linuxGetMandatoryDenyPaths(
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
   // and the security benefit doesn't justify the traversal cost
+  //
+  // ripgrep lists files, and its depth is the file's. `maxDepth` is that of a
+  // dangerous FILE, which lies in a directory one level up; the same
+  // directory's `.git/hooks/pre-commit` is two levels further down.
   let matches: string[] = []
   try {
     matches = await ripGrep(
@@ -362,7 +367,7 @@ async function linuxGetMandatoryDenyPaths(
         '--files',
         '--hidden',
         '--max-depth',
-        String(maxDepth),
+        String(maxDepth + 2),
         ...iglobArgs,
         '-g',
         '!**/node_modules/**',
@@ -375,39 +380,38 @@ async function linuxGetMandatoryDenyPaths(
     logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
   }
 
-  // Process matches
+  // The names a match can lie under, by path component.
+  const directoryNames = [
+    ...dangerousDirectories,
+    '.git/hooks',
+    '.git/config',
+    '.git/HEAD',
+  ].map(name => normalizeCaseForComparison(name).split('/'))
   for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
-
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
-      )
-      if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
+    const segments = path
+      .relative(cwd, path.resolve(cwd, match))
+      .split(path.sep)
+    const lower = segments.map(normalizeCaseForComparison)
+    // Where the dangerous name begins and how long it is: the first of
+    // `directoryNames` on the way down, else the file itself.
+    let at = segments.length - 1
+    let length = 1
+    search: for (let i = 0; i < lower.length; i++) {
+      for (const name of directoryNames) {
+        if (name.every((component, k) => lower[i + k] === component)) {
+          at = i
+          length = name.length
+          break search
         }
-        foundDir = true
-        break
       }
     }
-
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
-    }
+    // INVARIANT: every dangerous name of one directory is denied or none is.
+    // `at` is how deep that directory lies.
+    if (at > maxDepth - 1) continue
+    const found = segments.slice(0, at + length)
+    if (lower[at] === '.git' && lower[at + 1] === 'head')
+      found[at + 1] = 'hooks'
+    denyPaths.push(path.join(cwd, ...found))
   }
 
   return [...new Set(denyPaths)]

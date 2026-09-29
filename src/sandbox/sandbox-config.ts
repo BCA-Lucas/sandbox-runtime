@@ -1153,7 +1153,8 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'How far below the working directory dangerous names are looked for on Linux (default: 3): ' +
+          'in it and in the directories up to one level less than this below it. ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z

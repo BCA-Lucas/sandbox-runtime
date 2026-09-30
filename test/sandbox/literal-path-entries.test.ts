@@ -1325,16 +1325,21 @@ describe.if(isLinux)(
         // pattern is also applied like a path that is not there: the name is
         // kept from being created, and what it would match is not denied.
         const locked = join(root, 'locked')
+        const elsewhere = join(root, 'elsewhere')
         mkdirSync(locked)
+        mkdirSync(elsewhere)
         writeFileSync(join(locked, 'a.pem'), 'original\n')
         const wrapsWith = async (
           name: string,
+          cwd: string,
         ): Promise<{ denied: string[]; stdout: string }> => {
           const policy = {
             allowWrite: [root],
             denyWrite: [join(locked, name)],
           }
           chmodSync(locked, 0o000)
+          // Where the wrap looks for dangerous names is the process's own.
+          process.chdir(cwd)
           try {
             await initialize(policy)
             const denied = SandboxManager.getFsWriteConfig().denyWithinAllow
@@ -1342,10 +1347,11 @@ describe.if(isLinux)(
               policy,
               `chmod 755 ${q(locked)}; echo x > ${q(join(locked, name))} && echo CREATED; ` +
                 `echo t >> ${q(join(locked, 'a.pem'))} && echo WROTE; echo END`,
-              { cwd: root },
+              { cwd },
             )
             return { denied, stdout }
           } finally {
+            process.chdir(root)
             chmodSync(locked, 0o755)
           }
         }
@@ -1368,11 +1374,21 @@ describe.if(isLinux)(
         }
 
         for (const name of ['absent', '*.pem']) {
-          const { denied, stdout } = await wrapsWith(name)
+          const { denied, stdout } = await wrapsWith(name, elsewhere)
           expect(denied).toEqual([join(locked, name)])
           expect(stdout).not.toContain('CREATED')
           expect(stdout).toContain('WROTE')
           expect(stdout).toContain('END')
+          expect(existsSync(join(locked, name))).toBe(false)
+
+          // Below the working directory the folder is denied whole, because
+          // the scan for dangerous names could not read it either: its mode
+          // cannot be given back, so what the pattern would match is safe too.
+          const below = await wrapsWith(name, root)
+          expect(below.denied).toEqual([join(locked, name)])
+          expect(below.stdout).not.toContain('CREATED')
+          expect(below.stdout).not.toContain('WROTE')
+          expect(below.stdout).toContain('END')
           expect(existsSync(join(locked, name))).toBe(false)
         }
         // The folder cannot be cleaned by the host while it cannot be looked

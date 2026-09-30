@@ -1375,6 +1375,10 @@ export class GlobWalkBudgetError extends Error {
   }
 }
 
+/** Successful listings, by real directory: a second position, or a second
+ *  pattern, reads the same entries. */
+export type GlobWalkListings = Map<string, fs.Dirent[]>
+
 /** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
 export interface GlobWalk {
   /** Where the walk started, with symlinks resolved (the spelling itself
@@ -1780,6 +1784,9 @@ export function walkGlobPattern(
     withDirectoryForm?: boolean
     followSymlinkedDirectories?: boolean
     budget?: GlobWalkBudget
+    /** Handed to every walk of one configuration, so that patterns with a
+     *  base in common list each directory once between them. */
+    listings?: GlobWalkListings
   } = {},
 ): GlobWalk {
   const walk: GlobWalk = {
@@ -1880,12 +1887,11 @@ export function walkGlobPattern(
   type DirectoryRecord = {
     /** The positions it has been listed for, each of them successfully. */
     listedFor: Set<number>
-    /** What a successful listing found, which a second position reads. */
-    entries?: fs.Dirent[]
     /** Whether it is already in `walk.unlisted`, which names it once. */
     unlisted?: true
   }
   const records = new Map<string, DirectoryRecord>()
+  const listings: GlobWalkListings = opts.listings ?? new Map()
   const pending: Frame[] = []
   /** Counts one more entry of `dir` looked at, or none before a listing, and
    *  throws once the budget is spent. The clock is read every time: what one
@@ -1986,13 +1992,13 @@ export function walkGlobPattern(
     const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
     spend(dir, 0)
-    let entries = record.entries
+    let entries = listings.get(real)
     if (entries === undefined) {
       try {
         entries = onRealPath(real, frame.short, p =>
           fs.readdirSync(p, { withFileTypes: true }),
         )
-        record.entries = entries
+        listings.set(real, entries)
       } catch (err) {
         const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
         logForDebugging(
@@ -2009,7 +2015,19 @@ export function walkGlobPattern(
     }
     for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
+      // Before the skip below: an entry it passes over was looked at too.
       spend(dir, 1)
+      // Nearly every entry of a large tree: a plain file the pattern does not
+      // match, which nothing below records. A pattern that splits is matched
+      // by name, so no path need be spelled to find that out.
+      if (
+        positions.splits &&
+        !entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        !positions.matches(fresh, entry.name, '')
+      ) {
+        continue
+      }
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
       // A pattern that does not split is matched by its whole spelling, and
@@ -2109,7 +2127,7 @@ export function walkGlobPattern(
 
   // Not `records.size`: that counts a directory that could not be listed too.
   for (const record of records.values()) {
-    if (record.entries !== undefined) walk.directoriesListed++
+    if (record.listedFor.size > 0) walk.directoriesListed++
   }
   return walk
 }

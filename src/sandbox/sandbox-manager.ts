@@ -107,6 +107,7 @@ import {
   removeTrailingGlobSuffix,
   expandGlobPattern,
   GlobWalkBudgetError,
+  type GlobWalkListings,
   newGlobWalkBudget,
   attributionKeyFor,
   decodeSandboxedCommand,
@@ -1528,9 +1529,9 @@ function expandAllowReadGlob(pattern: string, anchor?: string): string[] {
 
 /**
  * The expansion of every denyRead glob of one read configuration, on Linux,
- * all on one budget of `limits` (`filesystem.denyReadGlobBudget`). When it
- * runs out the returned function throws {@link LinuxSandboxProfileError}
- * `deny_glob_too_large`.
+ * all on one budget of `limits` (`filesystem.denyReadGlobBudget`) and listing
+ * each directory once between them. When the budget runs out the returned
+ * function throws {@link LinuxSandboxProfileError} `deny_glob_too_large`.
  */
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
@@ -1538,6 +1539,7 @@ function readDenyGlobExpander(
   limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
 ): (pattern: string, anchor?: string) => string[] {
   const budget = newGlobWalkBudget(limits)
+  const listings: GlobWalkListings = new Map()
   return (pattern, anchor) => {
     try {
       // Both: a walk beneath an anchor draws on the budget like any other.
@@ -1545,7 +1547,7 @@ function readDenyGlobExpander(
         pattern,
         reExposedPaths,
         unlistableDenyDirs,
-        { anchor, budget },
+        { anchor, budget, listings },
       )
     } catch (error) {
       if (!(error instanceof GlobWalkBudgetError)) throw error

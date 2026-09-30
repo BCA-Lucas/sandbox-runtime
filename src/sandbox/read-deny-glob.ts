@@ -1,6 +1,7 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
   type GlobWalkBudget,
+  type GlobWalkListings,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -76,12 +77,18 @@ function collapseReadDenyLocations({
  * come back unmasked.
  * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
  * @param opts.budget - shared with every expansion handed the same object.
+ * @param opts.listings - likewise: one map for all the patterns of a
+ * configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; budget?: GlobWalkBudget } = {},
+  opts: {
+    anchor?: string
+    budget?: GlobWalkBudget
+    listings?: GlobWalkListings
+  } = {},
 ): string[] {
   const startedAt = performance.now()
   const walk = walkGlobPattern(globPattern, {
@@ -89,6 +96,7 @@ export function expandReadDenyGlobLinux(
     followSymlinkedDirectories: true,
     anchor: opts.anchor,
     budget: opts.budget,
+    listings: opts.listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.

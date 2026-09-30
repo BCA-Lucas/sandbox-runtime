@@ -715,6 +715,46 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
+  it('lists a directory once for all the patterns handed the same listings', () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-shared-')))
+    try {
+      mkdirSync(join(root, 'a', 'b'), { recursive: true })
+      writeFileSync(join(root, 'a', '.env'), '')
+      writeFileSync(join(root, 'a', 'b', 'id.pem'), '')
+      writeFileSync(join(root, 'a', 'b', 'notes.txt'), '')
+      const patterns = ['**/.env', '**/*.pem', '**/*.key'].map(p =>
+        join(root, p),
+      )
+      const alone = patterns.map(p => walkGlobPattern(p).matches)
+
+      const listed: string[] = []
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        listed.push(String(args[0]))
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      let together
+      try {
+        const listings = new Map()
+        together = patterns.map(p => walkGlobPattern(p, { listings }).matches)
+      } finally {
+        readdirSpy.mockRestore()
+      }
+
+      expect(listed.sort()).toEqual(
+        [root, join(root, 'a'), join(root, 'a', 'b')].sort(),
+      )
+      expect(together).toEqual(alone)
+      expect(together.flat().sort()).toEqual(
+        [join(root, 'a', '.env'), join(root, 'a', 'b', 'id.pem')].sort(),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('lists a directory again under a name the pattern tells apart', () => {
     // vault is reached by its own name, which matches nothing, and through
     // config/secrets, the only spelling `**/secrets/*.pem` matches. However
@@ -2098,6 +2138,53 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     expect(readConfig.denyOnly).not.toContain(join(realTestDir, 'readme.txt'))
 
     await SandboxManager.reset()
+  })
+
+  it('lists a directory once for all the denyRead patterns of a configuration', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: ['*.env', '*.txt', '*.pem'].map(p => join(RAW_TEST_DIR, p)),
+        allowWrite: ['/tmp'],
+        denyWrite: [],
+      },
+    })
+
+    const realTestDir = realPath(RAW_TEST_DIR)
+    const timesListedBy = async (call: () => unknown): Promise<number> => {
+      let times = 0
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]) === realTestDir) times++
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        await call()
+      } finally {
+        readdirSpy.mockRestore()
+      }
+      return times
+    }
+    try {
+      expect(await timesListedBy(() => SandboxManager.getFsReadConfig())).toBe(
+        1,
+      )
+      expect(
+        await timesListedBy(() => SandboxManager.wrapWithSandbox('true')),
+      ).toBe(1)
+    } finally {
+      await SandboxManager.reset()
+    }
   })
 
   it('should pass non-glob paths through unchanged on Linux', async () => {

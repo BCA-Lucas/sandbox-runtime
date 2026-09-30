@@ -1,5 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkListings,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -70,15 +71,18 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param listings - one map for all the patterns of a configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  listings?: GlobWalkListings,
 ): string[] {
   const walk = walkGlobPattern(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.

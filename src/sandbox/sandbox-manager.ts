@@ -85,6 +85,7 @@ import {
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  type GlobWalkListings,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
@@ -1331,10 +1332,16 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
   const unlistableDenyDirs = new Set<string>()
+  const listings: GlobWalkListings = new Map()
   const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
     pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
+      expandReadDenyGlobLinux(
+        pattern,
+        reExposedPaths,
+        unlistableDenyDirs,
+        listings,
+      ),
     credentialRestrictions.degradeToDenyPaths,
   )
 
@@ -1717,13 +1724,19 @@ async function wrapWithSandbox(
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
     const unlistableDenyDirs = new Set<string>()
+    const listings: GlobWalkListings = new Map()
     const expandedDenyRead = resolveReadPathEntries(
       unionDenyReadPaths(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
         credentialRestrictions,
       ),
       pattern =>
-        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
+        expandReadDenyGlobLinux(
+          pattern,
+          reExposedPaths,
+          unlistableDenyDirs,
+          listings,
+        ),
       credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {

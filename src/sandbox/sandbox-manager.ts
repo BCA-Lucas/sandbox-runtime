@@ -63,7 +63,7 @@ import {
   linuxGetCwdMandatoryDenyPaths,
   LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
-import { expandReadDenyGlobLinux } from './read-deny-glob.js'
+import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   describeUnavailableHostHelper,
   findHostHelper,
@@ -105,10 +105,13 @@ import {
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
-  expandGlobPattern,
   GlobWalkBudgetError,
+  walkGlobPatternSteps,
   type GlobWalkListings,
   newGlobWalkBudget,
+  type Steps,
+  finish,
+  finishInTurns,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
@@ -1476,21 +1479,34 @@ function unionDenyReadPaths(
  * it is passed through whatever characters it contains. Expanded as a
  * pattern, a name holding `[` matches nothing and the deny is lost.
  */
-function resolveReadPathEntries(
+function* resolveReadPathEntries(
   kind: PathListKind,
   paths: readonly FilesystemPathEntry[],
-  expandGlob: (pattern: string, anchor?: string) => string[],
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
   literalPaths: readonly string[] = [],
-): string[] {
+): Steps<string[]> {
   const literal = new Set(literalPaths)
-  return spelledOf(paths).flatMap(p => {
+  const resolved: string[] = []
+  for (const p of spelledOf(paths)) {
     const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' &&
+    if (
+      getPlatform() === 'linux' &&
       !literal.has(p) &&
       containsGlobChars(stripped)
-      ? withOtherReadings(p, stripped, kind, expandGlob)
-      : [stripped]
-  })
+    ) {
+      for (const found of yield* withOtherReadings(
+        p,
+        stripped,
+        kind,
+        expandGlob,
+      )) {
+        resolved.push(found)
+      }
+    } else {
+      resolved.push(stripped)
+    }
+  }
+  return resolved
 }
 
 /**
@@ -1519,8 +1535,11 @@ function stripWriteGlobs(
     })
 }
 
-function expandAllowReadGlob(pattern: string, anchor?: string): string[] {
-  const expanded = expandGlobPattern(pattern, { anchor })
+function* expandAllowReadGlob(
+  pattern: string,
+  anchor?: string,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1537,13 +1556,13 @@ function readDenyGlobExpander(
   reExposedPaths: readonly string[],
   unlistableDenyDirs: Set<string>,
   limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
-): (pattern: string, anchor?: string) => string[] {
+): (pattern: string, anchor?: string) => Steps<string[]> {
   const budget = newGlobWalkBudget(limits)
   const listings: GlobWalkListings = new Map()
-  return (pattern, anchor) => {
+  return function* (pattern, anchor) {
     try {
       // Both: a walk beneath an anchor draws on the budget like any other.
-      return expandReadDenyGlobLinux(
+      return yield* expandReadDenyGlobLinuxSteps(
         pattern,
         reExposedPaths,
         unlistableDenyDirs,
@@ -1585,10 +1604,12 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
-  const allowPaths = resolveReadPathEntries(
-    'allow',
-    config.filesystem.allowRead ?? [],
-    expandAllowReadGlob,
+  const allowPaths = finish(
+    resolveReadPathEntries(
+      'allow',
+      config.filesystem.allowRead ?? [],
+      expandAllowReadGlob,
+    ),
   )
   const reExposedPaths = reExposedBy(
     allowPaths,
@@ -1596,18 +1617,20 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
-  const denyPaths = resolveReadPathEntries(
-    'deny',
-    unionDenyReadPaths(
-      spelledOf(config.filesystem.denyRead),
-      credentialRestrictions,
+  const denyPaths = finish(
+    resolveReadPathEntries(
+      'deny',
+      unionDenyReadPaths(
+        spelledOf(config.filesystem.denyRead),
+        credentialRestrictions,
+      ),
+      readDenyGlobExpander(
+        reExposedPaths,
+        unlistableDenyDirs,
+        config.filesystem.denyReadGlobBudget,
+      ),
+      credentialRestrictions.degradeToDenyPaths,
     ),
-    readDenyGlobExpander(
-      reExposedPaths,
-      unlistableDenyDirs,
-      config.filesystem.denyReadGlobBudget,
-    ),
-    credentialRestrictions.degradeToDenyPaths,
   )
 
   return {
@@ -1932,6 +1955,7 @@ async function wrapWithSandbox(
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
+  const startedWith = config
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -2005,10 +2029,15 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const expandedAllowRead = resolveReadPathEntries(
-      'allow',
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+    const expandedAllowRead = await finishInTurns(
+      resolveReadPathEntries(
+        'allow',
+        customConfig?.filesystem?.allowRead ??
+          config?.filesystem.allowRead ??
+          [],
+        expandAllowReadGlob,
+      ),
+      abortSignal,
     )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
@@ -2026,21 +2055,24 @@ async function wrapWithSandbox(
       writeConfig,
     )
     const unlistableDenyDirs = new Set<string>()
-    const expandedDenyRead = resolveReadPathEntries(
-      'deny',
-      unionDenyReadPaths(
-        spelledOf(
-          customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+    const expandedDenyRead = await finishInTurns(
+      resolveReadPathEntries(
+        'deny',
+        unionDenyReadPaths(
+          spelledOf(
+            customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+          ),
+          credentialRestrictions,
         ),
-        credentialRestrictions,
+        readDenyGlobExpander(
+          reExposedPaths,
+          unlistableDenyDirs,
+          customConfig?.filesystem?.denyReadGlobBudget ??
+            config?.filesystem.denyReadGlobBudget,
+        ),
+        credentialRestrictions.degradeToDenyPaths,
       ),
-      readDenyGlobExpander(
-        reExposedPaths,
-        unlistableDenyDirs,
-        customConfig?.filesystem?.denyReadGlobBudget ??
-          config?.filesystem.denyReadGlobBudget,
-      ),
-      credentialRestrictions.degradeToDenyPaths,
+      abortSignal,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
@@ -2075,6 +2107,21 @@ async function wrapWithSandbox(
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
     await waitForNetworkInitialization()
+  }
+
+  // INVARIANT: one wrap, one configuration. updateConfig() can run in any of
+  // the turns above, and what was read before it must not be put together
+  // with what is read after it: the write list of one configuration with the
+  // allowGitConfig of another is a policy nobody chose. So the wrap starts
+  // over. Nothing from here to the platform's wrapper awaits.
+  if (config !== startedWith) {
+    return wrapWithSandbox(
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
   }
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)

@@ -27,6 +27,7 @@ import {
   markedLiteralPath,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
+  type Steps,
   stripExtendedPathPrefix,
   toForwardSlashes,
 } from './sandbox-utils.js'
@@ -275,18 +276,18 @@ export function hasNameReading(spelling: string, kind: PathListKind): boolean {
  * pattern, then what the entry's other readings add. `name` is the entry as
  * a name, in the caller's spelling.
  */
-export function withOtherReadings(
+export function* withOtherReadings(
   spelling: string,
   name: string,
   kind: PathListKind,
-  expandGlob: (pattern: string, anchor?: string) => string[],
-): string[] {
-  const expansion = expandGlob(spelling)
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
+): Steps<string[]> {
+  const expansion = yield* expandGlob(spelling)
   const seen = new Set(expansion)
   const added: string[] = []
   for (const reading of literalReadings(spelling, kind)) {
     const found = reading.glob
-      ? expandGlob(reading.path, reading.anchor)
+      ? yield* expandGlob(reading.path, reading.anchor)
       : [name]
     for (const p of found) {
       if (seen.has(p)) continue

@@ -6,7 +6,9 @@ import {
   normalizePathForSandbox,
   pathSpellings,
   properAncestors,
-  walkGlobPattern,
+  type Steps,
+  finish,
+  walkGlobPatternSteps,
 } from './sandbox-utils.js'
 
 /**
@@ -90,8 +92,29 @@ export function expandReadDenyGlobLinux(
     listings?: GlobWalkListings
   } = {},
 ): string[] {
+  return finish(
+    expandReadDenyGlobLinuxSteps(
+      globPattern,
+      reExposedPaths,
+      unlistableDirs,
+      opts,
+    ),
+  )
+}
+
+/** {@link expandReadDenyGlobLinux}, in the walk's steps. */
+export function* expandReadDenyGlobLinuxSteps(
+  globPattern: string,
+  reExposedPaths: readonly string[],
+  unlistableDirs?: Set<string>,
+  opts: {
+    anchor?: string
+    budget?: GlobWalkBudget
+    listings?: GlobWalkListings
+  } = {},
+): Steps<string[]> {
   const startedAt = performance.now()
-  const walk = walkGlobPattern(globPattern, {
+  const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
     anchor: opts.anchor,

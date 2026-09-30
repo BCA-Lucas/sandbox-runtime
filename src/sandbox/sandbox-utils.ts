@@ -1379,6 +1379,51 @@ export class GlobWalkBudgetError extends Error {
  *  pattern, reads the same entries. */
 export type GlobWalkListings = Map<string, fs.Dirent[]>
 
+export type GlobWalkOptions = ExpandGlobOptions & {
+  withDirectoryForm?: boolean
+  followSymlinkedDirectories?: boolean
+  budget?: GlobWalkBudget
+  /** Handed to every walk of one configuration, so that patterns with a
+   *  base in common list each directory once between them. */
+  listings?: GlobWalkListings
+}
+
+/** Work that can be left between two steps and taken up again. */
+export type Steps<T> = Generator<undefined, T, undefined>
+
+/** Runs `steps` to the end, on the spot. */
+export function finish<T>(steps: Steps<T>): T {
+  for (;;) {
+    const step = steps.next()
+    if (step.done) return step.value
+  }
+}
+
+/** How long {@link finishInTurns} works before it lets others have a turn. */
+const TURN_MS = 10
+
+/**
+ * Runs `steps` to the end, letting the event loop have a turn every
+ * {@link TURN_MS}: a walk of a large tree takes seconds, and a caller whose
+ * thread is held that long can neither draw nor hear that it should stop.
+ * Rejects with `signal`'s reason once that is aborted, however far it got.
+ */
+export async function finishInTurns<T>(
+  steps: Steps<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  signal?.throwIfAborted()
+  let since = performance.now()
+  for (;;) {
+    const step = steps.next()
+    if (!step.done && performance.now() - since < TURN_MS) continue
+    if (!step.done) await new Promise(resolve => setImmediate(resolve))
+    signal?.throwIfAborted()
+    if (step.done) return step.value
+    since = performance.now()
+  }
+}
+
 /** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
 export interface GlobWalk {
   /** Where the walk started, with symlinks resolved (the spelling itself
@@ -1780,15 +1825,16 @@ export function toForwardSlashes(s: string): string {
  */
 export function walkGlobPattern(
   globPath: string,
-  opts: ExpandGlobOptions & {
-    withDirectoryForm?: boolean
-    followSymlinkedDirectories?: boolean
-    budget?: GlobWalkBudget
-    /** Handed to every walk of one configuration, so that patterns with a
-     *  base in common list each directory once between them. */
-    listings?: GlobWalkListings
-  } = {},
+  opts: GlobWalkOptions = {},
 ): GlobWalk {
+  return finish(walkGlobPatternSteps(globPath, opts))
+}
+
+/** {@link walkGlobPattern}, a step to a directory. */
+export function* walkGlobPatternSteps(
+  globPath: string,
+  opts: GlobWalkOptions = {},
+): Steps<GlobWalk> {
   const walk: GlobWalk = {
     baseLocation: '',
     matches: [],
@@ -1991,6 +2037,8 @@ export function walkGlobPattern(
     // others it came with, so only the ones new to this directory are taken.
     const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
+    yield
+    // After the step, in which time can have passed, and before the listing.
     spend(dir, 0)
     let entries = listings.get(real)
     if (entries === undefined) {

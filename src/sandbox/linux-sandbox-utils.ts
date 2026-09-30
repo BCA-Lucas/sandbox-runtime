@@ -448,6 +448,9 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
+    // Stopped, it found nothing: the caller must not be handed a command
+    // without the denies it would have found.
+    signal.throwIfAborted()
     // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 if
     // there was a directory it could not read, having listed the rest, and is
     // killed after ten seconds. What it had not come to by then is not denied.

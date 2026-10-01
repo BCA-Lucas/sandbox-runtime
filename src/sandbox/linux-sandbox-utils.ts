@@ -1457,33 +1457,39 @@ function resolveApplySeccompPrefix(
  * The network namespace counts its TCP sockets in use, and a listening one
  * counts from the moment it listens. The namespace is new and only the two
  * relays make a socket in it before the command runs, one each, so two in
- * use are the two relays listening. Reading the count costs no process and
- * no connection through a relay. Not `/proc/net/tcp`, which names the ports:
- * one read of it walks the host's whole connection table (5 ms on a machine
- * with 256 GB). First without a pause, since a relay needs a few
- * milliseconds, then every 10 ms.
+ * use are the two relays listening. Not `/proc/net/tcp`, which names the
+ * ports: one read of it walks the host's whole connection table (5 ms on a
+ * machine with 256 GB).
  *
  * It gives up, and the command starts as it did before, when a relay has
- * exited, when the count cannot be read, when `sleep` takes no fraction, and
- * after 200 pauses. No `!`: shell-quote would put a backslash before it that
- * the shell keeps. No `%1`: dash resolves no job outside an interactive
- * shell.
+ * exited, when a file cannot be read, and after 0.3 s by `/proc/uptime`,
+ * which counts in hundredths (the `1` in front keeps a leading zero from
+ * being read as octal).
+ *
+ * INVARIANT: these lines start no program. They run before the seccomp
+ * filter is on, so anything found on `PATH` here would run without it. That
+ * is why they poll without a pause: `sleep` is a program in all three
+ * shells.
+ *
+ * No `!`: shell-quote would put a backslash before it that the shell keeps.
+ * No `%1`: dash resolves no job outside an interactive shell.
  */
 const RELAYS_LISTEN = [
-  '_srt_tries=0',
-  'while [ -r /proc/net/sockstat ] && [ "$_srt_tries" -lt 300 ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
+  '_srt_since=',
+  'while [ -r /proc/net/sockstat ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
   '  _srt_up=0',
   '  for _srt_counts in /proc/net/sockstat /proc/net/sockstat6; do',
   '    [ -r "$_srt_counts" ] || continue',
   '    while read -r _srt_kind _srt_skip _srt_inuse _srt_skip; do',
-  '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)) ;; esac',
+  '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)); break ;; esac',
   '    done < "$_srt_counts"',
   '  done',
   '  [ "$_srt_up" -lt 2 ] || break',
-  '  _srt_tries=$((_srt_tries + 1))',
-  '  [ "$_srt_tries" -lt 100 ] || sleep 0.01 2>/dev/null || break',
+  '  read -r _srt_now _srt_skip 2>/dev/null < /proc/uptime || break',
+  '  _srt_now=1${_srt_now%.*}${_srt_now#*.}',
+  '  [ "$((_srt_now - ${_srt_since:=$_srt_now}))" -lt 30 ] || break',
   'done',
-  'unset _srt_tries _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
+  'unset _srt_since _srt_now _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
 ]
 
 /**

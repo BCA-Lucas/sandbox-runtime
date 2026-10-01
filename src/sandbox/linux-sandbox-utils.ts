@@ -1449,6 +1449,44 @@ function resolveApplySeccompPrefix(
 }
 
 /**
+ * Shell lines that return once both relays listen, given their process ids in
+ * `$_srt_http` and `$_srt_socks`. The relays are started in the background,
+ * and a command that connects at once got there first: its first connection
+ * was refused.
+ *
+ * The network namespace counts its TCP sockets in use, and a listening one
+ * counts from the moment it listens. The namespace is new and only the two
+ * relays make a socket in it before the command runs, one each, so two in
+ * use are the two relays listening. Reading the count costs no process and
+ * no connection through a relay. Not `/proc/net/tcp`, which names the ports:
+ * one read of it walks the host's whole connection table (5 ms on a machine
+ * with 256 GB). First without a pause, since a relay needs a few
+ * milliseconds, then every 10 ms.
+ *
+ * It gives up, and the command starts as it did before, when a relay has
+ * exited, when the count cannot be read, when `sleep` takes no fraction, and
+ * after 200 pauses. No `!`: shell-quote would put a backslash before it that
+ * the shell keeps. No `%1`: dash resolves no job outside an interactive
+ * shell.
+ */
+const RELAYS_LISTEN = [
+  '_srt_tries=0',
+  'while [ -r /proc/net/sockstat ] && [ "$_srt_tries" -lt 300 ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
+  '  _srt_up=0',
+  '  for _srt_counts in /proc/net/sockstat /proc/net/sockstat6; do',
+  '    [ -r "$_srt_counts" ] || continue',
+  '    while read -r _srt_kind _srt_skip _srt_inuse _srt_skip; do',
+  '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)) ;; esac',
+  '    done < "$_srt_counts"',
+  '  done',
+  '  [ "$_srt_up" -lt 2 ] || break',
+  '  _srt_tries=$((_srt_tries + 1))',
+  '  [ "$_srt_tries" -lt 100 ] || sleep 0.01 2>/dev/null || break',
+  'done',
+  'unset _srt_tries _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
+]
+
+/**
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
@@ -1467,13 +1505,16 @@ function buildSandboxCommand(
   const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    '_srt_http=$!',
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    '_srt_socks=$!',
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
     // keep the script's status, zsh takes the status of the trap's own last
     // command (the kill), so under zsh a failing command reported 0. Single
     // quotes, so $? and $rc are read when the trap runs, not when it is set.
     "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
+    ...RELAYS_LISTEN,
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.

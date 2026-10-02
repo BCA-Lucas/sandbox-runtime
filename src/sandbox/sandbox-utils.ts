@@ -1137,8 +1137,9 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
-/** What listing a real directory gave, its entries or the error: a second
- *  position, or a second pattern, reads the same answer. */
+/** What listing a real directory gave, its entries or the error that has it
+ *  denied whole: a second position, or a second pattern, reads the same
+ *  answer. */
 export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
@@ -1680,15 +1681,16 @@ export function* walkGlobPatternSteps(
         )
       listings.set(real, entries)
     } catch (err) {
-      // Kept as well, or every pattern would try the directory again. One
-      // that would have cleared meanwhile hides more, never less.
-      listings.set(real, err instanceof Error ? err : new Error(String(err)))
       const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
       logForDebugging(
         `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
         { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
       )
       if (errorCode !== 'ENOENT') {
+        // Kept, or every pattern would try the directory again: one that
+        // would have cleared meanwhile hides more. An absence is not kept. It
+        // is the one answer that denies nothing, so each pattern asks.
+        listings.set(real, err instanceof Error ? err : new Error(String(err)))
         walk.unlisted.push(dir)
         if (real !== dir) walk.realOf.set(dir, real)
       }

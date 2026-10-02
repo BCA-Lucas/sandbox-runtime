@@ -644,8 +644,10 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     () => {
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-failed-')))
       const locked = join(root, 'locked')
+      const open = join(root, 'open')
       try {
-        mkdirSync(join(root, 'open'))
+        mkdirSync(open)
+        writeFileSync(join(open, 'id.pem'), '')
         mkdirSync(locked)
         chmodSync(locked, 0o000)
         const patterns = ['**/.env', '**/*.pem', '**/*.key'].map(p =>
@@ -658,9 +660,11 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
           ...args: Parameters<typeof fs.readdirSync>
         ) => {
-          tried.push(String(args[0]))
-          // Gone since its parent was listed: absent, for every pattern.
-          if (String(args[0]) === join(root, 'open')) {
+          const dir = String(args[0])
+          const askedBefore = tried.includes(dir)
+          tried.push(dir)
+          // Absent when the first pattern asks, and there for the others.
+          if (dir === open && !askedBefore) {
             throw Object.assign(new Error('gone'), { code: 'ENOENT' })
           }
           return readdirSync(...args)
@@ -668,17 +672,22 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         let together
         try {
           const listings = new Map()
-          together = patterns.map(
-            p => walkGlobPattern(p, { listings }).unlisted,
-          )
+          together = patterns.map(p => walkGlobPattern(p, { listings }))
         } finally {
           readdirSpy.mockRestore()
         }
 
-        expect(tried.sort()).toEqual([root, locked, join(root, 'open')].sort())
+        expect(tried.filter(dir => dir === locked)).toEqual([locked])
         // Every pattern still has it to deny whole.
-        expect(together).toEqual(alone)
-        expect(together).toEqual(patterns.map(() => [locked]))
+        expect(together.map(walk => walk.unlisted)).toEqual(alone)
+        expect(alone).toEqual(patterns.map(() => [locked]))
+        // An absence denies nothing, so it is nobody's answer but the asker's.
+        expect(tried.filter(dir => dir === open)).toEqual([open, open])
+        expect(together.map(walk => walk.matches)).toEqual([
+          [],
+          [join(open, 'id.pem')],
+          [],
+        ])
       } finally {
         chmodSync(locked, 0o755)
         rmSync(root, { recursive: true, force: true })

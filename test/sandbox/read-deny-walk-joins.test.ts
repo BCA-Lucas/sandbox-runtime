@@ -79,6 +79,44 @@ describe('the read-deny walk: budget, shared listings and steps together', () =>
     }
   })
 
+  it('charges the budget for a walk it is handed back, as for one it makes', () => {
+    const pattern = join(ROOT, '**/*.pem')
+    const walks = new Map()
+    const made = newGlobWalkBudget()
+    const walk = walkGlobPattern(pattern, { budget: made, walks })
+    expect(made.entries).toBe(ENTRIES)
+
+    const kept = newGlobWalkBudget({ maxEntries: ENTRIES })
+    expect(walkGlobPattern(pattern, { budget: kept, walks })).toBe(walk)
+    expect(kept.entries).toBe(ENTRIES)
+    // A budget the walk would not have fitted into does not take it either.
+    expect(() =>
+      walkGlobPattern(pattern, {
+        budget: newGlobWalkBudget({ maxEntries: ENTRIES - 1 }),
+        walks,
+      }),
+    ).toThrow(GlobWalkBudgetError)
+  })
+
+  it('does not hand back beneath an anchor the walk of the same characters without one', () => {
+    // `d[0]` is a pattern for d0, and beneath the anchor it is a name.
+    const named = join(ROOT, 'd[0]')
+    mkdirSync(named)
+    writeFileSync(join(named, 'own.pem'), '')
+    try {
+      const pattern = join(named, '*.pem')
+      const walks = new Map()
+      const matchesOf = (anchor?: string): string[] =>
+        walkGlobPattern(pattern, { anchor, walks }).matches
+      expect(matchesOf()).toEqual([join(ROOT, 'd0', 'key.pem')])
+      expect(matchesOf(named)).toEqual([join(named, 'own.pem')])
+      expect(matchesOf()).toEqual([join(ROOT, 'd0', 'key.pem')])
+      expect(walks.size).toBe(2)
+    } finally {
+      rmSync(named, { recursive: true, force: true })
+    }
+  })
+
   it('reads the clock after a step and before the listing that follows it', () => {
     const steps = walkGlobPatternSteps(join(ROOT, '**/*.pem'), {
       budget: newGlobWalkBudget({ timeoutMs: 5 }),

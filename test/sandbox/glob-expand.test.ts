@@ -639,6 +639,53 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
+  it.if(process.getuid?.() !== 0)(
+    'tries a directory it cannot list once for all the patterns handed the same listings',
+    () => {
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-failed-')))
+      const locked = join(root, 'locked')
+      try {
+        mkdirSync(join(root, 'open'))
+        mkdirSync(locked)
+        chmodSync(locked, 0o000)
+        const patterns = ['**/.env', '**/*.pem', '**/*.key'].map(p =>
+          join(root, p),
+        )
+        const alone = patterns.map(p => walkGlobPattern(p).unlisted)
+
+        const tried: string[] = []
+        const readdirSync = fs.readdirSync
+        const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+          ...args: Parameters<typeof fs.readdirSync>
+        ) => {
+          tried.push(String(args[0]))
+          // Gone since its parent was listed: absent, for every pattern.
+          if (String(args[0]) === join(root, 'open')) {
+            throw Object.assign(new Error('gone'), { code: 'ENOENT' })
+          }
+          return readdirSync(...args)
+        }) as typeof fs.readdirSync)
+        let together
+        try {
+          const listings = new Map()
+          together = patterns.map(
+            p => walkGlobPattern(p, { listings }).unlisted,
+          )
+        } finally {
+          readdirSpy.mockRestore()
+        }
+
+        expect(tried.sort()).toEqual([root, locked, join(root, 'open')].sort())
+        // Every pattern still has it to deny whole.
+        expect(together).toEqual(alone)
+        expect(together).toEqual(patterns.map(() => [locked]))
+      } finally {
+        chmodSync(locked, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('lists a directory again under a name the pattern tells apart', () => {
     // vault is reached by its own name, which matches nothing, and through
     // config/secrets, the only spelling `**/secrets/*.pem` matches. However
@@ -1357,6 +1404,41 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       await SandboxManager.reset()
     }
   })
+
+  it.if(process.getuid?.() !== 0)(
+    'gives each path once, however many patterns came to it',
+    async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-once-')))
+      const locked = join(root, 'locked')
+      mkdirSync(locked)
+      chmodSync(locked, 0o000)
+      writeFileSync(join(root, 'id.pem'), '')
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          // All three could not list `locked`, and two match the file.
+          denyRead: ['**/*.pem', '**/id.*', '**/.env'].map(p => join(root, p)),
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+      try {
+        expect(SandboxManager.getFsReadConfig().denyOnly).toEqual([
+          join(root, 'id.pem'),
+          locked,
+        ])
+      } finally {
+        await SandboxManager.reset()
+        chmodSync(locked, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   for (const list of ['denyRead', 'allowRead'] as const) {
     it(`gives up a wrap whose signal is aborted while a ${list} pattern is walked`, async () => {

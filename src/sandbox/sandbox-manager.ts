@@ -108,7 +108,6 @@ import {
   GlobWalkBudgetError,
   walkGlobPatternSteps,
   type GlobWalkListings,
-  type GlobWalks,
   newGlobWalkBudget,
   type Steps,
   finish,
@@ -1539,10 +1538,8 @@ function stripWriteGlobs(
 function* expandAllowReadGlob(
   pattern: string,
   anchor?: string,
-  walks?: GlobWalks,
 ): Steps<string[]> {
-  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor, walks }))
-    .matches
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1554,19 +1551,14 @@ function* expandAllowReadGlob(
  * all on one budget of `limits` (`filesystem.denyReadGlobBudget`) and listing
  * each directory once between them. When the budget runs out the returned
  * function throws {@link LinuxSandboxProfileError} `deny_glob_too_large`.
- * `kept` is what a wrap that starts over has listed and walked before. The
- * budget is never kept: it is the one of the configuration read now.
  */
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
   unlistableDenyDirs: Set<string>,
   limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
-  kept: { listings: GlobWalkListings; walks?: GlobWalks } = {
-    listings: new Map(),
-  },
 ): (pattern: string, anchor?: string) => Steps<string[]> {
   const budget = newGlobWalkBudget(limits)
-  const { listings, walks } = kept
+  const listings: GlobWalkListings = new Map()
   return function* (pattern, anchor) {
     try {
       // Both: a walk beneath an anchor draws on the budget like any other.
@@ -1574,7 +1566,7 @@ function readDenyGlobExpander(
         pattern,
         reExposedPaths,
         unlistableDenyDirs,
-        { anchor, budget, listings, walks },
+        { anchor, budget, listings },
       )
     } catch (error) {
       if (!(error instanceof GlobWalkBudgetError)) throw error
@@ -1953,17 +1945,12 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
-/** What a wrap has found on disk so far, which it keeps when it starts over. */
-type WrapFindings = {
-  listings: GlobWalkListings
-  walks: GlobWalks
-  /** How many times the wrap has started over. */
-  restarts: number
-}
-
 /** A wrap that has started over this many times walks without giving the
  *  thread back. */
 const RESTARTS_IN_TURNS = 2
+
+/** In place of what a walk finds: the configuration was replaced under it. */
+const REPLACED = Symbol('replaced')
 
 async function wrapWithSandbox(
   command: string,
@@ -1972,8 +1959,8 @@ async function wrapWithSandbox(
   abortSignal?: AbortSignal,
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
-  return wrapWithSandboxKeeping(
-    { listings: new Map(), walks: new Map(), restarts: 0 },
+  return wrapWithSandboxAgain(
+    0,
     command,
     binShell,
     customConfig,
@@ -1982,8 +1969,9 @@ async function wrapWithSandbox(
   )
 }
 
-async function wrapWithSandboxKeeping(
-  found: WrapFindings,
+/** {@link wrapWithSandbox}, having started over `restarts` times. */
+async function wrapWithSandboxAgain(
+  restarts: number,
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
@@ -1994,9 +1982,30 @@ async function wrapWithSandboxKeeping(
   const commandId = options?.commandId
   registerCommandText(command, options)
   const startedWith = config
-  const walked = <T>(steps: Steps<T>): T | Promise<T> => {
-    if (found.restarts < RESTARTS_IN_TURNS) {
-      return finishInTurns(steps, abortSignal)
+  const startOver = (): Promise<string> =>
+    wrapWithSandboxAgain(
+      restarts + 1,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  /** `steps`, left as soon as the configuration is seen to be replaced:
+   *  what they would go on to find is for a wrap that starts over anyway. */
+  function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
+    for (;;) {
+      if (config !== startedWith) return REPLACED
+      const step = steps.next()
+      if (step.done) return step.value
+      yield
+    }
+  }
+  const walked = <T>(
+    steps: Steps<T>,
+  ): T | typeof REPLACED | Promise<T | typeof REPLACED> => {
+    if (restarts < RESTARTS_IN_TURNS) {
+      return finishInTurns(whileCurrent(steps), abortSignal)
     }
     abortSignal?.throwIfAborted()
     return finish(steps)
@@ -2080,9 +2089,10 @@ async function wrapWithSandboxKeeping(
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
-        (pattern, anchor) => expandAllowReadGlob(pattern, anchor, found.walks),
+        expandAllowReadGlob,
       ),
     )
+    if (expandedAllowRead === REPLACED) return startOver()
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -2113,11 +2123,11 @@ async function wrapWithSandboxKeeping(
           unlistableDenyDirs,
           customConfig?.filesystem?.denyReadGlobBudget ??
             config?.filesystem.denyReadGlobBudget,
-          found,
         ),
         credentialRestrictions.degradeToDenyPaths,
       ),
     )
+    if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
@@ -2159,23 +2169,16 @@ async function wrapWithSandboxKeeping(
   // allowGitConfig of another is a policy nobody chose. So the wrap starts
   // over. Nothing from here to the platform's wrapper awaits.
   //
-  // INVARIANT: starting over costs only what is new, and ends. An embedder
-  // can replace the configuration many times during one walk, mostly with
-  // the same content. So the wrap keeps what it has listed and walked: an
-  // attempt with no pattern new to it takes no turn of the event loop, and
-  // after RESTARTS_IN_TURNS the new ones are walked without a turn as well.
-  // What is kept is as old as its walk, and misses a path made since, as one
-  // long walk misses a path made behind it.
-  if (config !== startedWith) {
-    return wrapWithSandboxKeeping(
-      { ...found, restarts: found.restarts + 1 },
-      command,
-      binShell,
-      customConfig,
-      abortSignal,
-      options,
-    )
-  }
+  // INVARIANT: what a wrap hands out was read from the disk after its
+  // configuration was installed. A host that writes a file and then installs
+  // a rule that denies it must find it denied. So a wrap that starts over
+  // keeps nothing of what it has listed or walked, the same rules included.
+  //
+  // INVARIANT: it ends. An embedder can replace the configuration many times
+  // during one walk. After RESTARTS_IN_TURNS the wrap walks without a turn of
+  // the event loop, so no timer or callback replaces it meanwhile. That holds
+  // the thread for one walk, as every wrap did before the walk took turns.
+  if (config !== startedWith) return startOver()
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty

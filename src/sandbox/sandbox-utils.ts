@@ -1379,9 +1379,6 @@ export class GlobWalkBudgetError extends Error {
  *  pattern, reads the same entries. */
 export type GlobWalkListings = Map<string, fs.Dirent[]>
 
-/** Finished walks, by their options and pattern. */
-export type GlobWalks = Map<string, GlobWalk>
-
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
   followSymlinkedDirectories?: boolean
@@ -1389,10 +1386,6 @@ export type GlobWalkOptions = ExpandGlobOptions & {
   /** Handed to every walk of one configuration, so that patterns with a
    *  base in common list each directory once between them. */
   listings?: GlobWalkListings
-  /** A walk found here is handed back as it is, and a finished one is put
-   *  here: for a caller that starts over and should walk no pattern twice.
-   *  What such a walk reports is as old as the walk. */
-  walks?: GlobWalks
 }
 
 /** Work that can be left between two steps and taken up again. */
@@ -1842,40 +1835,6 @@ export function* walkGlobPatternSteps(
   globPath: string,
   opts: GlobWalkOptions = {},
 ): Steps<GlobWalk> {
-  // The options that shape a walk, then its pattern. The anchor is one of
-  // them: beneath it the same characters are read as a name, not a pattern.
-  // No path holds a NUL, so one tells a key with an anchor from one without.
-  const walkKey =
-    [
-      opts.withDirectoryForm,
-      opts.followSymlinkedDirectories,
-      opts.caseInsensitive,
-    ]
-      .map(on => (on ? '1' : '0'))
-      .join('') +
-    (opts.anchor === undefined ? '' : `${opts.anchor}\0`) +
-    globPath
-  const walked = opts.walks?.get(walkKey)
-  if (walked !== undefined) {
-    // Charged the entries it looked at, as an entry read from a listing
-    // another pattern made is. The budget may be that of a configuration
-    // which allows fewer than the one the walk was made under, and a wrap
-    // that starts over ends as an undisturbed one does: here, rejected.
-    const budget = opts.budget
-    if (budget !== undefined) {
-      budget.entries += walked.entriesExamined
-      if (budget.entries > budget.maxEntries) {
-        throw new GlobWalkBudgetError(
-          globPath,
-          walked.baseLocation,
-          'entries',
-          budget,
-        )
-      }
-    }
-    return walked
-  }
-
   const walk: GlobWalk = {
     baseLocation: '',
     matches: [],
@@ -2218,6 +2177,5 @@ export function* walkGlobPatternSteps(
   for (const record of records.values()) {
     if (record.listedFor.size > 0) walk.directoriesListed++
   }
-  opts.walks?.set(walkKey, walk)
   return walk
 }

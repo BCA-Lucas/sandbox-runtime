@@ -108,6 +108,7 @@ import {
   GlobWalkBudgetError,
   walkGlobPatternSteps,
   type GlobWalkListings,
+  type GlobWalks,
   newGlobWalkBudget,
   type Steps,
   finish,
@@ -1538,8 +1539,10 @@ function stripWriteGlobs(
 function* expandAllowReadGlob(
   pattern: string,
   anchor?: string,
+  walks?: GlobWalks,
 ): Steps<string[]> {
-  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor, walks }))
+    .matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1551,14 +1554,19 @@ function* expandAllowReadGlob(
  * all on one budget of `limits` (`filesystem.denyReadGlobBudget`) and listing
  * each directory once between them. When the budget runs out the returned
  * function throws {@link LinuxSandboxProfileError} `deny_glob_too_large`.
+ * `kept` is what a wrap that starts over has listed and walked before. The
+ * budget is never kept: it is the one of the configuration read now.
  */
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
   unlistableDenyDirs: Set<string>,
   limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
+  kept: { listings: GlobWalkListings; walks?: GlobWalks } = {
+    listings: new Map(),
+  },
 ): (pattern: string, anchor?: string) => Steps<string[]> {
   const budget = newGlobWalkBudget(limits)
-  const listings: GlobWalkListings = new Map()
+  const { listings, walks } = kept
   return function* (pattern, anchor) {
     try {
       // Both: a walk beneath an anchor draws on the budget like any other.
@@ -1566,7 +1574,7 @@ function readDenyGlobExpander(
         pattern,
         reExposedPaths,
         unlistableDenyDirs,
-        { anchor, budget, listings },
+        { anchor, budget, listings, walks },
       )
     } catch (error) {
       if (!(error instanceof GlobWalkBudgetError)) throw error
@@ -1945,7 +1953,37 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
+/** What a wrap has found on disk so far, which it keeps when it starts over. */
+type WrapFindings = {
+  listings: GlobWalkListings
+  walks: GlobWalks
+  /** How many times the wrap has started over. */
+  restarts: number
+}
+
+/** A wrap that has started over this many times walks without giving the
+ *  thread back. */
+const RESTARTS_IN_TURNS = 2
+
 async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  return wrapWithSandboxKeeping(
+    { listings: new Map(), walks: new Map(), restarts: 0 },
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+}
+
+async function wrapWithSandboxKeeping(
+  found: WrapFindings,
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
@@ -1956,6 +1994,13 @@ async function wrapWithSandbox(
   const commandId = options?.commandId
   registerCommandText(command, options)
   const startedWith = config
+  const walked = <T>(steps: Steps<T>): T | Promise<T> => {
+    if (found.restarts < RESTARTS_IN_TURNS) {
+      return finishInTurns(steps, abortSignal)
+    }
+    abortSignal?.throwIfAborted()
+    return finish(steps)
+  }
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -2029,15 +2074,14 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const expandedAllowRead = await finishInTurns(
+    const expandedAllowRead = await walked(
       resolveReadPathEntries(
         'allow',
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
-        expandAllowReadGlob,
+        (pattern, anchor) => expandAllowReadGlob(pattern, anchor, found.walks),
       ),
-      abortSignal,
     )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
@@ -2055,7 +2099,7 @@ async function wrapWithSandbox(
       writeConfig,
     )
     const unlistableDenyDirs = new Set<string>()
-    const expandedDenyRead = await finishInTurns(
+    const expandedDenyRead = await walked(
       resolveReadPathEntries(
         'deny',
         unionDenyReadPaths(
@@ -2069,10 +2113,10 @@ async function wrapWithSandbox(
           unlistableDenyDirs,
           customConfig?.filesystem?.denyReadGlobBudget ??
             config?.filesystem.denyReadGlobBudget,
+          found,
         ),
         credentialRestrictions.degradeToDenyPaths,
       ),
-      abortSignal,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
@@ -2114,8 +2158,17 @@ async function wrapWithSandbox(
   // with what is read after it: the write list of one configuration with the
   // allowGitConfig of another is a policy nobody chose. So the wrap starts
   // over. Nothing from here to the platform's wrapper awaits.
+  //
+  // INVARIANT: starting over costs only what is new, and ends. An embedder
+  // can replace the configuration many times during one walk, mostly with
+  // the same content. So the wrap keeps what it has listed and walked: an
+  // attempt with no pattern new to it takes no turn of the event loop, and
+  // after RESTARTS_IN_TURNS the new ones are walked without a turn as well.
+  // What is kept is as old as its walk, and misses a path made since, as one
+  // long walk misses a path made behind it.
   if (config !== startedWith) {
-    return wrapWithSandbox(
+    return wrapWithSandboxKeeping(
+      { ...found, restarts: found.restarts + 1 },
       command,
       binShell,
       customConfig,

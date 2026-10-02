@@ -151,15 +151,19 @@ describe('the read-deny walk: budget, shared listings and steps together', () =>
       denyWrite: [],
       ...(denyReadGlobBudget === undefined ? {} : { denyReadGlobBudget }),
     })
-    /** Runs `act` in the second listing below ROOT, each outlasting a turn. */
-    const duringTheWalk = (act: () => void): { restore: () => void } => {
+    /** Runs `act` in the listing below ROOT that `at` counts to, the second
+     *  unless told otherwise, each outlasting a turn. */
+    const duringTheWalk = (
+      act: () => void,
+      at = 2,
+    ): { restore: () => void } => {
       let listed = 0
       const readdirSync = fs.readdirSync
       const spy = spyOn(fs, 'readdirSync').mockImplementation(((
         ...args: Parameters<typeof fs.readdirSync>
       ) => {
         if (String(args[0]).startsWith(ROOT)) {
-          if (++listed === 2) act()
+          if (++listed === at) act()
           outlastATurn()
         }
         return readdirSync(...args)
@@ -258,6 +262,35 @@ describe('the read-deny walk: budget, shared listings and steps together', () =>
           SandboxManager.wrapWithSandbox('true'),
         )
         expect((undisturbed as LinuxSandboxProfileError).code).toBe(
+          'deny_glob_too_large',
+        )
+      } finally {
+        walk.restore()
+      }
+    })
+
+    it('holds a walk it kept to the budget of the configuration that replaced the one it was made under', async () => {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network,
+        filesystem: filesystemWith(undefined),
+      })
+      // In the denyRead walk, which comes after the allowRead one has listed
+      // every directory: it ends under the budget it began with, and is kept.
+      const walk = duringTheWalk(
+        () =>
+          SandboxManager.updateConfig({
+            network,
+            filesystem: filesystemWith({ maxEntries: ENTRIES - 1 }),
+          }),
+        DIRECTORIES + 1 + 2,
+      )
+      try {
+        const disturbed = await outcomeOf(
+          SandboxManager.wrapWithSandbox('true'),
+        )
+        expect(disturbed).toBeInstanceOf(LinuxSandboxProfileError)
+        expect((disturbed as LinuxSandboxProfileError).code).toBe(
           'deny_glob_too_large',
         )
       } finally {

@@ -1,7 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
   type GlobWalkListings,
-  type GlobWalks,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -92,23 +91,17 @@ export function expandReadDenyGlobLinux(
   )
 }
 
-/**
- * {@link expandReadDenyGlobLinux}, in the walk's steps. With `walks`, a
- * pattern walked before is not walked again; what follows the walk is done
- * anew each time, since `reExposedPaths` may differ.
- */
+/** {@link expandReadDenyGlobLinux}, in the walk's steps. */
 export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
   listings?: GlobWalkListings,
-  walks?: GlobWalks,
 ): Steps<string[]> {
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
     listings,
-    walks,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.

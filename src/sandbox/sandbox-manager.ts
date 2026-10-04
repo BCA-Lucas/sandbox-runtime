@@ -2171,13 +2171,18 @@ async function wrapWithSandboxAgain(
   //
   // INVARIANT: what a wrap hands out was read from the disk after its
   // configuration was installed. A host that writes a file and then installs
-  // a rule that denies it must find it denied. So a wrap that starts over
-  // keeps nothing of what it has listed or walked, the same rules included.
+  // a rule that denies it finds it denied by every wrap that goes by that
+  // rule. So a wrap that starts over keeps nothing of what it has listed or
+  // walked, the same rules included. A configuration installed after this
+  // check is the next wrap's.
   //
-  // INVARIANT: it ends. An embedder can replace the configuration many times
-  // during one walk. After RESTARTS_IN_TURNS the wrap walks without a turn of
-  // the event loop, so no timer or callback replaces it meanwhile. That holds
-  // the thread for one walk, as every wrap did before the walk took turns.
+  // An embedder can replace the configuration many times during one walk.
+  // After RESTARTS_IN_TURNS the wrap walks without a turn of the event loop,
+  // so no timer or I/O callback replaces it meanwhile. That holds the thread
+  // for one walk, as every wrap did before the walk took turns. It is not a
+  // proof that the wrap ends: a promise continuation, or anything at all
+  // while the network is still being initialized, can replace it between the
+  // walk and this check, and the wrap then starts over once more.
   if (config !== startedWith) return startOver()
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)

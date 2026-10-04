@@ -1,9 +1,17 @@
 import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test'
 import * as fs from 'fs'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LinuxSandboxProfileError } from '../../src/sandbox/linux-sandbox-utils.js'
+import { expandReadDenyGlobLinux } from '../../src/sandbox/read-deny-glob.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
   GlobWalkBudgetError,
@@ -92,6 +100,45 @@ describe('the read-deny walk: budget, shared listings and steps together', () =>
       expect(readdir.mock.calls.length).toBe(0)
     } finally {
       readdir.mockRestore()
+    }
+  })
+
+  it('lets a failure kept in shared listings answer for a second name, the directory being denied whole', () => {
+    // A walk by itself tries a directory under each name that leads to it
+    // (glob-expand: "does not let one name that fails to list answer for the
+    // others"). Between the patterns of one configuration a failure is kept.
+    // Nothing is lost by that: the first failure has the directory denied
+    // whole, so what a second name would find lies beneath a deny already.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'walk-joins-name-')))
+    const certs = join(root, 'pkg', 'certs')
+    mkdirSync(certs, { recursive: true })
+    writeFileSync(join(certs, 'id.pem'), '')
+    symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+    let attempts = 0
+    const readdirSync = fs.readdirSync
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (String(args[0]) === certs && ++attempts === 1) {
+        throw Object.assign(new Error('EMFILE: too many open files'), {
+          code: 'EMFILE',
+        })
+      }
+      return readdirSync(...args)
+    }) as typeof fs.readdirSync)
+    try {
+      const listings: GlobWalkListings = new Map()
+      for (const name of ['*.pem', '*.key']) {
+        expect(
+          expandReadDenyGlobLinux(join(root, '**', name), [], undefined, {
+            listings,
+          }),
+        ).toEqual([certs])
+      }
+      expect(attempts).toBe(1)
+    } finally {
+      spy.mockRestore()
+      rmSync(root, { recursive: true, force: true })
     }
   })
 

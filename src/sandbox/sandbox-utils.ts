@@ -1375,9 +1375,10 @@ export class GlobWalkBudgetError extends Error {
   }
 }
 
-/** Successful listings, by real directory: a second position, or a second
- *  pattern, reads the same entries. */
-export type GlobWalkListings = Map<string, fs.Dirent[]>
+/** What listing a real directory gave, its entries or the error that has it
+ *  denied whole: a second position, or a second pattern, reads the same
+ *  answer. */
+export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
@@ -2040,9 +2041,11 @@ export function* walkGlobPatternSteps(
     yield
     // After the step, in which time can have passed, and before the listing.
     spend(dir, 0)
-    let entries = listings.get(real)
+    const known = listings.get(real)
+    let entries = known instanceof Error ? undefined : known
     if (entries === undefined) {
       try {
+        if (known instanceof Error) throw known
         entries = onRealPath(real, frame.short, p =>
           fs.readdirSync(p, { withFileTypes: true }),
         )
@@ -2053,10 +2056,23 @@ export function* walkGlobPatternSteps(
           `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
           { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
         )
-        if (errorCode !== 'ENOENT' && !record.unlisted) {
-          record.unlisted = true
-          walk.unlisted.push(dir)
-          if (real !== dir) walk.realOf.set(dir, real)
+        if (errorCode !== 'ENOENT') {
+          // Kept, or every pattern would try the directory again: one that
+          // would have cleared meanwhile hides more. An absence is not kept.
+          // It is the one answer that denies nothing, so each pattern asks.
+          // Nor is anything kept in a walk's own map: there a second name
+          // for the directory still gets its try (see `listedFor`).
+          if (opts.listings !== undefined) {
+            listings.set(
+              real,
+              err instanceof Error ? err : new Error(String(err)),
+            )
+          }
+          if (!record.unlisted) {
+            record.unlisted = true
+            walk.unlisted.push(dir)
+            if (real !== dir) walk.realOf.set(dir, real)
+          }
         }
         continue
       }

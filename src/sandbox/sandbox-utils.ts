@@ -1185,9 +1185,10 @@ export interface ExpandGlobOptions {
   anchor?: string
 }
 
-/** Successful listings, by real directory: a second position, or a second
- *  pattern, reads the same entries. */
-export type GlobWalkListings = Map<string, fs.Dirent[]>
+/** What listing a real directory gave, its entries or the error that has it
+ *  denied whole: a second position, or a second pattern, reads the same
+ *  answer. */
+export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
@@ -1742,11 +1743,15 @@ export function* walkGlobPatternSteps(
     if (fresh.length === 0) continue
     yield
     for (const p of fresh) listed.add(p)
-    let entries = listings.get(real)
+    let entries: fs.Dirent[]
     try {
-      entries ??= onRealPath(real, frame.short, p =>
-        fs.readdirSync(p, { withFileTypes: true }),
-      )
+      const known = listings.get(real)
+      if (known instanceof Error) throw known
+      entries =
+        known ??
+        onRealPath(real, frame.short, p =>
+          fs.readdirSync(p, { withFileTypes: true }),
+        )
       listings.set(real, entries)
     } catch (err) {
       const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
@@ -1755,6 +1760,10 @@ export function* walkGlobPatternSteps(
         { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
       )
       if (errorCode !== 'ENOENT') {
+        // Kept, or every pattern would try the directory again: one that
+        // would have cleared meanwhile hides more. An absence is not kept. It
+        // is the one answer that denies nothing, so each pattern asks.
+        listings.set(real, err instanceof Error ? err : new Error(String(err)))
         walk.unlisted.push(dir)
         if (real !== dir) walk.realOf.set(dir, real)
       }

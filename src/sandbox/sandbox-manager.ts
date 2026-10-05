@@ -1288,6 +1288,10 @@ function unionDenyReadPaths(
  * credential file that degraded to deny) — each names one file on disk, so
  * it is passed through whatever characters it contains. Expanded as a
  * pattern, a name holding `[` matches nothing and the deny is lost.
+ *
+ * Each path once, where it first came up: every `**` pattern over one base
+ * returns the directories it could not list, and the Linux wrapper looks at
+ * every entry it is given.
  */
 function* resolveReadPathEntries(
   kind: PathListKind,
@@ -1296,7 +1300,7 @@ function* resolveReadPathEntries(
   literalPaths: readonly string[] = [],
 ): Steps<string[]> {
   const literal = new Set(literalPaths)
-  const resolved: string[] = []
+  const resolved = new Set<string>()
   for (const p of spelledOf(paths)) {
     const stripped = removeTrailingGlobSuffix(p)
     if (
@@ -1304,14 +1308,19 @@ function* resolveReadPathEntries(
       !literal.has(p) &&
       containsGlobChars(stripped)
     ) {
-      resolved.push(
-        ...(yield* withOtherReadings(p, stripped, kind, expandGlob)),
-      )
+      for (const found of yield* withOtherReadings(
+        p,
+        stripped,
+        kind,
+        expandGlob,
+      )) {
+        resolved.add(found)
+      }
     } else {
-      resolved.push(stripped)
+      resolved.add(stripped)
     }
   }
-  return resolved
+  return [...resolved]
 }
 
 /**

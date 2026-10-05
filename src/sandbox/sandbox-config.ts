@@ -6,7 +6,11 @@
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
-import { z } from 'zod'
+// The 'zod/v3' subpath, not bare 'zod': it exists from zod 3.25 on and is the
+// v3 API under both zod 3.25+ and zod 4. Where a consumer's dependency tree
+// resolves this package's zod to version 4, the bare import would hand these
+// schemas the v4 API they are not written against.
+import { z } from 'zod/v3'
 import {
   ALLOWED_DOMAIN_ENTRY_MESSAGE,
   DOMAIN_PATTERN_MESSAGE,
@@ -68,6 +72,28 @@ const addressRangeSchema = z
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
+
+/**
+ * An entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite`: a
+ * spelling, which is a pattern when it reads as one, or a path marked
+ * `literal: true`, which never is. An object without the mark, or with a
+ * key this does not know, is refused rather than read either way.
+ */
+const filesystemPathEntrySchema = z.union(
+  [
+    filesystemPathSchema,
+    z.object({ path: filesystemPathSchema, literal: z.literal(true) }).strict(),
+  ],
+  {
+    errorMap: (issue, ctx) =>
+      issue.code === z.ZodIssueCode.invalid_union
+        ? {
+            message:
+              'Expected a path, or { "path": "<path>", "literal": true }',
+          }
+        : { message: ctx.defaultError },
+  },
+)
 
 /**
  * Schema for an absolute path to an external binary.
@@ -250,7 +276,7 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
     'Path to a credential file or directory. Supports the same path forms as ' +
-      'filesystem.denyRead (absolute paths and ~ expansion).',
+      'a string in filesystem.denyRead (absolute paths and ~ expansion).',
   ),
   mode: credentialModeSchema.describe('Access mode for this path'),
   extract: extractPatternSchema
@@ -836,19 +862,21 @@ export const FilesystemConfigSchema = z.object({
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
-  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  denyRead: z
+    .array(filesystemPathEntrySchema)
+    .describe('Paths denied for reading'),
   allowRead: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .optional()
     .describe(
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
   allowWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
   allowGitConfig: z
     .boolean()
@@ -1006,7 +1034,9 @@ export const SeccompConfigSchema = z.object({
 /**
  * An inert deny is fail-open, so a deny glob whose trailing separator leaves
  * it matching nothing is rejected; the same glob as an allow fails closed,
- * so the allow lists keep the plain path schema.
+ * so the allow lists keep the plain path schema. Such an entry may also be
+ * the name of a path (`/w/[WIP]/keep/`), but only the disk can say so and
+ * validation does not ask it: the message gives the spelling read both ways.
  */
 function addInertSlashedDenyGlobIssue(
   value: string,
@@ -1028,9 +1058,10 @@ function addInertSlashedDenyGlobIssue(
     code: z.ZodIssueCode.custom,
     path,
     message:
-      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
-      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
-      `"**" segment to match at any depth.`,
+      `Deny glob "${value}" ends in a separator, so as a pattern it can ` +
+      `match no path. Write "${value.replace(trailingSeparator, '')}", ` +
+      `which is also read as the path of that name where it exists, or add ` +
+      `a "**" segment to match at any depth.`,
   })
 }
 
@@ -1084,7 +1115,9 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
+          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+          'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z
@@ -1130,10 +1163,14 @@ export const SandboxRuntimeConfigSchema = z
     // under it is not a hole.
     const fsEnforced = !cfg.filesystem.disabled
     if (fsEnforced) {
+      // A marked entry is never a glob, so a separator at its end is the
+      // end of a name.
       for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
       }
       for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
       }
     }
@@ -1394,6 +1431,7 @@ export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
+export type FilesystemPathEntry = z.infer<typeof filesystemPathEntrySchema>
 export type CredentialMode = z.infer<typeof credentialModeSchema>
 export type CredentialFileConfig = z.infer<typeof CredentialFileConfigSchema>
 export type CredentialEnvVarConfig = z.infer<

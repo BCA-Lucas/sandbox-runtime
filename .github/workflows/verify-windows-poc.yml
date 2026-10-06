@@ -56,7 +56,7 @@ jobs:
           $psiA.UseShellExecute = $false
           $psiA.RedirectStandardOutput = $true
           $psiA.RedirectStandardError = $true
-          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 240')) {
+          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe','-NoProfile','-Command','Start-Sleep -Seconds 240')) {
             $null = $psiA.ArgumentList.Add($a)
           }
           $procA = [System.Diagnostics.Process]::Start($psiA)
@@ -109,7 +109,7 @@ jobs:
           $psiB.UseShellExecute = $false
           $psiB.RedirectStandardOutput = $true
           $psiB.RedirectStandardError = $true
-          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-File','C:\srt-poc\inject_payload.ps1','-TargetPid',"$targetPid",'-DllPath','C:\srt-poc\marker.dll')) {
+          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe','-NoProfile','-File','C:\srt-poc\inject_payload.ps1','-TargetPid',"$targetPid",'-DllPath','C:\srt-poc\marker.dll')) {
             $null = $psiB.ArgumentList.Add($a)
           }
           $procB = [System.Diagnostics.Process]::Start($psiB)

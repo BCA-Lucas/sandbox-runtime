@@ -63,9 +63,8 @@ jobs:
           set -x
           node ../dist/cli.js -s s.json -- sh -c '
             set -e
+            cp -R proj/.git/modules/sub evilgd
             rm -rf proj/.git/modules/sub
-            mkdir -p evilgd/hooks evilgd/objects evilgd/refs
-            printf "ref: refs/heads/main\n" > evilgd/HEAD
             ln -s ../../../evilgd proj/.git/modules/sub
             printf "#!/bin/sh\ntouch /tmp/PWNED_outside_sandbox\n" > proj/.git/modules/sub/hooks/post-checkout
             chmod +x proj/.git/modules/sub/hooks/post-checkout

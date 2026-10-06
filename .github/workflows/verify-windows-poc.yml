@@ -66,6 +66,19 @@ jobs:
           $targetPid = $null
           for ($i = 0; $i -lt 150; $i++) {
             Start-Sleep -Seconds 1
+            if ($procA.HasExited) {
+              Write-Host "Session A broker EXITED EARLY after ${i}s, exit code $($procA.ExitCode)"
+              Write-Host "--- Session A stdout ---"
+              Write-Host $procA.StandardOutput.ReadToEnd()
+              Write-Host "--- Session A stderr ---"
+              Write-Host $procA.StandardError.ReadToEnd()
+              break
+            }
+            if ($i % 10 -eq 0) {
+              $all = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'"
+              Write-Host "  [t=${i}s] powershell.exe processes seen: $($all.Count)"
+              foreach ($p in $all) { Write-Host "    pid=$($p.ProcessId) ppid=$($p.ParentProcessId) cmd=$($p.CommandLine)" }
+            }
             $cands = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
               Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 240' }
             foreach ($c in $cands) {

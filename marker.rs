@@ -16,7 +16,7 @@ pub extern "system" fn DllMain(_hinst: *mut c_void, reason: u32, _reserved: *mut
             "CROSS-SESSION-INJECTION-CONFIRMED\npid-of-injected-process={}\n",
             pid
         );
-        let _ = fs::write("C:\\PWNED_cross_session_injection.txt", msg);
+        let _ = fs::write("C:\\srt-poc\\PWNED_cross_session_injection.txt", msg);
     }
     1
 }

@@ -38,6 +38,16 @@ jobs:
           {"filesystem":{"denyRead":[],"allowWrite":["."],"denyWrite":[]},"network":{"allowedDomains":[],"deniedDomains":[]}}
           EOF
 
+      - name: DIAGNOSTIC — dump the actual mandatory-deny entries for this fixture
+        working-directory: work
+        run: |
+          node -e '
+            const m = require("../dist/sandbox/macos-sandbox-utils.js");
+            console.log(Object.keys(m).filter(k => /mandator|deny/i.test(k)));
+            const entries = m.macGetMandatoryDenyEntries ? m.macGetMandatoryDenyEntries(false) : "macGetMandatoryDenyEntries not exported";
+            console.log(JSON.stringify(entries, null, 1));
+          '
+
       - name: Control — direct (non-symlinked) submodule hook write must be DENIED
         working-directory: work
         run: |

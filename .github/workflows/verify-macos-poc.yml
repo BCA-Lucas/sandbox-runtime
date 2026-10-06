@@ -79,7 +79,9 @@ jobs:
         run: |
           set -x
           rm -f /tmp/PWNED_outside_sandbox
-          git -C proj -c protocol.file.allow=always submodule update --init --checkout sub || true
+          git -C proj -c protocol.file.allow=always submodule update --init --checkout --force sub || true
+          echo "--- direct checkout inside the submodule (unambiguously fires post-checkout) ---"
+          git -C proj/sub checkout -f HEAD || true
           echo "--- result ---"
           if [ -f /tmp/PWNED_outside_sandbox ]; then
             echo "ESCAPED: hook planted inside the sandbox executed OUTSIDE it on a real git operation"

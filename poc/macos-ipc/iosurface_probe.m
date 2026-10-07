@@ -51,6 +51,22 @@ int main(int argc, const char **argv) {
     }
     return 0;
   }
+  if (argc == 3 && strcmp(argv[1], "scan") == 0) {
+    // Discoverability: report which small integer IDs map to a live global
+    // surface (and its size). Reporting only; no pixel bytes are read here.
+    uint32_t maxid = (uint32_t)strtoul(argv[2], NULL, 10);
+    int live = 0;
+    for (uint32_t id = 1; id <= maxid; id++) {
+      IOSurfaceRef s = IOSurfaceLookup((IOSurfaceID)id);
+      if (!s) continue;
+      live++;
+      printf("SCAN live id=%u size=%zu %zux%zu\n", id, IOSurfaceGetAllocSize(s),
+             IOSurfaceGetWidth(s), IOSurfaceGetHeight(s));
+      CFRelease(s);
+    }
+    printf("SCAN done: %d live global surface(s) in ids 1..%u\n", live, maxid);
+    return 0;
+  }
   if (argc == 4 && strcmp(argv[1], "read") == 0) {
     @autoreleasepool {
       IOSurfaceID id = (IOSurfaceID)strtoul(argv[2], NULL, 10);

@@ -76,7 +76,9 @@ jobs:
               com.apple.system.notification_center \
               com.apple.secd \
               com.apple.SecurityServer
-            echo "--- cross-boundary IOSurface read ---"
+            echo "--- discover live global surfaces by enumeration (no ID given) ---"
+            ./poc/macos-ipc/iosurface_probe scan 256
+            echo "--- cross-boundary IOSurface read (ID the host actually used) ---"
             ./poc/macos-ipc/iosurface_probe read '"$ID"' '"$SENT"'
           '
 
